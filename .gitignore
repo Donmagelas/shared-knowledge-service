@@ -1,0 +1,15 @@
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+htmlcov/
+
+# 本地服务数据和探针输出不得进入仓库。
+.data/
+.reports/

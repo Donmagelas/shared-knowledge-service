@@ -1,0 +1,83 @@
+name: shared-knowledge-service
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ogx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ogx-local-only}
+      POSTGRES_USER: ${POSTGRES_USER:-ogx}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c}
+    healthcheck:
+      # Qdrant 镜像没有 curl；Bash TCP 探针只验证服务端口已监听。
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  knowledge-ogx:
+    image: shared-knowledge-service-ogx:0.1.0
+    build:
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://deb.debian.org/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}
+        DOCLING_LAYOUT_MODEL_REVISION: ${DOCLING_LAYOUT_MODEL_REVISION:-8f39ad3c0b4c58e9c2d2c84a38465abf757272d8}
+        DOCLING_TABLE_MODEL_REVISION: ${DOCLING_TABLE_MODEL_REVISION:-fc0f2d45e2218ea24bce5045f58a389aed16dc23}
+        DOCLING_TOKENIZER_MODEL: ${DOCLING_TOKENIZER_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        DOCLING_TOKENIZER_REVISION: ${DOCLING_TOKENIZER_REVISION:-1110a243fdf4706b3f48f1d95db1a4f5529b4d41}
+        HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+        PYPI_FILES_URL: ${PYPI_FILES_URL:-https://files.pythonhosted.org/packages}
+        PYPI_SIMPLE_URL: ${PYPI_SIMPLE_URL:-https://pypi.org/simple}
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.example.com/v1}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-replace-with-embedding-model}
+      FILES_STORAGE_DIR: /data/files
+      POSTGRES_DB: ${POSTGRES_DB:-ogx}
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ogx-local-only}
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-ogx}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-shared_knowledge}
+      QDRANT_URL: http://qdrant:6333
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8321/v1/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "127.0.0.1:${OGX_HOST_PORT:-8321}:8321"
+    volumes:
+      - original-files:/data/files
+
+volumes:
+  original-files:
+  postgres-data:
+  qdrant-data:

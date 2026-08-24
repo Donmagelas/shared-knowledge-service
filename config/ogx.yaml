@@ -1,0 +1,114 @@
+version: 2
+distro_name: shared-knowledge-service
+
+apis:
+  - file_processors
+  - files
+  - inference
+  - knowledge
+  - vector_io
+
+external_apis_dir: config/apis.d
+
+providers:
+  inference:
+    - provider_id: embedding
+      provider_type: remote::openai
+      config:
+        api_key: ${env.EMBEDDING_API_KEY:=}
+        base_url: ${env.EMBEDDING_BASE_URL}
+
+  vector_io:
+    - provider_id: shared-qdrant
+      provider_type: remote::shared-qdrant
+      module: shared_knowledge_service
+      config:
+        api_key: ${env.QDRANT_API_KEY:=}
+        collection_name: ${env.QDRANT_COLLECTION_NAME:=shared_knowledge}
+        dense_vector_name: dense
+        # 需要高性能过滤的业务字段由 Stella/企业版部署时按实际 Payload 契约声明。
+        payload_indexes: {}
+        persistence:
+          backend: kv_default
+          namespace: vector_io::shared_qdrant
+        sparse_vector_name: bm25
+        url: ${env.QDRANT_URL:=http://localhost:6333}
+
+  files:
+    - provider_id: builtin-files
+      provider_type: inline::localfs
+      config:
+        metadata_store:
+          backend: sql_default
+          table_name: files_metadata
+        storage_dir: ${env.FILES_STORAGE_DIR:=/data/files}
+
+  file_processors:
+    - provider_id: docling
+      provider_type: inline::docling
+      config:
+        default_chunk_overlap_tokens: 400
+        default_chunk_size_tokens: 800
+        do_ocr: false
+        vlm_model: null
+
+  knowledge:
+    - provider_id: shared-knowledge
+      provider_type: inline::shared-knowledge
+      config: {}
+
+storage:
+  backends:
+    kv_default:
+      type: kv_postgres
+      db: ${env.POSTGRES_DB:=ogx}
+      host: ${env.POSTGRES_HOST:=localhost}
+      password: ${env.POSTGRES_PASSWORD:=ogx-local-only}
+      port: ${env.POSTGRES_PORT:=5432}
+      table_name: ogx_kvstore
+      user: ${env.POSTGRES_USER:=ogx}
+    sql_default:
+      type: sql_postgres
+      db: ${env.POSTGRES_DB:=ogx}
+      host: ${env.POSTGRES_HOST:=localhost}
+      max_overflow: 10
+      password: ${env.POSTGRES_PASSWORD:=ogx-local-only}
+      pool_pre_ping: true
+      pool_size: 5
+      port: ${env.POSTGRES_PORT:=5432}
+      user: ${env.POSTGRES_USER:=ogx}
+  stores:
+    inference:
+      backend: sql_default
+      table_name: inference_store
+    metadata:
+      backend: kv_default
+      namespace: registry
+    vector_stores:
+      backend: sql_default
+      table_name: vector_store_metadata
+
+registered_resources:
+  models:
+    - metadata:
+        embedding_dimension: ${env.EMBEDDING_DIMENSION:=3}
+      model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
+      provider_id: embedding
+      provider_model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
+      model_type: embedding
+  vector_stores: []
+
+server:
+  port: 8321
+
+vector_stores:
+  default_embedding_model:
+    model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
+    provider_id: embedding
+  default_provider_id: shared-qdrant
+  file_ingestion_params:
+    default_chunk_overlap_tokens: 400
+    default_chunk_size_tokens: 800
+  chunk_retrieval_params:
+    default_search_mode: hybrid
+    default_reranker_strategy: rrf

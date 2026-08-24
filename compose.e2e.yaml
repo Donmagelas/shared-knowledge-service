@@ -1,0 +1,36 @@
+name: shared-knowledge-service
+
+# 该文件只用于本地/CI 验收；生产部署仍只有 compose.yaml 中的三个服务。
+services:
+  embedding-stub:
+    image: shared-knowledge-service-ogx:0.1.0
+    entrypoint:
+      - /app/.venv/bin/python
+      - /tmp/embedding_stub.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18080"
+      - --failure-file
+      - /tmp/embedding_stub.fail
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ./tests/fixtures/embedding_stub.py:/tmp/embedding_stub.py:ro
+
+  knowledge-ogx:
+    depends_on:
+      embedding-stub:
+        condition: service_healthy
+    environment:
+      EMBEDDING_API_KEY: test-only
+      EMBEDDING_BASE_URL: http://embedding-stub:18080/v1
+      EMBEDDING_DIMENSION: "3"
+      EMBEDDING_MODEL: deterministic-test

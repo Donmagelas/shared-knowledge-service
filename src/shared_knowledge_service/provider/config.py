@@ -1,0 +1,65 @@
+"""外置 Qdrant Provider 配置。"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from ogx.core.storage.datatypes import KVStoreReference, SqlStoreReference
+from pydantic import BaseModel, Field
+
+
+class PayloadIndexType(StrEnum):
+    """部署方可声明的 Qdrant Payload Index 类型。"""
+
+    KEYWORD = "keyword"
+    INTEGER = "integer"
+    FLOAT = "float"
+    BOOL = "bool"
+    DATETIME = "datetime"
+    TEXT = "text"
+
+
+class SharedQdrantVectorIOConfig(BaseModel):
+    """固定 OGX v1.3.0 所需连接和元数据配置。
+
+    这里显式拥有配置契约，避免后续 Provider 被 OGX 内部 Qdrant Config 的变化绑死。
+    """
+
+    location: str | None = None
+    url: str | None = None
+    port: int | None = 6333
+    grpc_port: int = 6334
+    prefer_grpc: bool = False
+    https: bool | None = None
+    api_key: str | None = None
+    prefix: str | None = None
+    timeout: int | None = None
+    host: str | None = None
+    persistence: KVStoreReference
+    metadata_store: SqlStoreReference | None = Field(
+        default=None,
+        description="用于保存 VectorStore 元数据的 OGX SQL Store",
+    )
+    collection_name: str = Field(default="shared_knowledge", min_length=1)
+    dense_vector_name: str = Field(default="dense", min_length=1)
+    sparse_vector_name: str = Field(default="bm25", min_length=1)
+    payload_indexes: dict[str, PayloadIndexType] = Field(
+        default_factory=dict,
+        description="需要高性能过滤的业务 attributes 字段及其类型",
+    )
+
+    def qdrant_client_kwargs(self) -> dict[str, Any]:
+        """只返回 AsyncQdrantClient 接受的连接参数。"""
+
+        return self.model_dump(
+            exclude_none=True,
+            exclude={
+                "collection_name",
+                "dense_vector_name",
+                "metadata_store",
+                "payload_indexes",
+                "persistence",
+                "sparse_vector_name",
+            },
+        )

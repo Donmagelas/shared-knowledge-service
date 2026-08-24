@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shared-knowledge-service"
+version = "0.1.0"
+description = "Stella 与 Cherry Studio 企业版共用的知识库基础设施"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # OGX 1.3.0 的 Qdrant Adapter 会直接导入 starter extra 中的 chardet。
+    "chardet==7.4.3",
+    "docling==2.121.0",
+    "httpx==0.28.1",
+    "ogx==1.3.0",
+    "ogx-api==1.3.0",
+    # OGX 的共享 VectorStore 工具在导入 Qdrant Adapter 时会直接加载 PdfReader。
+    "pypdf==6.13.3",
+    "qdrant-client==1.18.0",
+    "torch==2.13.0+cpu",
+    "torchvision==0.28.0+cpu",
+    "transformers==4.57.6",
+]
+
+[project.scripts]
+knowledge-embedding-preflight = "shared_knowledge_service.preflight:main"
+knowledge-qdrant-preflight = "shared_knowledge_service.qdrant_preflight:main"
+
+[dependency-groups]
+dev = [
+    # 只用于和 Qdrant 原生 multilingual BM25 做离线效果对照，不进入生产镜像。
+    "jieba==0.42.1",
+    "mmh3==5.2.1",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "e2e: 需要已启动完整服务的端到端测试",
+    "integration: 需要真实基础设施的集成测试",
+    "recovery: 会重启 Compose 服务的显式恢复测试",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["shared_knowledge_service"]
+
+[[tool.mypy.overrides]]
+module = ["ogx.*", "ogx_api.*"]
+ignore_missing_imports = true

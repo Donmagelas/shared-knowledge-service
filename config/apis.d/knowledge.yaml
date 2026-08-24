@@ -1,0 +1,3 @@
+name: knowledge
+module: shared_knowledge_service.api
+protocol: KnowledgeApi
