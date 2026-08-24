@@ -11,7 +11,7 @@
 | 产品过滤字段 | Ingest `attributes` | `attributes.<field>` Payload |
 | 本次可检索范围 | Search `knowledge_base_ids + filters` | 服务强制生成 `vector_store_id IN [...] AND filter` |
 
-一个客户环境只有一个共享 Qdrant Collection。Embedding Endpoint、模型 ID 和维度由每套部署配置，不在代码中固定。维度在 Collection 初始化时确定，当前部署内不再修改；模型 ID 允许后续调整，但必须选择相同输出维度。由于 OGX 会在每个 VectorStore 上记录模型，切换时必须迁移全部 VectorStore 模型记录并重新向量化已有 Chunk；该迁移能力属于生产化步骤，当前不能只修改环境变量。新增业务知识库只是新增 VectorStore ID 和 Payload 值，不会新建 Dense/BM25 索引结构。
+一个客户环境只有一个共享 Qdrant Collection。Embedding Endpoint、模型 ID 和维度由每套部署配置，不在代码中固定。维度在 Collection 初始化时确定，当前部署内不再修改；模型 ID 由部署方选择。当前范围不设计已有数据的模型切换流程。新增业务知识库只是新增 VectorStore ID 和 Payload 值，不会新建 Dense/BM25 索引结构。
 
 ## 2. Stella
 

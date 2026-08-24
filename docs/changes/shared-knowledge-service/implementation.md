@@ -32,7 +32,7 @@
 | 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding 和第一轮两侧项目文档效果均有新鲜证据，OGX 路线继续 |
 | 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供同步 Ingest、多知识库 Search 和稳定 SearchHit |
 | 12. 两侧契约 | 服务端完成 | Stella 四级范围和企业版显式知识库映射、过滤与 E2E 已固化；产品仓库适配后续各自实施 |
-| 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控、Embedding 模型迁移工具和更大业务语料仍待实施 |
+| 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控和更大业务语料仍待实施 |
 
 当前镜像已只预置 Docling PDF 默认路径需要的模型：Transformers layout、Accurate TableFormer 和 HybridChunker tokenizer，且都固定到 commit。构建阶段在离线模式初始化 PDF Pipeline，最终镜像约 `1.08 GB`，而不是此前包含未使用 ONNX/Fast 变体时的约 `4.55 GB`。
 
@@ -426,7 +426,6 @@ shared-knowledge-service/
 
 - 生产 Compose 覆盖、S3 配置、认证配置、资源限制、日志与监控配置。
 - PostgreSQL、Qdrant Snapshot 和原文件的备份恢复 Runbook。
-- 相同维度下切换 Embedding 模型、迁移 OGX Registry 与全部 VectorStore 模型记录并全量重新向量化的运维命令与回滚说明。
 - 安全、升级、回滚和兼容性文档。
 
 **依赖**

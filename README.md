@@ -57,7 +57,7 @@ uv sync --frozen
 | `EMBEDDING_PROBE_BATCH_SIZE` | 前置探针验证的请求批量 |
 | `EMBEDDING_TIMEOUT_SECONDS` | 前置探针超时 |
 
-`EMBEDDING_DIMENSION` 在部署初始化 Collection 时确定，当前方案不支持在该部署内修改。`EMBEDDING_MODEL` 是可变配置，但不是热切换：OGX 会把模型记录在每个 VectorStore 上，因此已有部署切换模型时，必须同时迁移 VectorStore 模型记录并对全部 Chunk 重新向量化。该迁移工具尚未包含在 MVP 中；在它完成前不能只修改环境变量。
+`EMBEDDING_DIMENSION` 在部署初始化 Collection 时确定，当前方案不支持在该部署内修改。`EMBEDDING_MODEL` 由部署配置选择，不在代码中固定。当前范围不实现已有数据的模型热切换或迁移工具。
 
 ```bash
 set -a
