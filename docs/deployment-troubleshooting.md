@@ -186,7 +186,8 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 
 **影响与解决**
 
-- 正常部署固定一套 Embedding 模型时不受影响；同一 Qdrant Collection 本来也不能混用不同维度或向量空间。
-- 模型迁移不能只改环境变量。必须把 PostgreSQL 模型注册迁移、全量重新 Embedding、Qdrant 新 Collection 构建和切换作为一个明确操作。
+- 维度在部署初始化后保持不变；新模型必须返回配置的相同维度，否则前置探针直接拒绝。
+- 模型迁移不能只改环境变量。即使维度相同，也必须在维护窗口内完成 PostgreSQL 模型注册、全部 OGX VectorStore 模型记录迁移和全部 Chunk 的重新 Embedding，不能让新旧向量空间混存。
+- 相同维度下可以全量覆盖现有 Collection；如果需要无停机切换，则使用新 Collection 重建并切换。两种迁移工具都不属于当前 MVP。
 - 本次多模型评测为每个候选创建独立 PostgreSQL 评测数据库和 Qdrant Collection，没有清理或篡改原有注册表。
 - 正式设计迁移工具前，不自动删除 OGX Registry 记录；删除错误记录可能影响仍在使用的模型和 VectorStore。

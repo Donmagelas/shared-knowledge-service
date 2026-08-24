@@ -48,6 +48,17 @@ uv sync --frozen
 
 复制 `.env.example` 为本地 `.env`，通过环境变量提供实际配置。`.env` 已被 Git 忽略，不得提交真实 Endpoint 或 Token。
 
+| 配置项 | 含义 |
+| --- | --- |
+| `EMBEDDING_BASE_URL` | OpenAI-compatible 模型服务地址 |
+| `EMBEDDING_API_KEY` | 模型服务凭证 |
+| `EMBEDDING_MODEL` | 当前部署使用的 Embedding 模型 ID |
+| `EMBEDDING_DIMENSION` | 该模型实际返回的向量维度 |
+| `EMBEDDING_PROBE_BATCH_SIZE` | 前置探针验证的请求批量 |
+| `EMBEDDING_TIMEOUT_SECONDS` | 前置探针超时 |
+
+`EMBEDDING_DIMENSION` 在部署初始化 Collection 时确定，当前方案不支持在该部署内修改。`EMBEDDING_MODEL` 是可变配置，但不是热切换：OGX 会把模型记录在每个 VectorStore 上，因此已有部署切换模型时，必须同时迁移 VectorStore 模型记录并对全部 Chunk 重新向量化。该迁移工具尚未包含在 MVP 中；在它完成前不能只修改环境变量。
+
 ```bash
 set -a
 source .env
@@ -55,7 +66,7 @@ set +a
 uv run knowledge-embedding-preflight
 ```
 
-成功时只输出模型、向量维度、返回数量、已验证批量和耗时；不会输出 Token、Endpoint 或响应正文。`EMBEDDING_PROBE_BATCH_SIZE` 仅验证指定批量能够成功，不代表自动发现服务端最大批量。
+成功时只输出模型、向量维度、返回数量、已验证批量和耗时；不会输出 Token、Endpoint 或响应正文。探针会拒绝实际返回维度与 `EMBEDDING_DIMENSION` 不一致的配置。`EMBEDDING_PROBE_BATCH_SIZE` 仅验证指定批量能够成功，不代表自动发现服务端最大批量。
 
 ### 真实模型与项目文档评测
 

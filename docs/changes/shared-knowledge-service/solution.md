@@ -67,7 +67,7 @@ Stella / Cherry Studio 企业版判断本次请求可以访问什么
 - 知识库服务必须忠实执行过滤条件，但不解释字段的业务含义。
 - 产品数据库保存组织关系、挂载关系和权限；知识库 PostgreSQL 保存 OGX 自己的资源与任务状态。
 - 两个 PostgreSQL 连接可以指向同一实例中的不同逻辑数据库，也可以指向独立实例。MVP 为隔离变量使用独立 PostgreSQL 容器。
-- 一个 Qdrant Collection 内只能启用一套 Dense Embedding 模型和维度；首期一个部署固定一套 Embedding 配置。
+- Embedding Endpoint、模型 ID 和维度由每套部署配置。维度在 Collection 初始化后保持不变；模型 ID 可以调整，但新模型必须返回相同维度，切换时需全量重新向量化已有 Chunk，不能混用两套模型的向量。
 
 ### 3.2 Stella 当前四级范围
 
@@ -452,7 +452,7 @@ MVP 没有 Revision。替换文件采用：
 | Qdrant 原生 BM25 与服务版本耦合 | tokenizer 选项或语言处理在升级后可能改变 | 固定 Qdrant 1.18.2；文档和查询共用同一配置；升级必须重跑原生 BM25 探针与真实语料评测 |
 | 产品生成错误 Filter | 可能漏数据或越权 | 产品只从可信身份生成；服务校验语法和保留字段；为 Stella 与企业版权限矩阵建立契约测试 |
 | 新增高频过滤字段 | 已有 Collection 可能需要索引迁移和 HNSW 优化 | 常用字段在建 Collection 前声明；字段变更走显式迁移，不与“新增知识库值”混淆 |
-| Embedding 模型或维度变化 | 同一 Collection 中向量不兼容 | 一个 Collection 固定一套模型；换模型按重建索引处理 |
+| Embedding 模型变化 | 即使维度相同，新旧向量空间通常也不兼容；OGX VectorStore 还会保存原模型 ID | 只允许切换到相同维度模型；维护窗口内迁移 Registry 和全部 VectorStore 模型记录并全量重新向量化，不把修改环境变量当成完整切换 |
 | OGX 模型注册信息与配置漂移 | 原地修改模型后可能因自动发现记录类型冲突而启动失败 | 模型迁移同时处理 PostgreSQL Registry 与 Qdrant 全量重建；不把修改环境变量当成完整迁移 |
 | 无 Revision 原子发布 | 文件替换存在短时双版本 | MVP 明确接受；若成为硬需求，重新评估扩展 OGX 或切换 Haystack |
 | OGX 上游变化 | 升级可能破坏 Provider 契约 | 固定 v1.3.0；升级必须通过兼容性测试，允许选择不跟进 |
@@ -465,6 +465,7 @@ MVP 没有 Revision。替换文件采用：
 
 1. 生产环境原始文件使用本地持久卷还是 S3。
 2. Reranker 的模型、接入位置和启用条件。
+3. 相同维度下的 Embedding 模型迁移命令、失败回滚和服务窗口。
 
 MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。这一轮用于验证模型服务兼容性、维度配置和检索链路，不用于在架构阶段固定具体模型。后续使用更大业务语料，综合效果、延迟和成本再确定部署模型；如果 multilingual BM25 或 Dense 在扩大语料后退化，再加入 Jieba 或 Reranker 对照。
 

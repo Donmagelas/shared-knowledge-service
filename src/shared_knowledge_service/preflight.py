@@ -24,6 +24,7 @@ class EmbeddingProbeConfig:
     base_url: str
     api_key: str
     model: str
+    expected_dimension: int
     batch_size: int = 2
     timeout_seconds: float = 30.0
 
@@ -31,7 +32,12 @@ class EmbeddingProbeConfig:
     def from_mapping(cls, values: Mapping[str, str]) -> EmbeddingProbeConfig:
         """从环境变量兼容的键值表读取并校验配置。"""
 
-        required_names = ("EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL")
+        required_names = (
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_API_KEY",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSION",
+        )
         missing = [name for name in required_names if not values.get(name, "").strip()]
         if missing:
             raise PreflightError(f"缺少配置：{', '.join(missing)}")
@@ -42,6 +48,7 @@ class EmbeddingProbeConfig:
             raise PreflightError("EMBEDDING_BASE_URL 必须是有效的 HTTP(S) URL")
 
         batch_size = _parse_positive_int(values.get("EMBEDDING_PROBE_BATCH_SIZE", "2"), "EMBEDDING_PROBE_BATCH_SIZE")
+        expected_dimension = _parse_positive_int(values["EMBEDDING_DIMENSION"], "EMBEDDING_DIMENSION")
         timeout_seconds = _parse_positive_float(
             values.get("EMBEDDING_TIMEOUT_SECONDS", "30"),
             "EMBEDDING_TIMEOUT_SECONDS",
@@ -50,6 +57,7 @@ class EmbeddingProbeConfig:
             base_url=base_url,
             api_key=values["EMBEDDING_API_KEY"].strip(),
             model=values["EMBEDDING_MODEL"].strip(),
+            expected_dimension=expected_dimension,
             batch_size=batch_size,
             timeout_seconds=timeout_seconds,
         )
@@ -101,10 +109,15 @@ def probe_embedding(
     dimensions = {len(vector) for vector in vectors}
     if len(dimensions) != 1:
         raise PreflightError("Embedding 返回的向量维度不一致")
+    actual_dimension = dimensions.pop()
+    if actual_dimension != config.expected_dimension:
+        raise PreflightError(
+            f"Embedding 返回维度与配置不一致：配置 {config.expected_dimension}，实际 {actual_dimension}"
+        )
 
     return {
         "accepted_batch_size": config.batch_size,
-        "dimension": dimensions.pop(),
+        "dimension": actual_dimension,
         "latency_ms": elapsed_ms,
         "model": config.model,
         "returned_vectors": len(vectors),

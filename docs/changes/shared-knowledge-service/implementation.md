@@ -32,7 +32,7 @@
 | 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding 和第一轮两侧项目文档效果均有新鲜证据，OGX 路线继续 |
 | 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供同步 Ingest、多知识库 Search 和稳定 SearchHit |
 | 12. 两侧契约 | 服务端完成 | Stella 四级范围和企业版显式知识库映射、过滤与 E2E 已固化；产品仓库适配后续各自实施 |
-| 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控和更大业务语料仍待实施 |
+| 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控、Embedding 模型迁移工具和更大业务语料仍待实施 |
 
 当前镜像已只预置 Docling PDF 默认路径需要的模型：Transformers layout、Accurate TableFormer 和 HybridChunker tokenizer，且都固定到 commit。构建阶段在离线模式初始化 PDF Pipeline，最终镜像约 `1.08 GB`，而不是此前包含未使用 ONNX/Fast 变体时的约 `4.55 GB`。
 
@@ -45,7 +45,7 @@
 - 不修改 OGX Core。VectorIO 通过外置 Provider 接入；统一产品接口通过 OGX `external_apis_dir` 接入。
 - 生产 Compose 始终只有 `knowledge-ogx / postgres / qdrant` 三个服务；测试桩不进入生产 Compose。
 - 一个部署默认一个 Qdrant Collection；VectorStore 是 Payload 中的逻辑范围，不创建独立 Collection。
-- 一个 Collection 固定一套 Dense Embedding 模型和维度。
+- Embedding Endpoint、模型和维度均为部署级配置；维度在初始化后保持不变，模型可调整但必须维度一致，并在切换时全量重新向量化已有 Chunk。
 - 产品负责权限计算；知识库服务校验并完整执行 `knowledge_base_ids + filters`，不推断权限。
 - 保留字段 `vector_store_id / file_id / chunk_id` 只能由服务生成，调用方 attributes 不能覆盖。
 - 所有凭证只从环境变量或 Secret 注入；示例、日志、测试快照和错误信息不得包含真实 Token。
@@ -426,6 +426,7 @@ shared-knowledge-service/
 
 - 生产 Compose 覆盖、S3 配置、认证配置、资源限制、日志与监控配置。
 - PostgreSQL、Qdrant Snapshot 和原文件的备份恢复 Runbook。
+- 相同维度下切换 Embedding 模型、迁移 OGX Registry 与全部 VectorStore 模型记录并全量重新向量化的运维命令与回滚说明。
 - 安全、升级、回滚和兼容性文档。
 
 **依赖**

@@ -13,6 +13,7 @@ def _config(**overrides: object) -> EmbeddingProbeConfig:
         "base_url": "https://embedding.example.test/v1",
         "api_key": "test-secret",
         "model": "test-embedding-model",
+        "expected_dimension": 3,
         "batch_size": 2,
         "timeout_seconds": 5.0,
     }
@@ -76,8 +77,8 @@ def test_probe_does_not_inherit_host_proxy(monkeypatch: pytest.MonkeyPatch) -> N
                 200,
                 json={
                     "data": [
-                        {"embedding": [0.1, 0.2]},
-                        {"embedding": [0.3, 0.4]},
+                        {"embedding": [0.1, 0.2, 0.3]},
+                        {"embedding": [0.4, 0.5, 0.6]},
                     ]
                 },
             )
@@ -98,6 +99,20 @@ def test_probe_rejects_inconsistent_dimensions() -> None:
     )
 
     with pytest.raises(PreflightError, match="维度不一致"):
+        probe_embedding(_config(), transport=transport)
+
+
+def test_probe_rejects_dimension_different_from_configuration() -> None:
+    """模型实际维度必须与部署配置一致。"""
+
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={"data": [{"embedding": [0.1, 0.2]}, {"embedding": [0.3, 0.4]}]},
+        )
+    )
+
+    with pytest.raises(PreflightError, match="配置 3，实际 2"):
         probe_embedding(_config(), transport=transport)
 
 
