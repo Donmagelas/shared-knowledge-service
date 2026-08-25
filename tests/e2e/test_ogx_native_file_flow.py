@@ -14,6 +14,19 @@ import pytest
 
 pytestmark = [pytest.mark.e2e]
 
+_ADMIN_TOKEN = "admin-e2e-at-least-sixteen"
+
+
+def _client(base_url: str, *, timeout: float = 180) -> httpx.Client:
+    """原生 OGX 路由只允许 Admin Token；统一路由也接受该超集 Token。"""
+
+    return httpx.Client(
+        base_url=base_url,
+        timeout=timeout,
+        trust_env=False,
+        headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
+    )
+
 
 def _compose_command() -> list[str]:
     """测试服务同时由生产 Compose 与 E2E 覆盖文件定义。"""
@@ -72,15 +85,35 @@ def _minimal_text_pdf() -> bytes:
 
 
 def _create_vector_store(client: httpx.Client, *, tenant_id: str = "e2e-default") -> str:
-    response = client.post(
-        "/v1/vector_stores",
+    configure = client.put(
+        f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
         json={
-            "name": f"e2e-{uuid.uuid4().hex[:8]}",
-            "metadata": {"test": True, "tenant_id": tenant_id},
+            "base_url": "http://embedding-stub:18080/v1",
+            "api_key": "native-e2e-secret",
+            "model_id": "deterministic-test",
+            "dimension": 3,
         },
     )
+    configure.raise_for_status()
+    if os.environ.get("E2E_EXPECT_RERANK", "1") == "1":
+        # 只有显式配置租户 Rerank 后，hybrid 检索才应调用远程重排服务。
+        rerank_configure = client.put(
+            f"/knowledge/v1/tenants/{tenant_id}/rerank-config",
+            json={
+                "enabled": True,
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "native-e2e-rerank-secret",
+                "model_id": "deterministic-rerank",
+            },
+        )
+        rerank_configure.raise_for_status()
+    response = client.post(
+        "/knowledge/v1/knowledge-bases",
+        headers={"Idempotency-Key": f"native-create-{uuid.uuid4()}"},
+        json={"tenant_id": tenant_id},
+    )
     response.raise_for_status()
-    return str(response.json()["id"])
+    return str(response.json()["knowledge_base_id"])
 
 
 def _attach_file(
@@ -112,6 +145,7 @@ def _submit_knowledge_ingest(
 
     response = client.post(
         "/knowledge/v1/ingest",
+        headers={"Idempotency-Key": f"native-ingest-{uuid.uuid4()}"},
         files={"file": (filename, content if content is not None else _fixture_bytes(), content_type)},
         data={
             "knowledge_base_id": vector_store_id,
@@ -276,11 +310,11 @@ def _kill_docling_workers() -> int:
 
 
 def test_native_file_ingestion_and_hybrid_search() -> None:
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     file_id: str | None = None
     vector_store_id: str | None = None
     try:
@@ -303,11 +337,12 @@ def test_native_file_ingestion_and_hybrid_search() -> None:
 
 
 def test_minimal_distribution_only_registers_required_api_families() -> None:
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    schema = httpx.get(f"{base_url}/openapi.json", timeout=30, trust_env=False).json()
+    with _client(base_url, timeout=30) as client:
+        schema = client.get("/openapi.json").json()
     paths = set(schema["paths"])
     required = {
         "/v1/files",
@@ -326,11 +361,11 @@ def test_minimal_distribution_only_registers_required_api_families() -> None:
 def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> None:
     """验证企业版多知识库和 Stella 单隐藏库共用同一稳定检索契约。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     vector_store_ids: list[str] = []
     file_ids: list[str] = []
     try:
@@ -363,7 +398,20 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
         response.raise_for_status()
         hits = response.json()["hits"]
         assert {hit["file_id"] for hit in hits} == {company_file, product_file}
-        assert all(set(hit) == {"file_id", "chunk_id", "content", "locator", "score", "attributes"} for hit in hits)
+        assert all(
+            set(hit)
+            == {
+                "knowledge_base_id",
+                "file_id",
+                "filename",
+                "chunk_id",
+                "content",
+                "locator",
+                "score",
+                "attributes",
+            }
+            for hit in hits
+        )
         if os.environ.get("E2E_EXPECT_RERANK", "1") == "1":
             # 测试 Reranker 返回 1000 起始的特殊分数，避免把 Qdrant RRF 分数误判为已完成远程重排。
             assert hits[0]["score"] == 1000.0
@@ -411,11 +459,11 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
 def test_multiple_async_ingests_complete_without_losing_files() -> None:
     """同时提交多个单文件 Batch，验证小并发下状态和索引都不会丢失。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     vector_store_id: str | None = None
     submitted: list[dict[str, object]] = []
     try:
@@ -452,11 +500,11 @@ def test_multiple_async_ingests_complete_without_losing_files() -> None:
 def test_unified_api_allows_same_tenant_and_rejects_cross_tenant_search() -> None:
     """验证 Collection 是租户边界，而 VectorStore 只是租户内逻辑范围。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     vector_store_ids: list[str] = []
     try:
         tenant_a_first = _create_vector_store(client, tenant_id="e2e-tenant-a")
@@ -495,11 +543,11 @@ def test_unified_api_allows_same_tenant_and_rejects_cross_tenant_search() -> Non
 
 
 def test_digital_pdf_is_parsed_and_searchable() -> None:
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     file_id: str | None = None
     vector_store_id: str | None = None
     try:
@@ -532,11 +580,11 @@ def test_digital_pdf_is_parsed_and_searchable() -> None:
 def test_one_file_can_be_attached_to_two_vector_stores_and_deleted_by_scope() -> None:
     """验证 OGX 对象生命周期不会破坏共享 Collection 中的其他逻辑知识库。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url:
-        pytest.skip("未设置 OGX_E2E_URL")
+        pytest.skip("未设置 OGX_NATIVE_E2E_URL")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     file_id: str | None = None
     vector_store_ids: list[str] = []
     try:
@@ -573,11 +621,11 @@ def test_one_file_can_be_attached_to_two_vector_stores_and_deleted_by_scope() ->
 def test_completed_data_survives_each_service_restart() -> None:
     """已完成数据必须在 PostgreSQL、Qdrant 与 OGX 分别重启后仍可检索。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url or os.environ.get("OGX_RESTART_E2E") != "1":
-        pytest.skip("需同时设置 OGX_E2E_URL 与 OGX_RESTART_E2E=1")
+        pytest.skip("需同时设置 OGX_NATIVE_E2E_URL 与 OGX_RESTART_E2E=1")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     file_id: str | None = None
     vector_store_id: str | None = None
     try:
@@ -592,7 +640,7 @@ def test_completed_data_survives_each_service_restart() -> None:
         for service in ("qdrant", "postgres", "knowledge-ogx"):
             client.close()
             _restart_compose_service(service)
-            client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+            client = _client(base_url)
             original = client.get(f"/v1/files/{file_id}/content")
             original.raise_for_status()
             assert original.content == _fixture_bytes(), f"{service} 重启后原文件内容变化"
@@ -612,11 +660,11 @@ def test_completed_data_survives_each_service_restart() -> None:
 def test_failed_attachment_can_be_deleted_and_retried() -> None:
     """验证 MVP 约定的显式恢复协议，而不是假定任意阶段都能自动续跑。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url or os.environ.get("OGX_FAILURE_E2E") != "1":
-        pytest.skip("需同时设置 OGX_E2E_URL 与 OGX_FAILURE_E2E=1")
+        pytest.skip("需同时设置 OGX_NATIVE_E2E_URL 与 OGX_FAILURE_E2E=1")
 
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     file_id: str | None = None
     vector_store_id: str | None = None
     try:
@@ -656,16 +704,16 @@ def test_failed_attachment_can_be_deleted_and_retried() -> None:
 def test_async_ingest_resumes_after_ogx_restart() -> None:
     """提交成功后立即重启 OGX，验证持久化 FileBatch 会恢复完整导入。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url or os.environ.get("OGX_ASYNC_RESTART_E2E") != "1":
-        pytest.skip("需同时设置 OGX_E2E_URL 与 OGX_ASYNC_RESTART_E2E=1")
+        pytest.skip("需同时设置 OGX_NATIVE_E2E_URL 与 OGX_ASYNC_RESTART_E2E=1")
 
     # 大文件用于确保重启发生时任务仍在处理，避免只验证已完成结果的读取。
     paragraphs = "".join(
         f"<h2>异步恢复规则 {index}</h2><p>退款必须提供订单编号和付款凭证。</p>" for index in range(1_000)
     )
     html = f"<!doctype html><html><body>{paragraphs}</body></html>".encode()
-    client = httpx.Client(base_url=base_url, timeout=240, trust_env=False)
+    client = _client(base_url, timeout=240)
     vector_store_id: str | None = None
     file_id: str | None = None
     try:
@@ -683,7 +731,7 @@ def test_async_ingest_resumes_after_ogx_restart() -> None:
 
         client.close()
         _restart_compose_service("knowledge-ogx")
-        client = httpx.Client(base_url=base_url, timeout=240, trust_env=False)
+        client = _client(base_url, timeout=240)
 
         completed = _wait_knowledge_ingest(
             client,
@@ -713,14 +761,14 @@ def test_async_ingest_resumes_after_ogx_restart() -> None:
 def test_docling_job_is_released_after_worker_crash() -> None:
     """终止正在执行的 Worker，验证租约到期后任务会被新 Worker 重新领取。"""
 
-    base_url = os.environ.get("OGX_E2E_URL")
+    base_url = os.environ.get("OGX_NATIVE_E2E_URL")
     if not base_url or os.environ.get("OGX_WORKER_CRASH_E2E") != "1":
-        pytest.skip("需同时设置 OGX_E2E_URL 与 OGX_WORKER_CRASH_E2E=1")
+        pytest.skip("需同时设置 OGX_NATIVE_E2E_URL 与 OGX_WORKER_CRASH_E2E=1")
 
     # 足够大的受支持 HTML 让测试能稳定观察到 in_progress，而不依赖 Docling 私有注入点。
     body = "".join(f"<h2>退款规则 {index}</h2><p>申请退款必须提供订单编号和付款凭证。</p>" for index in range(5_000))
     html = f"<!doctype html><html><body>{body}</body></html>".encode()
-    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    client = _client(base_url)
     submit = client.post(
         "/v1alpha/file-processors/jobs",
         files={"file": ("worker-crash.html", html, "text/html")},

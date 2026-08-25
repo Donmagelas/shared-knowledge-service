@@ -1,6 +1,6 @@
 # Stella × Cherry Studio 企业版统一知识库服务实施计划
 
-> 状态：MVP 内核、统一产品接口与第一轮真实效果评测已完成，生产化待实施
+> 状态：MVP 内核与统一产品接口已完成；真实 S3、备份、监控和更大业务语料仍待部署阶段验证
 >
 > 方案依据：[solution.md](./solution.md)
 >
@@ -16,7 +16,7 @@
 
 实施必须保持方案中的对象模型、权限边界、Collection 组织、任务可靠性边界和非目标，不在编码阶段重新引入 Haystack、Revision、PgQueuer、River 或独立 API 服务。异步导入复用 OGX 单文件 FileBatch 及 PostgreSQL 状态，不新增可部署组件。
 
-### 1.1 2026-08-24 实施快照
+### 1.1 2026-08-25 实施快照
 
 | 步骤 | 当前状态 | 已有证据或剩余事项 |
 | --- | --- | --- |
@@ -32,7 +32,8 @@
 | 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding 和第一轮两侧项目文档效果均有新鲜证据，OGX 路线继续 |
 | 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供异步 Ingest、Operation 状态、多知识库 Search 和稳定 SearchHit |
 | 12. 两侧契约 | 服务端完成 | Stella 四级范围和企业版显式知识库映射、过滤与 E2E 已固化；产品仓库适配后续各自实施 |
-| 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控和更大业务语料仍待实施 |
+| 13. 生产化 | 部分完成 | Runtime/Admin 认证、凭证加密、本地/S3 可选配置、稳定错误和无效文件清理已完成；真实 S3、备份恢复、监控和更大业务语料仍待验证 |
+| 14. 源码交付 | 完成 | 完整源码、Compose 本地构建、Secret 初始化、健康诊断和租户配置脚本已就绪；不再维护 GHCR 成品镜像和 Release 部署包 |
 
 租户 Collection 与产品调用模拟已完成一轮本地采样：67 个创建、导入、权限/挂载检索和跨租户拒绝场景全部通过；8 并发下执行 700 个 Hybrid 请求，吞吐约 `62.95 req/s`，平均 `126.26 ms`，P95 `181.76 ms`，最大 `428.39 ms`。并发阶段 OGX CPU 平均约 `92.82%`、P95 `105.60%`、内存最大约 `1172.48 MiB`；Qdrant CPU 平均约 `14.60%`、P95 `18.31%`、内存最大约 `165.70 MiB`；PostgreSQL CPU 平均约 `7.75%`、内存最大约 `70.68 MiB`。CPU `100%` 约等于一个逻辑核。
 
@@ -49,7 +50,7 @@
 - 不修改 OGX Core。VectorIO 通过外置 Provider 接入；统一产品接口通过 OGX `external_apis_dir` 接入。
 - 生产 Compose 始终只有 `knowledge-ogx / postgres / qdrant` 三个服务；测试桩不进入生产 Compose。
 - 每租户一个 Qdrant Collection；同租户 VectorStore 是 Payload 中的逻辑范围，不为每个知识库创建 Collection。没有租户 ID 的单租户部署使用默认 Collection。
-- Embedding Endpoint、模型和维度均为部署级配置；维度在初始化后保持不变，模型可调整但必须维度一致，并在切换时全量重新向量化已有 Chunk。
+- Embedding URL、Key、模型和维度由租户 Admin API 配置；首次 Ingest 初始化该租户 Collection 后锁定 URL、模型和维度，只允许轮换 Key。
 - 产品负责权限计算；知识库服务校验并完整执行 `knowledge_base_ids + filters`，不推断权限。
 - 保留字段 `vector_store_id / file_id / chunk_id` 只能由服务生成，调用方 attributes 不能覆盖。
 - 所有凭证只从环境变量或 Secret 注入；示例、日志、测试快照和错误信息不得包含真实 Token。
@@ -70,8 +71,7 @@ shared-knowledge-service/
 ├── .env.example
 ├── config/
 │   ├── ogx.yaml
-│   ├── providers.d/
-│   └── apis.d/                 # 统一产品 API 阶段再启用
+│   └── apis.d/                 # 已启用统一 Knowledge External API
 ├── src/shared_knowledge_service/
 │   ├── provider/               # 外置 Qdrant VectorIO Provider
 │   ├── retrieval/              # Payload、Filter、BM25、RRF 查询构造
@@ -103,7 +103,7 @@ shared-knowledge-service/
 **改动区域**
 
 - `pyproject.toml`、`uv.lock`、`.python-version`、`.gitignore`、`.env.example`。
-- 一个只读 Embedding preflight 脚本及其单元测试。
+- 租户 Embedding Admin API 在保存配置前对调用方提交的确切 Endpoint、模型和维度执行探针。
 - `README.md` 中的本地环境和凭证规则。
 
 **依赖**
@@ -114,7 +114,7 @@ shared-knowledge-service/
 **验证方法**
 
 - 在全新虚拟环境执行 `uv sync --frozen`。
-- 无 Token 时 preflight 明确报告缺失配置；有 Token 时调用 `/v1/embeddings` 并只输出模型、维度和延迟。
+- 缺少 URL、Key、模型或维度时配置接口明确拒绝；配置完整时调用 `/v1/embeddings` 并校验返回维度，响应和日志不回显 Token。
 - 扫描仓库，确认没有真实 Token、内部 URL 或 `.env` 被跟踪。
 - 启动目标 Qdrant 镜像并执行最小 Sparse Vector + IDF + RRF 特性探针。
 
@@ -188,7 +188,7 @@ shared-knowledge-service/
 **依赖**
 
 - 步骤 3。
-- 步骤 1 的 Embedding preflight 通过后才能运行真实模型测试。
+- 步骤 1 的租户 Embedding 配置探针通过后才能运行真实模型测试。
 
 **验证方法**
 
@@ -444,6 +444,28 @@ shared-knowledge-service/
 - 本地卷与 S3 后端运行同一 Files/导入 E2E 契约。
 - 依赖、许可证、镜像和 Secret 扫描通过。
 
+### 步骤 14：提供可直接修改的源码交付
+
+**预期结果**
+
+- 使用方拿到完整源码后可以修改 Provider、API、配置、依赖和 Dockerfile。
+- 宿主机只需 Linux amd64、Docker、Compose 与 curl；Python、uv 和 Docling 模型在镜像构建阶段处理。
+- PostgreSQL 与 Qdrant 使用固定官方镜像，Knowledge 从当前工作区源码构建。
+
+**已实现**
+
+- 根目录 `Dockerfile`、`compose.yaml`、`.env.example`、`pyproject.toml` 与 `uv.lock` 构成可重复的源码构建入口。
+- `scripts/init-env.sh` 生成四项本地 Secret；`build-production-image.sh` 处理模型端点和镜像构建；`doctor.sh` 验证三服务与 HTTP 路由；`configure-tenant.sh` 隐藏提交模型 Key。
+- README 首页提供 clone、初始化、构建、启动和诊断流程。
+- 已移除只服务于成品镜像的 GHCR Release workflow、部署包目录和打包脚本，避免维护两套交付路径。
+
+**本地验证结果**
+
+- 已从排除 `.git`、`.venv`、`.env` 和本地缓存的全新源码副本执行完整流程。
+- `init-env.sh` 生成的 `.env` 权限为 `0600`，四项示例凭证均被随机值替换，Compose 配置和全部辅助脚本语法检查通过。
+- `build-production-image.sh` 完成固定模型端点探测并从源码构建镜像；依赖和 Docling 模型层命中缓存，只有业务源码层重建。
+- 独立 Compose 项目中的 PostgreSQL、Qdrant、Knowledge 三个容器全部 healthy，宿主机 `/v1/health` 返回正常；验证后的临时容器和三个测试数据卷已清理。
+
 ## 5. 并行与阻塞关系
 
 ```text
@@ -455,7 +477,7 @@ shared-knowledge-service/
                                            ↓
 步骤 11 → 步骤 12
           └───────────────┐
-步骤 10 → 步骤 13 ────────┴→ 生产化完成
+步骤 10 → 步骤 13 → 步骤 14 ┴→ 可源码交付
 ```
 
 - 步骤 6 与步骤 2～5 的实现区域相对独立，可以并行；最终 Qdrant 接入必须等待步骤 3。

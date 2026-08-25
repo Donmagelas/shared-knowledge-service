@@ -72,10 +72,20 @@ def test_tenant_collection_name_is_stable_and_does_not_expose_tenant_id() -> Non
     assert config.collection_name_for_tenant(None) == config.collection_name
 
 
-def test_bound_collection_cannot_be_changed() -> None:
+def test_collection_binding_can_replace_placeholder_before_initialize() -> None:
     index = _index("vs-a")
 
     index.bind_collection(index.config.collection_name)
+    index.bind_collection("another-tenant")
+
+    assert index.bound_collection_name == "another-tenant"
+
+
+def test_bound_collection_cannot_be_changed_after_initialize() -> None:
+    index = _index("vs-a")
+
+    index.bind_collection(index.config.collection_name)
+    index._initialized = True
     with pytest.raises(ValueError, match="不能迁移"):
         index.bind_collection("another-tenant")
 

@@ -9,8 +9,8 @@ ARG DOCLING_TABLE_MODEL_REVISION=fc0f2d45e2218ea24bce5045f58a389aed16dc23
 ARG DOCLING_TOKENIZER_MODEL=sentence-transformers/all-MiniLM-L6-v2
 ARG DOCLING_TOKENIZER_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
 ARG HF_ENDPOINT=https://huggingface.co
-ARG PYPI_SIMPLE_URL=https://pypi.org/simple
-ARG PYPI_FILES_URL=https://files.pythonhosted.org/packages
+ARG PYPI_SIMPLE_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PYPI_FILES_URL=https://mirrors.aliyun.com/pypi/packages
 
 ENV DOCLING_TOKENIZER_MODEL=${DOCLING_TOKENIZER_MODEL} \
     DOCLING_TOKENIZER_REVISION=${DOCLING_TOKENIZER_REVISION} \

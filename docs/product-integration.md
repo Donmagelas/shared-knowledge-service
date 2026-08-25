@@ -1,24 +1,31 @@
 # Stella 与 Cherry Studio 企业版产品接入契约
 
-本文只说明两侧需要维护的映射和调用方式。用户、组织、角色、权限规则和 UI 均由产品维护；统一知识库只执行产品传入的逻辑知识库范围和 Filter。
+本文只说明两侧需要维护的映射和调用方式。用户、组织、角色、权限规则和 UI 均由产品维护；统一知识库只执行产品传入的逻辑 KnowledgeBase 范围和 Filter。
 
 ## 1. 共同对象映射
 
 | 产品概念 | 统一知识库概念 | Qdrant 表达 |
 | --- | --- | --- |
-| 租户 | VectorStore `metadata.tenant_id` 中的可信路由信息 | 一个独立 Collection；原始租户 ID 不写入 Collection 名或 Point Payload |
-| 逻辑知识库 | OGX VectorStore，ID 对外称 `knowledge_base_id` | 租户 Collection 内 Point 的 `vector_store_id` Payload |
-| 上传文件 | OGX File + VectorStoreFile | 原文件在 File Store，Chunk 在共享 Collection |
+| 租户 | 租户模型配置 + KnowledgeBase 中的可信 `tenant_id` | 一个独立 Collection；物理名称使用租户 ID 的哈希 |
+| 逻辑知识库 | 技术 `KnowledgeBase`，内部复用 OGX VectorStore | 租户 Collection 内 Point 的 `vector_store_id` Payload |
+| 上传文件 | OGX File + 单文件 FileBatch + FileRecord | 原文件在本地卷/S3，Chunk 在租户 Collection |
 | 产品过滤字段 | Ingest `attributes` | `attributes.<field>` Payload |
 | 本次可检索范围 | Search `knowledge_base_ids + filters` | 服务强制生成 `vector_store_id IN [...] AND filter` |
 
-一个租户只有一个共享 Qdrant Collection；同一服务可以承载多个相互隔离的租户 Collection。创建 VectorStore 时写入一次可信 `tenant_id`，后续 Ingest/Search 只传 `knowledge_base_id(s)`，Provider 根据已持久化的 metadata 路由，不要求产品重复传租户 ID。没有 `tenant_id` 的 VectorStore 进入单租户默认 Collection。
+一个租户只有一个 Qdrant Collection；同一服务可以承载多个相互隔离的租户 Collection。产品只在创建技术 KnowledgeBase 时传入可信 `tenant_id`，后续 Ingest/Search 传 `knowledge_base_id(s)`，服务根据持久化映射路由。
 
-Embedding Endpoint、模型 ID 和维度由每套部署配置，不在代码中固定。维度在每个 Collection 初始化时确定，当前部署内不再修改；模型 ID 由部署方选择。当前范围不设计已有数据的模型切换流程。租户内新增业务知识库只是新增 VectorStore ID 和 Payload 值，不会新建 Dense/BM25 索引结构。
+租户开始使用前，由产品后端使用 Admin Token 配置：
+
+- Embedding `base_url / api_key / model_id / dimension`。
+- 可选 Rerank `enabled / base_url / 独立 api_key / model_id`。
+
+统一知识库不获取模型列表。Embedding URL、模型和维度在该租户第一次 Ingest 初始化 Collection 后锁定；Key 可以轮换。Rerank 不参与持久化索引，可以按租户修改或关闭。
 
 ## 2. Stella
 
-Stella 在部署初始化时创建一个隐藏 VectorStore，并把返回 ID 保存在产品配置或数据库中。若部署需要和其他租户共用统一服务，创建时写入稳定的部署/租户 ID；独占单租户部署可以使用默认 Collection。上传时，Stella 从可信运行时写入四级范围 attributes：
+Stella 把自己视为一个租户，并在部署初始化时创建一个隐藏 KnowledgeBase，将返回 ID 保存在 Stella 配置或数据库中。它通常不向用户展示 KnowledgeBase 管理 UI。
+
+上传时，Stella 从可信运行时写入四级范围 attributes：
 
 | scope | `user_id` | `agent_id` |
 | --- | --- | --- |
@@ -27,7 +34,7 @@ Stella 在部署初始化时创建一个隐藏 VectorStore，并把返回 ID 保
 | `user` | 当前用户 | 不写 |
 | `user_agent` | 当前用户 | 当前 Agent |
 
-检索当前用户 `U`、Agent `A` 时，Stella 传固定隐藏 `knowledge_base_id`，并生成以下等价 Filter：
+检索当前用户 `U`、Agent `A` 时，Stella 传固定隐藏 `knowledge_base_id`，并生成：
 
 ```json
 {
@@ -51,28 +58,38 @@ Stella 在部署初始化时创建一个隐藏 VectorStore，并把返回 ID 保
 }
 ```
 
-Stella 负责确保 `scope / user_id / agent_id` 来自可信身份，不接受终端用户直接提交 owner 字段。
+Stella 负责确保 `scope / user_id / agent_id` 来自可信身份。统一知识库只验证通用 Filter 结构并在 Qdrant 检索阶段完整执行，不理解“四级权限”的业务含义。
+
+Stella 主要使用：
+
+- 部署时：租户 Embedding/Rerank 配置、创建/检查隐藏 KnowledgeBase。
+- 运行时：Ingest、Operation 查询/重试、File 查询/删除、Search。
+- 不需要：业务知识库列表、重命名、用户挂载或权限管理接口。
 
 ## 3. Cherry Studio 企业版
 
-公司、部门、产品等知识库是企业版显式业务对象。企业版创建业务对象时调用 `POST /v1/vector_stores`，在 metadata 中写入当前可信租户 ID，并把自己的业务 ID 与返回的 `vector_store_id` 一对一保存。`tenant_id` 只决定存储路由，创建后不可修改。
+公司、部门、产品等知识库是企业版显式业务对象。企业版先在自己的数据库中创建业务对象，再调用 `POST /knowledge/v1/knowledge-bases`，把自己的业务 ID 与返回的 `knowledge_base_id` 一对一保存。
 
 企业版负责：
 
-- 知识库名称、业务归属、展示字段与 CRUD UI。
+- 业务知识库名称、归属、展示字段与 CRUD UI。
 - 用户、组织、角色到业务知识库的授权和挂载关系。
 - 每次 Search 前把允许访问的业务知识库映射成 `knowledge_base_ids`。
+- 选择当前租户使用的 Embedding/Rerank 连接和凭证，并在租户开始使用前配置。
 
-例如当前用户可访问公司库与产品 A 库，Search 传入两个 ID；统一服务确认两者属于同一租户后，在该租户 Collection 中执行一条 `vector_store_id IN [company, product-a]` 的 Dense/BM25/Hybrid 查询，不进行两次检索后的二次融合。如果两者来自不同租户，服务返回 422，不读取任何一个 Collection。
+例如当前用户可访问公司库与产品 A 库，企业版传入两个技术 ID；服务确认两者属于同一租户后，在一个 Collection 中执行一次 Dense/BM25/Hybrid 查询。若 ID 属于不同租户，服务返回 `422 cross_tenant_search`，不会读取任意一个 Collection。
 
-## 4. 统一知识库维护范围
+“挂载知识库”只存在于企业版产品数据库中，不调用统一知识库的 Mount API。创建、展示和修改业务对象也不等于修改 Qdrant Payload；只有删除业务知识库时，企业版才调用技术 KnowledgeBase DELETE 清理其文件和索引。
+
+## 4. 维护边界
 
 | Stella / 企业版维护 | 统一知识库维护 |
 | --- | --- |
-| 权限规则、可信身份、组织关系 | Files、VectorStore、VectorStoreFile 状态 |
-| 业务知识库对象及 ID 映射 | 原文件存储、Docling、HybridChunker |
-| 上传 attributes 和 Search filters 的业务生成 | Embedding、Dense、BM25、Qdrant RRF |
-| 产品 UI、挂载选择、配额 | Filter 校验与强制知识库范围 |
-| 调用失败后的产品提示和显式重试 | 稳定 Ingest/Search 响应、删除和恢复协议 |
+| 用户认证、权限规则、可信身份和组织关系 | Runtime/Admin 服务认证与稳定错误协议 |
+| 业务知识库对象、名称、归属、挂载关系及技术 ID 映射 | 技术 KnowledgeBase、File、FileBatch、Operation 和幂等状态 |
+| 上传 attributes 与 Search filters 的业务生成 | 保留字段保护、同租户检查和 Qdrant 范围强制 |
+| 租户选择的模型 URL、Key、模型 ID 和 Embedding 维度 | 凭证加密、配置锁定、精确模型探针和实际模型调用 |
+| 产品 UI、配额、业务审计和错误提示 | 本地/S3 原文件、Docling、HybridChunker、Dense、BM25、RRF、可选 Rerank |
+| 决定何时创建、重试、删除 | 异步执行、崩溃恢复、技术删除和无效原文件自动清理 |
 
-知识库服务不提供用户创建或权限分配接口。企业版需要的“新建知识库”由企业版创建业务对象后调用 VectorStore 辅助接口完成；Stella 通常不把该能力暴露给用户。
+统一知识库不提供用户创建、权限分配、业务 KnowledgeBase 列表/改名、挂载、原文件下载、任务取消或模型列表接口。

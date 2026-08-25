@@ -12,18 +12,17 @@ external_apis_dir: config/apis.d
 
 providers:
   inference:
-    - provider_id: embedding
-      provider_type: remote::openai
+    - provider_id: tenant-inference
+      provider_type: remote::tenant-inference
+      module: shared_knowledge_service.tenant_inference
       config:
-        api_key: ${env.EMBEDDING_API_KEY:=}
-        base_url: ${env.EMBEDDING_BASE_URL}
-    - provider_id: rerank
-      provider_type: remote::shared-rerank
-      module: shared_knowledge_service.rerank
-      config:
-        api_token: ${env.RERANK_API_KEY:=}
-        base_url: ${env.RERANK_BASE_URL:=https://api.example.com/v1}
-        enabled: ${env.RERANK_ENABLED:=false}
+        allowed_hosts: ${env.KNOWLEDGE_INFERENCE_ALLOWED_HOSTS:=}
+        credential_master_key: ${env.KNOWLEDGE_CREDENTIAL_MASTER_KEY}
+        http_allowed_hosts: ${env.KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS:=}
+        persistence:
+          backend: kv_default
+          namespace: knowledge_control
+        timeout_seconds: ${env.KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS:=30}
 
   vector_io:
     - provider_id: shared-qdrant
@@ -39,18 +38,23 @@ providers:
           backend: kv_default
           namespace: vector_io::shared_qdrant
         rerank_candidate_limit: ${env.RERANK_CANDIDATE_LIMIT:=50}
-        rerank_enabled: ${env.RERANK_ENABLED:=false}
-        rerank_model: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
         sparse_vector_name: bm25
         url: ${env.QDRANT_URL:=http://localhost:6333}
 
   files:
     - provider_id: builtin-files
-      provider_type: inline::localfs
+      # 部署时可在本地持久卷和 S3/S3-compatible 对象存储之间选择，API 不变。
+      provider_type: ${env.FILES_PROVIDER_TYPE:=inline::localfs}
       config:
+        auto_create_bucket: ${env.S3_AUTO_CREATE_BUCKET:=false}
+        aws_access_key_id: ${env.AWS_ACCESS_KEY_ID:=}
+        aws_secret_access_key: ${env.AWS_SECRET_ACCESS_KEY:=}
+        bucket_name: ${env.S3_BUCKET_NAME:=}
+        endpoint_url: ${env.S3_ENDPOINT_URL:=}
         metadata_store:
           backend: sql_default
           table_name: files_metadata
+        region: ${env.AWS_REGION:=us-east-1}
         storage_dir: ${env.FILES_STORAGE_DIR:=/data/files}
 
   file_processors:
@@ -65,7 +69,19 @@ providers:
   knowledge:
     - provider_id: shared-knowledge
       provider_type: inline::shared-knowledge
-      config: {}
+      config:
+        admin_token: ${env.KNOWLEDGE_ADMIN_TOKEN}
+        allowed_inference_hosts: ${env.KNOWLEDGE_INFERENCE_ALLOWED_HOSTS:=}
+        credential_master_key: ${env.KNOWLEDGE_CREDENTIAL_MASTER_KEY}
+        failed_source_retention_days: ${env.KNOWLEDGE_FAILED_SOURCE_RETENTION_DAYS:=7}
+        file_cleanup_interval_hours: ${env.KNOWLEDGE_FILE_CLEANUP_INTERVAL_HOURS:=24}
+        http_allowed_inference_hosts: ${env.KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS:=}
+        inference_timeout_seconds: ${env.KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS:=30}
+        persistence:
+          backend: kv_default
+          namespace: knowledge_control
+        runtime_token: ${env.KNOWLEDGE_RUNTIME_TOKEN}
+        uncommitted_source_retention_hours: ${env.KNOWLEDGE_UNCOMMITTED_SOURCE_RETENTION_HOURS:=24}
 
 storage:
   backends:
@@ -99,26 +115,18 @@ storage:
       table_name: vector_store_metadata
 
 registered_resources:
-  models:
-    - metadata:
-        embedding_dimension: ${env.EMBEDDING_DIMENSION:=3}
-      model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
-      provider_id: embedding
-      provider_model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
-      model_type: embedding
-    - model_id: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
-      provider_id: rerank
-      provider_model_id: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
-      model_type: rerank
+  models: []
   vector_stores: []
 
 server:
+  auth:
+    provider_config:
+      # 回调位于同一进程，只接受 Admin Token；Knowledge API 路由自行鉴权。
+      endpoint: http://127.0.0.1:8321/knowledge/v1/internal/auth/validate
+      type: custom
   port: 8321
 
 vector_stores:
-  default_embedding_model:
-    model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
-    provider_id: embedding
   default_provider_id: shared-qdrant
   file_ingestion_params:
     default_chunk_overlap_tokens: 400

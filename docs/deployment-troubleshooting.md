@@ -81,21 +81,21 @@ Qdrant 1.18.2 已能在服务端根据 `qdrant/bm25` 文档生成 Sparse Vector�
 - `knowledge-qdrant-preflight` 同时验证服务端 BM25、Payload Filter 和原生 RRF；升级 Qdrant 前必须重新运行。
 - 当前选择只对固定的 Qdrant 1.18.2 生效；未来版本若调整语言选项，先迁移协议并重建索引，不原地混用两种编码。
 
-## 6. OpenAI-compatible Embedding 服务未实现模型列表接口
+## 6. OpenAI-compatible 模型服务未实现模型列表接口
 
 **现象**
 
-OGX 启动时可能记录 `list_provider_model_ids() failed` 或 `/models` 404，但显式注册的 Embedding 模型仍能正常完成 `/embeddings` 请求。
+部分模型网关没有 `/models`，但确切的 `/embeddings` 或 `/rerank` 请求可以正常工作。
 
 **原因**
 
-部分 OpenAI-compatible 服务只实现 Embedding/Chat 接口，没有实现完整的模型枚举接口。OGX 的周期模型发现与实际已注册模型调用是两条路径。
+模型发现与调用确切模型是两项不同能力。本项目只需要后者，继续执行 OGX 默认模型发现会产生无意义告警，甚至把同一网关的其他模型注册成错误类型。
 
 **解决**
 
-- 在 `registered_resources.models` 中显式配置 `model_id`、provider 和 `embedding_dimension`。
-- 以 Embedding preflight 和真实导入结果判断可用性，不把模型刷新告警单独当成服务不可用。
-- 如果实际 `/embeddings` 也失败，则按真实调用失败处理，不能忽略。
+- `tenant-inference` 明确返回空模型目录，并禁止自动刷新。
+- Admin API 只探测调用方提交的确切 URL、模型和 Embedding 维度，不访问或包装 `/models`。
+- 以配置接口的探针、真实 Ingest 和 Search 判断可用性；实际调用失败仍按稳定错误或 Operation 失败处理。
 
 ## 7. Docling Worker 的内存和租约回收不是瞬时行为
 
@@ -142,7 +142,7 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 **解决**
 
 - Dockerfile 已把 Debian、PyPI 和 Hugging Face 下载地址做成构建参数；版本、commit 和 `uv.lock` 哈希校验不随镜像地址改变。
-- 当前默认使用阿里云 Debian 与 Debian Security 镜像，避免当前部署网络反复等待官方源；其他环境仍可显式覆盖。
+- 当前默认使用阿里云 Debian、Debian Security 与 PyPI 镜像，避免当前部署网络反复等待官方源；其他环境仍可显式覆盖。
 - 使用 `scripts/build-production-image.sh` 构建生产镜像。脚本先探测 `HF_ENDPOINT` 上固定 revision 的 tokenizer、layout 和 TableFormer 配置文件；任一不可达时明确提示并尝试 `HF_FALLBACK_ENDPOINT`，不会只根据站点首页判断。
 - 在对应网络中通过 `.env` 或构建环境设置已验证可达的 `DEBIAN_MIRROR`、`DEBIAN_SECURITY_MIRROR`、`PYPI_SIMPLE_URL`、`PYPI_FILES_URL`、`HF_ENDPOINT` 和 `HF_FALLBACK_ENDPOINT`。
 - 切换镜像只改变传输来源，不得去掉基础镜像 digest、Python 锁文件或 Docling 模型 revision。
@@ -175,25 +175,24 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 
 **解决**
 
-- `knowledge-embedding-preflight` 显式使用 `trust_env=False`，不继承开发机通用代理。
-- 使用与生产 OGX OpenAI-compatible Provider 接近的 HTTP 客户端验证 `/embeddings`，不要用单个临时客户端的结果替代真实链路。
+- 租户 Embedding Admin API 使用与生产调用相同的安全 HTTP 路径探测 `/embeddings`，不依赖开发机临时脚本。
+- 使用配置接口与真实 Ingest 验证 `/embeddings`，不要用单个临时客户端的结果替代真实链路。
 - 依次区分网络/网关、鉴权、模型路由和响应协议；只有请求已进入模型路由后，模型不存在的 `404` 才能用于淘汰模型 ID。
 - 当前实测 `qwen/qwen3-embedding-8b` 可返回 4096 维向量；该结论仍需以部署环境的实时探针为准。
 
-## 12. 在同一 OGX 逻辑数据库中直接切换 Embedding 模型可能启动失败
+## 12. 已初始化 Collection 不能直接切换 Embedding 向量空间
 
 **现象**
 
-一个模型已运行并完成 OGX 模型目录刷新后，只修改 `EMBEDDING_MODEL` 和维度再重启，可能出现 `already exists with conflicting field values`。本次实测中，自动发现记录把另一个 Qwen Embedding 模型登记为 `llm`，与随后显式注册的 `embedding` 类型冲突。
+如果已有 Chunk 后直接修改 Embedding 模型、URL 或维度，旧向量与新查询向量不再属于同一向量空间；即使维度数字相同，也可能静默降低结果质量。修改维度还会与 Qdrant Collection Schema 直接冲突。
 
 **影响与解决**
 
-- 维度在部署初始化后保持不变；新模型必须返回配置的相同维度，否则前置探针直接拒绝。
-- 已有数据不能通过只改环境变量安全切换模型；当前范围不提供模型切换或迁移工具。若未来提出该需求，再单独设计数据重建与回滚流程。
-- 本次多模型评测为每个候选创建独立 PostgreSQL 评测数据库和 Qdrant Collection，没有清理或篡改原有注册表。
-- 正式设计迁移工具前，不自动删除 OGX Registry 记录；删除错误记录可能影响仍在使用的模型和 VectorStore。
+- 租户第一次 Ingest 初始化 Collection 后，服务锁定该租户的 Embedding URL、模型和维度。
+- 后续提交不同 URL、模型或维度返回 `409 embedding_config_locked`；只允许在其他字段不变时轮换 Key。
+- 多模型评测必须使用独立租户 Collection，不能在已有 Collection 中混写两种向量空间。
 
-## 13. OGX vLLM Rerank 路径与版本化网关不一致
+## 13. OGX vLLM Rerank 路径与租户配置模型不一致
 
 **现象**
 
@@ -202,9 +201,9 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 **原因与解决**
 
 - OGX `1.3.0` 的 vLLM Provider 会主动去掉 Base URL 末尾的 `/v1`，这是针对原生 vLLM 路径的行为，不适用于当前版本化网关。
-- 本项目的 `remote::shared-rerank` Provider 复用 OGX vLLM 请求、鉴权和响应转换，只保留 Base URL 中的 `/v1`，最终调用 `/v1/rerank`。
-- 不使用把 Base URL 伪造成 `/v1/v1` 的配置技巧；该做法会破坏健康检查和其他模型接口语义。
-- OGX `1.3.0` 的 `--dry-run` 校验没有把当前配置传给外置 Provider Registry，可能误报 `remote::shared-rerank` 不可用。应以配置感知的 Registry 测试和真实 Compose 启动为准，不能据此判断 Provider 注册失败。
+- 早期的全局 `remote::shared-rerank` 只能在进程启动时固定一套 URL、Key 和模型，不能满足企业版每租户使用独立 Key/模型。
+- 当前只保留 `remote::tenant-inference`：OGX 内部模型资源指向不含敏感信息的租户 Profile ID，实际调用时再从 PostgreSQL 解密该租户凭证。
+- Provider 保留调用方配置中的 `/v1` 等路径，最终拼接 `/rerank`；不使用伪造 `/v1/v1` 的配置技巧。
 ## 14. 租户 Collection 路由
 
 - `QDRANT_COLLECTION_NAME` 是单租户默认 Collection 名，也是多租户 Collection 的前缀；它不是企业版业务知识库 ID。
@@ -258,3 +257,40 @@ OGX `1.3.0` 在优雅关闭时取消进程内 Batch Task；后台协程捕获 `C
 - 异步状态接口会返回明确的 `failed` 和文件级错误，不会把该文件误报为完成。
 - 当前重启恢复测试使用 1000 个段落，既能稳定覆盖停机窗口，也不会越过当前测试模型的单请求上限。
 - 正式支持超大文档前，需要把 Chunk Embedding 按配置上限分批，并验证任一批失败时的 Qdrant 清理或幂等重试；不能只放宽 Pydantic 校验。
+
+## 18. 可选环境变量的空字符串会破坏 Provider 配置解析
+
+**现象**
+
+Compose 为可选的 Host、S3 Endpoint 或 API Key 传入空字符串后，OGX/Pydantic 可能把它当成“已经配置的值”，而不是 `None`。不同 Provider 对空字符串的解释不一致，可能导致启动校验或首次连接失败。
+
+**解决**
+
+- 对 Knowledge 与租户 Inference 的可选字符串使用允许 `None` 的配置模型，并在业务边界统一去除空白。
+- Files 配置同时包含本地卷和 S3 字段；实际 Provider 只验证自己需要的字段。切换到 `remote::s3` 时必须显式填写 Bucket 和凭证。
+- `docker compose config` 只能证明变量替换成功，仍需分别解析 `inline::localfs` 和 `remote::s3` Provider 配置。
+
+## 19. OGX 原生路由与统一 Knowledge API 需要不同权限边界
+
+**现象**
+
+如果只给 `/knowledge/v1/*` 增加 Token，部署在同一端口的 OGX `/v1/files`、`/v1/vector_stores` 等原生接口可能绕过统一对象、租户和幂等协议。若把 OGX 全局鉴权直接套到 Knowledge API，又会丢失 Runtime/Admin 差异和稳定错误信封。
+
+**解决**
+
+- OGX 全局 Custom Auth 回调位于同一进程，只接受 Admin Token，因此原生路由仅供运维诊断。
+- Knowledge 路由对 OGX 标记为公开，再由自身校验 Runtime/Admin Token，返回统一 `error.code + request_id`。
+- 内部鉴权回调不进入 OpenAPI；Runtime Token 无法访问原生 Files/VectorStore API。
+
+## 20. FileBatch 与统一控制面之间存在跨存储崩溃窗口
+
+**现象**
+
+OGX File、FileBatch、统一 API 幂等记录和 Qdrant 不在一个物理事务中。进程可能在“原文件已保存、Batch 已创建、控制面记录尚未完成”的任意间隙退出。
+
+**解决**
+
+- Ingest 要求 `Idempotency-Key`，并先保存可恢复记录；重放时按 `VectorStore + 单 File + attributes` 找回已经存在的 FileBatch，不重复创建任务。
+- Operation 终态第一次被读取后持久化快照；即使 OGX Batch 后续过期，仍可返回稳定终态。
+- Knowledge 进程启动时及每日扫描无效原文件：未提交记录默认保留 24 小时，最终失败文件默认保留 7 天，孤儿 File 默认保留 24 小时。
+- 清理步骤保持幂等；检测到仍有 `in_progress` Batch 时不删除原文件。保留周期可由部署环境调整，但不增加公开清理 API。

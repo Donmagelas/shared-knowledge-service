@@ -66,15 +66,6 @@ class SharedQdrantVectorIOConfig(BaseModel):
         default_factory=dict,
         description="需要高性能过滤的业务 attributes 字段及其类型",
     )
-    rerank_enabled: bool = Field(
-        default=False,
-        description="是否在 Hybrid RRF 候选集后调用远程神经 Reranker",
-    )
-    rerank_model: str = Field(
-        default="qwen/qwen3-reranker-0.6b",
-        min_length=1,
-        description="Rerank Provider 中注册的原始模型 ID",
-    )
     rerank_candidate_limit: int = Field(
         default=50,
         ge=1,
@@ -99,8 +90,6 @@ class SharedQdrantVectorIOConfig(BaseModel):
                 "payload_indexes",
                 "persistence",
                 "rerank_candidate_limit",
-                "rerank_enabled",
-                "rerank_model",
                 "sparse_vector_name",
             },
         )

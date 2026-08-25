@@ -38,9 +38,9 @@ services:
         DOCLING_TABLE_MODEL_REVISION: ${DOCLING_TABLE_MODEL_REVISION:-fc0f2d45e2218ea24bce5045f58a389aed16dc23}
         DOCLING_TOKENIZER_MODEL: ${DOCLING_TOKENIZER_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
         DOCLING_TOKENIZER_REVISION: ${DOCLING_TOKENIZER_REVISION:-1110a243fdf4706b3f48f1d95db1a4f5529b4d41}
-        HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
-        PYPI_FILES_URL: ${PYPI_FILES_URL:-https://files.pythonhosted.org/packages}
-        PYPI_SIMPLE_URL: ${PYPI_SIMPLE_URL:-https://pypi.org/simple}
+        HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+        PYPI_FILES_URL: ${PYPI_FILES_URL:-https://mirrors.aliyun.com/pypi/packages}
+        PYPI_SIMPLE_URL: ${PYPI_SIMPLE_URL:-https://mirrors.aliyun.com/pypi/simple}
       context: .
       dockerfile: Dockerfile
     depends_on:
@@ -49,11 +49,20 @@ services:
       qdrant:
         condition: service_healthy
     environment:
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.example.com/v1}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-3}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-replace-with-embedding-model}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      FILES_PROVIDER_TYPE: ${FILES_PROVIDER_TYPE:-inline::localfs}
       FILES_STORAGE_DIR: /data/files
+      KNOWLEDGE_ADMIN_TOKEN: ${KNOWLEDGE_ADMIN_TOKEN:-admin-local-only-change-me}
+      KNOWLEDGE_CREDENTIAL_MASTER_KEY: ${KNOWLEDGE_CREDENTIAL_MASTER_KEY:-credential-local-only-change-me}
+      KNOWLEDGE_FAILED_SOURCE_RETENTION_DAYS: ${KNOWLEDGE_FAILED_SOURCE_RETENTION_DAYS:-7}
+      KNOWLEDGE_FILE_CLEANUP_INTERVAL_HOURS: ${KNOWLEDGE_FILE_CLEANUP_INTERVAL_HOURS:-24}
+      KNOWLEDGE_INFERENCE_ALLOWED_HOSTS: ${KNOWLEDGE_INFERENCE_ALLOWED_HOSTS:-}
+      KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS: ${KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS:-}
+      KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS: ${KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS:-30}
+      KNOWLEDGE_RUNTIME_TOKEN: ${KNOWLEDGE_RUNTIME_TOKEN:-runtime-local-only-change-me}
+      KNOWLEDGE_UNCOMMITTED_SOURCE_RETENTION_HOURS: ${KNOWLEDGE_UNCOMMITTED_SOURCE_RETENTION_HOURS:-24}
       POSTGRES_DB: ${POSTGRES_DB:-ogx}
       POSTGRES_HOST: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ogx-local-only}
@@ -62,11 +71,10 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-shared_knowledge}
       QDRANT_URL: http://qdrant:6333
-      RERANK_API_KEY: ${RERANK_API_KEY:-}
-      RERANK_BASE_URL: ${RERANK_BASE_URL:-https://api.example.com/v1}
       RERANK_CANDIDATE_LIMIT: ${RERANK_CANDIDATE_LIMIT:-50}
-      RERANK_ENABLED: ${RERANK_ENABLED:-false}
-      RERANK_MODEL: ${RERANK_MODEL:-qwen/qwen3-reranker-0.6b}
+      S3_AUTO_CREATE_BUCKET: ${S3_AUTO_CREATE_BUCKET:-false}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
     healthcheck:
       test:
         - CMD

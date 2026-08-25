@@ -1,4 +1,4 @@
-"""统一知识库使用的远程 Rerank Provider。"""
+"""租户感知的 Embedding 与 Rerank OGX Inference Provider。"""
 
 from .provider import get_adapter_impl, get_provider_spec
 

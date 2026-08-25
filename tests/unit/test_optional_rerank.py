@@ -64,11 +64,10 @@ class TestAdapter(SharedQdrantVectorIOAdapter):
 
 
 def _config(*, enabled: bool) -> SharedQdrantVectorIOConfig:
+    del enabled
     return SharedQdrantVectorIOConfig(
         url="http://qdrant.test",
         persistence=KVStoreReference(backend="test", namespace="test"),
-        rerank_enabled=enabled,
-        rerank_model="qwen/qwen3-reranker-0.6b",
     )
 
 
@@ -77,12 +76,17 @@ async def test_enabled_rerank_reorders_candidates_and_replaces_scores() -> None:
     inference = FakeInference()
     adapter = TestAdapter(_config(enabled=True), inference)
 
-    result = await adapter._apply_optional_rerank("退款材料", _candidates(), 2)
+    result = await adapter._apply_optional_rerank(
+        "退款材料",
+        _candidates(),
+        2,
+        rerank_model="tenant-inference/rerank-tenant-a",
+    )
 
     assert [chunk.chunk_id for chunk in result.chunks] == ["second", "first"]
     assert result.scores == [0.99, 0.01]
     assert len(inference.requests) == 1
-    assert inference.requests[0].model == "rerank/qwen/qwen3-reranker-0.6b"
+    assert inference.requests[0].model == "tenant-inference/rerank-tenant-a"
     assert inference.requests[0].max_num_results == 2
 
 
@@ -91,7 +95,7 @@ async def test_disabled_rerank_returns_rrf_results_without_remote_call() -> None
     inference = FakeInference()
     adapter = TestAdapter(_config(enabled=False), inference)
 
-    result = await adapter._apply_optional_rerank("退款材料", _candidates(), 1)
+    result = await adapter._apply_optional_rerank("退款材料", _candidates(), 1, rerank_model=None)
 
     assert [chunk.chunk_id for chunk in result.chunks] == ["first"]
     assert result.scores == [0.8]
@@ -103,7 +107,12 @@ async def test_rerank_failure_falls_back_to_rrf_results() -> None:
     inference = FakeInference(error=TimeoutError("upstream timeout"))
     adapter = TestAdapter(_config(enabled=True), inference)
 
-    result = await adapter._apply_optional_rerank("退款材料", _candidates(), 1)
+    result = await adapter._apply_optional_rerank(
+        "退款材料",
+        _candidates(),
+        1,
+        rerank_model="tenant-inference/rerank-tenant-a",
+    )
 
     assert [chunk.chunk_id for chunk in result.chunks] == ["first"]
     assert result.scores == [0.8]

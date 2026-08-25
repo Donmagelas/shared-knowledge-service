@@ -21,9 +21,23 @@ from ogx_api import (
 )
 from qdrant_client import AsyncQdrantClient, models
 
+from .attributes import decode_attribute_from_ogx
 from .bm25 import native_bm25_document
 from .config import PayloadIndexType, SharedQdrantVectorIOConfig
 from .filtering import RESERVED_ATTRIBUTE_FIELDS, scoped_filter
+
+_CHUNK_INTERNAL_METADATA = frozenset(
+    {
+        "chunk_id",
+        "chunk_window",
+        "document_id",
+        "file_id",
+        "filename",
+        "headings",
+        "source",
+        "vector_store_id",
+    }
+)
 
 
 def compound_point_id(vector_store_id: str, chunk_id: str) -> str:
@@ -64,12 +78,17 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         self._initialized = False
 
     def bind_collection(self, collection_name: str) -> None:
-        """把逻辑 VectorStore 绑定到不可变的租户 Collection。"""
+        """把逻辑 VectorStore 绑定到租户 Collection。
+
+        OGX 注册路由时可能先用缺少租户 metadata 的占位路由构造索引。
+        只要物理 Collection 尚未初始化，就允许 Knowledge API 补齐真实租户路由；
+        一旦初始化完成则禁止迁移，避免同一逻辑知识库跨租户串库。
+        """
 
         if not collection_name:
             raise ValueError("Qdrant Collection 名不能为空")
-        if self.collection_name is not None and self.collection_name != collection_name:
-            raise ValueError("VectorStore 创建后不能迁移到另一个租户 Collection")
+        if self.collection_name is not None and self.collection_name != collection_name and self._initialized:
+            raise ValueError("VectorStore 初始化后不能迁移到另一个租户 Collection")
         self.collection_name = collection_name
 
     def _require_collection_name(self) -> str:
@@ -153,16 +172,28 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
             joined = ", ".join(sorted(forbidden))
             raise ValueError(f"Chunk attributes 不能覆盖保留字段：{joined}")
 
-        file_id = metadata.pop("file_id", None) or metadata.get("document_id")
+        file_id = metadata.get("file_id") or metadata.get("document_id")
         if not file_id and chunk.chunk_metadata:
             file_id = chunk.chunk_metadata.document_id
+        business_attributes = {
+            key: decode_attribute_from_ogx(value)
+            for key, value in metadata.items()
+            if key not in _CHUNK_INTERNAL_METADATA
+        }
+        normalized_metadata = {
+            **metadata,
+            **business_attributes,
+            "vector_store_id": self.vector_store_id,
+            "file_id": str(file_id or ""),
+        }
+        normalized_chunk = chunk.model_copy(update={"metadata": normalized_metadata})
         return {
             "vector_store_id": self.vector_store_id,
             "file_id": str(file_id or ""),
             "chunk_id": chunk.chunk_id,
-            "attributes": metadata,
+            "attributes": business_attributes,
             "content_text": interleaved_content_as_str(chunk.content),
-            "chunk_content": chunk.model_dump(mode="json"),
+            "chunk_content": normalized_chunk.model_dump(mode="json"),
         }
 
     async def add_chunks(self, embedded_chunks: list[EmbeddedChunk]) -> None:

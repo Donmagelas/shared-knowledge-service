@@ -30,15 +30,12 @@ services:
       embedding-stub:
         condition: service_healthy
     environment:
-      EMBEDDING_API_KEY: test-only
-      EMBEDDING_BASE_URL: http://embedding-stub:18080/v1
-      EMBEDDING_DIMENSION: "3"
-      EMBEDDING_MODEL: deterministic-test
-      RERANK_API_KEY: test-only
-      RERANK_BASE_URL: http://embedding-stub:18080/v1
+      KNOWLEDGE_ADMIN_TOKEN: admin-e2e-at-least-sixteen
+      KNOWLEDGE_CREDENTIAL_MASTER_KEY: credential-e2e-at-least-sixteen
+      KNOWLEDGE_INFERENCE_ALLOWED_HOSTS: embedding-stub
+      KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS: embedding-stub
+      KNOWLEDGE_RUNTIME_TOKEN: runtime-e2e-at-least-sixteen
       RERANK_CANDIDATE_LIMIT: "20"
-      RERANK_ENABLED: ${E2E_RERANK_ENABLED:-true}
-      RERANK_MODEL: deterministic-reranker
     volumes:
       # 测试环境复用已含 Docling 模型的镜像，只读挂载当前代码，避免每次迭代重新下载模型资产。
       - ./config:/app/config:ro

@@ -1,228 +1,217 @@
 # Stella × Cherry Studio 企业版统一知识库服务
 
-本仓库实现独立部署的统一知识库基础设施。当前基线是 OGX `v1.3.0` 最小 Distribution、自定义 Qdrant Provider、PostgreSQL 和 Qdrant。
+本仓库提供一套独立部署的知识库基础设施。Stella 与 Cherry Studio 企业版通过稳定的 Knowledge API 共用上传、原文件存储、解析、切块、向量化、检索、任务状态和技术对象生命周期；用户、组织、权限、业务知识库展示与挂载关系仍由两侧产品维护。
 
-方案与实施顺序分别见：
+当前技术基线：
 
-- [方案设计](docs/changes/shared-knowledge-service/solution.md)
-- [实施计划](docs/changes/shared-knowledge-service/implementation.md)
-- [产品接入契约](docs/product-integration.md)
-- [部署问题与解决方法](docs/deployment-troubleshooting.md)
-
-## 当前进度
-
-OGX 原生 MVP 与统一产品 API 已贯通以下链路：
-
-```text
-File 上传 → Docling 解析 → HybridChunker → Embedding
-          → Dense + Qdrant 原生 multilingual BM25
-          → Payload Filter → Qdrant 原生 RRF
-          → 可选远程 Rerank → OGX Search
-```
-
-共享 Collection、逻辑 VectorStore 隔离、同一 File 多重挂载、scoped delete、异步失败重试、Docling Worker 租约回收和三组件重启恢复均有自动化测试。`/knowledge/v1/ingest` 已使用单文件 OGX FileBatch 异步提交，`/knowledge/v1/search` 已实现单个或多个逻辑知识库的一次 Qdrant 查询，并可按部署开关通过 OGX `Inference.rerank` 调用远程模型。真实 Embedding 与 Stella/企业版真实项目文档的第一轮评测已完成；当前仍未完成的是更大业务语料复核、认证、S3 和备份等生产化工作。
-
-## 本地环境
-
-- Python `3.12`
-- uv `0.12.5`
-- Docker Engine
-- Docker Compose plugin `5.5.0`
-- Qdrant Server `1.18.2`
-- Qdrant Client `1.18.0`
+- OGX `1.3.0` 最小 Distribution
+- Docling `2.121.0` + Docling `HybridChunker`
+- Qdrant Server `1.18.2` / Client `1.18.0`
 - PostgreSQL `17.10`
+- Python `3.12`、FastAPI、租户感知 Inference Provider
 
-首次生成或更新锁文件：
+## 源码构建快速启动
 
-```bash
-uv lock
-uv sync --frozen
-```
+本项目以完整源码仓库交付，不提供固化业务代码的预构建 Knowledge 镜像。使用方可以直接修改 Provider、API、配置、依赖或 Dockerfile，再在自己的环境中构建三服务镜像组合。
 
-后续只使用冻结依赖还原环境：
+宿主机需要 Linux amd64、Docker Engine、Docker Compose v2 和 `curl`，不要求安装 Python 或 uv：
 
 ```bash
-uv sync --frozen
-```
+git clone https://github.com/Donmagelas/shared-knowledge-service.git
+cd shared-knowledge-service
 
-## Embedding 前置探针
-
-复制 `.env.example` 为本地 `.env`，通过环境变量提供实际配置。`.env` 已被 Git 忽略，不得提交真实 Endpoint 或 Token。
-
-| 配置项 | 含义 |
-| --- | --- |
-| `EMBEDDING_BASE_URL` | OpenAI-compatible 模型服务地址 |
-| `EMBEDDING_API_KEY` | 模型服务凭证 |
-| `EMBEDDING_MODEL` | 当前部署使用的 Embedding 模型 ID |
-| `EMBEDDING_DIMENSION` | 该模型实际返回的向量维度 |
-| `EMBEDDING_PROBE_BATCH_SIZE` | 前置探针验证的请求批量 |
-| `EMBEDDING_TIMEOUT_SECONDS` | 前置探针超时 |
-
-`EMBEDDING_DIMENSION` 在部署初始化 Collection 时确定，当前方案不支持在该部署内修改。`EMBEDDING_MODEL` 由部署配置选择，不在代码中固定。当前范围不实现已有数据的模型热切换或迁移工具。
-
-```bash
-set -a
-source .env
-set +a
-uv run knowledge-embedding-preflight
-```
-
-成功时只输出模型、向量维度、返回数量、已验证批量和耗时；不会输出 Token、Endpoint 或响应正文。探针会拒绝实际返回维度与 `EMBEDDING_DIMENSION` 不一致的配置。`EMBEDDING_PROBE_BATCH_SIZE` 仅验证指定批量能够成功，不代表自动发现服务端最大批量。
-
-## 可选远程 Rerank
-
-| 配置项 | 含义 |
-| --- | --- |
-| `RERANK_ENABLED` | 是否在 Hybrid RRF 候选集后执行远程 Rerank，默认 `false` |
-| `RERANK_BASE_URL` | Jina-compatible Rerank 服务的版本化 Base URL |
-| `RERANK_API_KEY` | Rerank 服务凭证 |
-| `RERANK_MODEL` | 远程模型 ID，MVP 默认 `qwen/qwen3-reranker-0.6b` |
-| `RERANK_CANDIDATE_LIMIT` | 送入远程模型的最大 RRF 候选数，默认 `50` |
-
-该开关只增强 `hybrid` 模式；显式 `dense` 和 `bm25` 模式保持各自原始排序。开启后，Qdrant 先返回至多 `RERANK_CANDIDATE_LIMIT` 个 RRF 候选，远程模型再裁剪到 Search 请求的 `limit`。远程调用失败或返回无效索引时会降级到原 RRF Top K，不让可选效果层中断基础检索。
-
-### 真实模型与项目文档评测
-
-2026-08-24 使用 2 份 Stella 实际文档、3 份 Cherry Studio 企业版实际文档和 8 条人工标注中文查询，完成两个逻辑知识库的一次跨库检索。私有文档只在本地读取，没有复制进本仓库。三组单次运行结果如下；它们是 MVP 链路验证数据，不是模型选型、并发压测或最终质量承诺。
-
-| 模型 | 维度 | Dense Top1 | Hybrid Top1 | Hybrid 平均延迟 | 5 文档总导入耗时 | 用途 |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `qwen/qwen3-embedding-0.6b` | 1024 | 8/8 | 8/8 | 648 ms | 11.47 s | 本轮测试数据 |
-| `qwen/qwen3-embedding-4b` | 2560 | 7/8 | 8/8 | 738 ms | 13.61 s | 本轮测试数据 |
-| `qwen/qwen3-embedding-8b` | 4096 | 7/8 | 8/8 | 5514 ms | 35.33 s | 本轮测试数据 |
-
-三组模型下 Qdrant 原生 multilingual BM25 和最终 Hybrid 均为 8/8 Top1、Recall@3 1.0、MRR 1.0。这一轮只用于证明真实 Embedding 服务、不同向量维度和完整检索链路能够工作，不在 MVP 架构阶段选定具体模型。模型将在后续使用更大业务语料，综合效果、延迟和成本另行确定。
-
-评测工具不内置业务内容，通过命令行接收本地文档和相关性标注：
-
-```bash
-uv run python tests/evaluation/live_retrieval.py \
-  --document 'stella:stella-policy:/path/to/stella-policy.md' \
-  --document 'enterprise:enterprise-guide:/path/to/enterprise-guide.md' \
-  --query 'stella-policy:Stella 的相关规则是什么？' \
-  --query 'enterprise-guide:企业版应如何执行对应操作？'
-```
-
-## Qdrant 前置探针
-
-目标 Qdrant 启动后执行：
-
-```bash
-uv run knowledge-qdrant-preflight
-```
-
-探针会创建一个带 Dense、IDF Sparse 和 Payload 的临时 Collection，执行带相同 Filter 的 Qdrant 原生 RRF 查询，并在结束时删除临时 Collection。
-
-自定义 Provider 按租户创建物理 Qdrant Collection；同一租户内的 OGX `VectorStore` 是逻辑知识库，通过 Point 的 `vector_store_id` Payload 区分。创建 VectorStore 时可在 `metadata.tenant_id` 写入可信租户 ID，Provider 会把它稳定映射为不暴露原始 ID 的 Collection 名。没有 `tenant_id` 时走单租户默认 Collection。所有检索和删除都会由服务端强制带上逻辑知识库范围；一次检索混入不同租户的 VectorStore 会直接返回 422。业务过滤字段写入 `attributes`，需要高性能过滤的字段应在 `config/ogx.yaml` 的 `payload_indexes` 中按部署显式声明。
-
-中文 BM25 使用 Qdrant 1.18.2 服务端 `qdrant/bm25`，文档与查询统一传入 `multilingual` tokenizer 配置，Qdrant 负责分词、TF/长度权重和动态 IDF。Dense 与 BM25 候选由 Qdrant 原生 RRF 融合。生产运行路径不依赖 Jieba、mmh3 或 FastEmbed；切换 BM25 编码协议后必须重建索引。
-
-## 最小三服务环境
-
-复制 `.env.example` 为 `.env` 并填写真实 Embedding 配置。先通过构建脚本生成生产镜像，再启动服务：
-
-```bash
+./scripts/init-env.sh
+# 检查 .env 中的模型访问白名单、S3 等部署选项。
 ./scripts/build-production-image.sh
 docker compose up -d
+./scripts/doctor.sh
 ```
 
-构建脚本会分别探测固定 revision 的 tokenizer、layout 和 TableFormer 配置文件；首选 `HF_ENDPOINT` 不可达时，会明确提示并尝试 `HF_FALLBACK_ENDPOINT`，最后把选中的端点传给 Compose。也可以向脚本传入 `docker compose build` 参数，例如 `./scripts/build-production-image.sh --no-cache`。直接执行 `docker compose build` 仍只使用显式配置的 `HF_ENDPOINT`，不会静默切换下载源。
+服务启动后可运行 `./scripts/configure-tenant.sh --help` 查看租户 Embedding/Rerank 配置方式；模型 Key 默认通过终端隐藏输入。
 
-Compose 只启动三个服务：`knowledge-ogx`、`postgres` 和 `qdrant`。Docling Worker 是 `knowledge-ogx` 容器内由 OGX 管理的独立进程，不是第四个部署服务。
+首次构建会在 Docker 中还原锁定的 Python 依赖，并下载固定 revision 的 Docling tokenizer、layout 和 TableFormer 模型；耗时和网络要求高于拉取成品镜像。后续只修改 Provider/API 源码时，Docker 会复用依赖和模型缓存层。
 
-镜像构建会按固定 commit 预置 Docling `HybridChunker` 默认使用的 Hugging Face tokenizer、数字 PDF 所需的 Transformers layout 模型和 Accurate TableFormer 模型。不会下载当前运行路径用不到的 ONNX layout 与 Fast TableFormer 变体。构建阶段会在离线模式下初始化一次 PDF Pipeline；生产导入不会临时访问 Hugging Face。升级 Docling、tokenizer 或模型资产必须显式修改 revision 并重建镜像。
+PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像；Knowledge 镜像始终从当前工作区源码构建。默认只在 `127.0.0.1:8321` 暴露 Knowledge API，三个 Docker named volume 保存 PostgreSQL、Qdrant 和本地原文件。
 
-当前 amd64 本地构建镜像约 `1.08 GB`。本机 Docker 实测中，OGX 冷启动稳定后约占 `1.03 GiB` 内存，完成一份单页数字 PDF 导入后约占 `1.54 GiB`；PostgreSQL 约 `58 MiB`，Qdrant 约 `120 MiB`。这些数字使用三维确定性 Embedding Stub，只用于 MVP 量级判断，不是生产资源承诺。
+详细设计见 [solution.md](docs/changes/shared-knowledge-service/solution.md)，两侧映射见 [product-integration.md](docs/product-integration.md)，开发和运行排障见 [deployment-troubleshooting.md](docs/deployment-troubleshooting.md)。
 
-## 产品核心 API
+## 架构与部署组件
 
-创建逻辑知识库仍复用 OGX 辅助接口 `POST /v1/vector_stores`。Stella 通常只在部署初始化时创建一个隐藏 VectorStore；企业版为公司、部门、产品等显式业务知识库分别创建并保存映射。企业版多租户部署创建时必须写入可信 `tenant_id`：
+生产 Compose 只有三个服务：
+
+| 服务 | 作用 |
+| --- | --- |
+| `knowledge-ogx` | Knowledge API、OGX Files/FileBatch、Docling Worker、HybridChunker、自定义 Qdrant Provider、租户 Embedding/Rerank Provider |
+| `postgres` | OGX 对象、任务、幂等记录、文件技术状态和加密后的租户模型凭证 |
+| `qdrant` | 每租户一个物理 Collection；租户内多个逻辑 KnowledgeBase 通过 Payload 隔离 |
+
+原文件可选择 `inline::localfs` 本地持久卷或 `remote::s3` S3-compatible 后端，外部 API 不变。S3 是连接已有对象存储的部署选项，本仓库不会额外启动对象存储服务。
+
+导入链路：
+
+```text
+POST /knowledge/v1/ingest
+  → OGX File 持久化
+  → 单文件 FileBatch
+  → Docling 解析
+  → Docling HybridChunker
+  → 租户远程 Embedding
+  → Qdrant Dense + 原生 multilingual BM25
+```
+
+检索链路：
+
+```text
+POST /knowledge/v1/search
+  → knowledge_base_ids + 产品 Filter
+  → Qdrant Dense / BM25 / Hybrid RRF
+  → 可选租户远程 Rerank
+  → 稳定 SearchHit[]
+```
+
+## 配置原则
+
+- Stella 使用一个部署级租户配置；企业版按租户分别配置。
+- 服务不发现、列举或推荐模型，只接受调用方提交的 `base_url / api_key / model_id / dimension`。
+- Embedding URL、模型和维度在该租户第一次 Ingest 成功初始化 Collection 后锁定；API Key 仍可轮换。
+- Rerank 使用独立 URL、Key、模型和开关，可以按租户随时修改；只增强 `hybrid`，失败时降级为 Qdrant RRF。
+- 一个 Search 可以包含同一租户的多个 KnowledgeBase；跨租户请求直接拒绝，不做跨 Collection 融合。
+- 需要高性能过滤的业务属性由部署方在 `config/ogx.yaml` 的 `payload_indexes` 中声明类型。
+
+## 服务间认证
+
+Knowledge API 使用两个静态 Bearer Token：
+
+| Token | 权限 |
+| --- | --- |
+| Runtime Token | KnowledgeBase、Ingest、Operation、File 和 Search 接口 |
+| Admin Token | Runtime 全部能力，以及租户 Embedding/Rerank 配置 |
+
+OGX 原生接口只接受 Admin Token，用于运维诊断，产品正常接入只调用 `/knowledge/v1/*`。Token 和凭证必须由部署 Secret 注入，不得提交到仓库。
+
+## API 概览
+
+### 租户模型配置
+
+```http
+PUT /knowledge/v1/tenants/{tenant_id}/embedding-config
+GET /knowledge/v1/tenants/{tenant_id}/embedding-config
+PUT /knowledge/v1/tenants/{tenant_id}/rerank-config
+GET /knowledge/v1/tenants/{tenant_id}/rerank-config
+```
+
+配置 Embedding：
 
 ```bash
-curl -X POST http://127.0.0.1:8321/v1/vector_stores \
+curl -X PUT http://127.0.0.1:8321/knowledge/v1/tenants/tenant-a/embedding-config \
+  -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "name": "产品 A 知识库",
-    "metadata": {"tenant_id": "tenant-from-trusted-product-context"}
+    "base_url": "https://model.example/v1",
+    "api_key": "replace-with-secret",
+    "model_id": "embedding-model-id",
+    "dimension": 1024
   }'
 ```
 
-异步导入先持久化原文件和单文件 FileBatch，再立即返回：
+查询配置不会返回 API Key。
+
+### KnowledgeBase
+
+```http
+POST   /knowledge/v1/knowledge-bases
+GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}
+DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}
+```
+
+创建技术 KnowledgeBase：
+
+```bash
+curl -X POST http://127.0.0.1:8321/knowledge/v1/knowledge-bases \
+  -H "Authorization: Bearer $KNOWLEDGE_RUNTIME_TOKEN" \
+  -H 'Idempotency-Key: create-company-kb-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"tenant-a"}'
+```
+
+业务名称、公司/部门/产品归属和挂载关系不进入该请求；企业版在自己的数据库中保存业务对象与返回 `knowledge_base_id` 的映射。Stella 通常只在部署初始化时创建一个隐藏 KnowledgeBase。
+
+### 异步 Ingest 与 Operation
+
+```http
+POST /knowledge/v1/ingest
+GET  /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}
+POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry
+```
 
 ```bash
 curl -X POST http://127.0.0.1:8321/knowledge/v1/ingest \
+  -H "Authorization: Bearer $KNOWLEDGE_RUNTIME_TOKEN" \
+  -H 'Idempotency-Key: ingest-file-1' \
   -F 'file=@./knowledge.md;type=text/markdown' \
   -F 'knowledge_base_id=vs_example' \
   -F 'attributes={"department_id":"product-a"}'
 ```
 
-响应使用 HTTP `202`，返回 `operation_id`、`file_id`、`knowledge_base_id` 和 `processing`。调用方轮询任务状态：
+首次可靠接受返回 HTTP `202`；相同幂等请求重放返回 HTTP `200` 和原 Operation。状态统一为 `processing / completed / failed / cancelled`。最终失败且原文件仍存在时，可调用 Retry 接口复用原文件创建唯一的子 Operation。
 
-```bash
-curl http://127.0.0.1:8321/knowledge/v1/knowledge-bases/vs_example/operations/batch_example
+### File
+
+```http
+POST   /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query
+GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}
+DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}
 ```
 
-状态为 `processing / completed / failed / cancelled`。当前实现复用 OGX 持久化 FileBatch；单实例服务重启后会恢复未完成任务，失败文件仍按“删除失败挂载后复用原 File 重试”的协议处理。
+V1 不提供原文件下载、替换、主动取消任务、用户管理或知识库挂载 API。超过保留期的未提交、最终失败和孤儿原文件由 Knowledge 进程内部自动清理，不增加公开清理接口。
 
-检索接口接收产品权限层算出的逻辑知识库列表和 Filter：
+### Search
 
 ```bash
 curl -X POST http://127.0.0.1:8321/knowledge/v1/search \
+  -H "Authorization: Bearer $KNOWLEDGE_RUNTIME_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "query": "退款申请需要什么材料",
     "knowledge_base_ids": ["vs_company", "vs_product_a"],
-    "filters": {"type": "eq", "key": "department_id", "value": "product-a"},
+    "filters": {"type":"eq", "key":"department_id", "value":"product-a"},
     "mode": "hybrid",
     "limit": 10
   }'
 ```
 
-`mode` 支持 `hybrid`、`dense` 和 `bm25`。同一租户的多个 `knowledge_base_ids` 会转换成一条 `vector_store_id IN [...]` 的 Qdrant 查询；跨租户 ID 不会做跨 Collection 融合，而是被拒绝。返回 `hits` 中每项固定包含 `file_id`、`chunk_id`、`content`、`locator`、`score` 和 `attributes`。关闭 Rerank 时 `score` 是检索引擎分数；开启后 Hybrid 命中的 `score` 是模型返回的 `relevance_score`，调用方不应跨模式或跨部署直接比较其绝对值。
+`mode` 支持 `hybrid / dense / bm25`。服务始终在 Qdrant 查询阶段强制加入 `vector_store_id IN knowledge_base_ids`；调用方不能通过 Filter 覆盖保留字段。每个命中固定返回 `knowledge_base_id / file_id / filename / chunk_id / content / locator / score / attributes`。
 
-## 开发检查
+## 修改与重新构建
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
+./scripts/build-production-image.sh
+docker compose up -d
+./scripts/doctor.sh
+```
+
+构建默认使用固定 revision 的 Docling tokenizer、layout 和 Accurate TableFormer 资产，并在镜像中离线初始化 PDF Pipeline。默认 Hugging Face 端点为兼容镜像；使用方也可改为自己的镜像或内部制品库。运行时不会临时下载模型资产。
+
+本机 amd64 历史测量中，镜像约 `1.08 GB`；OGX 冷启动约 `1.03 GiB`，处理一页数字 PDF 后约 `1.54 GiB`。这些数字使用确定性模型 Stub，只用于量级参考，不是生产配额或 SLA。
+
+## 验证
+
+```bash
+uv sync --frozen
+uv run ruff format --check src tests
+uv run ruff check src tests
 uv run mypy src
-uv run pytest
-```
+uv run pytest -q tests/unit
 
-需要完整 OGX 文件链路时，叠加测试专用 Compose 文件启动确定性 Embedding Stub。该 Stub 是第四个测试容器，不属于生产部署：
-
-```bash
-docker compose -f compose.yaml -f compose.e2e.yaml up --build -d
-
-COMPOSE_FILE=compose.yaml:compose.e2e.yaml \
-OGX_E2E_URL=http://127.0.0.1:8321 \
-OGX_EMBEDDING_STUB_SERVICE=embedding-stub \
-uv run pytest tests/e2e/test_ogx_native_file_flow.py
-```
-
-重启与失败恢复测试必须显式启用，避免普通测试意外重启开发服务：
-
-```bash
-COMPOSE_FILE=compose.yaml:compose.e2e.yaml \
-OGX_E2E_URL=http://127.0.0.1:8321 \
-OGX_EMBEDDING_STUB_SERVICE=embedding-stub \
-OGX_RESTART_E2E=1 \
-OGX_FAILURE_E2E=1 \
-OGX_ASYNC_RESTART_E2E=1 \
-OGX_WORKER_CRASH_E2E=1 \
-uv run pytest tests/e2e/test_ogx_native_file_flow.py -m recovery
-```
-
-Worker 崩溃用例需要等待 OGX 默认 60 秒租约到期，因此只应在完整验收中启用。
-
-Jieba BM25 与当前 Qdrant 原生 multilingual BM25 的小型工程语料对照可显式执行：
-
-```bash
 QDRANT_INTEGRATION_URL=http://127.0.0.1:6333 \
-uv run python tests/evaluation/compare_bm25.py
+  uv run pytest -q tests/integration
+
+KNOWLEDGE_E2E_URL=http://127.0.0.1:8321 \
+KNOWLEDGE_FAILURE_E2E=1 \
+  uv run pytest -q tests/e2e/test_knowledge_api_contract.py
 ```
 
-该脚本会在唯一命名的临时 Collection 中对两条路线计算 Top1、Recall@3、MRR 和客户端耗时，并在结束后删除临时数据。内置语料只用于发现明显回归，不能代替 Stella 与企业版真实文档上的效果评测。
+E2E 使用 `compose.e2e.yaml` 中的确定性 Embedding/Rerank Stub；该 Stub 不属于生产部署。真实业务语料评测与模型选型应单独执行，不能用确定性 Stub 的结果代替效果结论。
 
 ## 许可证
 
