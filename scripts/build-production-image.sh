@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-# 始终从仓库根目录执行 Compose，避免调用位置改变构建上下文。
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# 始终从仓库根目录执行 Compose；路径解析兼容 macOS 自带 BSD 工具。
+repo_root="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 for command_name in curl docker; do
@@ -18,8 +18,12 @@ compose_environment="$(docker compose -f compose.yaml config --environment)"
 
 resolved_value() {
     local default_value="$2"
-    local environment_value="${!1-}"
+    local environment_value
     local compose_value
+
+    # Bash 3.2 不支持带默认值的间接参数展开 ``${!name-}``；macOS 自带
+    # ``printenv``，并且调用脚本时显式传入的构建变量本来就需要 export。
+    environment_value="$(printenv "$1" 2>/dev/null || true)"
 
     if [[ -n "${environment_value}" ]]; then
         printf '%s' "${environment_value}"

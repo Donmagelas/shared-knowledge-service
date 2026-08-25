@@ -14,7 +14,7 @@
 
 本项目以完整源码仓库交付，不提供固化业务代码的预构建 Knowledge 镜像。使用方可以直接修改 Provider、API、配置、依赖或 Dockerfile，再在自己的环境中构建三服务镜像组合。
 
-宿主机需要 Linux amd64、Docker Engine、Docker Compose v2 和 `curl`，不要求安装 Python 或 uv：
+已验证的宿主机环境为 Linux amd64、Docker Engine、Docker Compose v2 和 `curl`，不要求安装 Python 或 uv。macOS 使用 Docker Desktop；交付脚本兼容系统自带 Bash 3.2 与 BSD 工具。Apple Silicon 的基础镜像和 Python 依赖已确认存在 arm64 版本，但完整的构建、导入与检索链路仍需在真机上验证后才视为正式支持：
 
 ```bash
 git clone https://github.com/Donmagelas/shared-knowledge-service.git
@@ -32,6 +32,12 @@ docker compose up -d
 首次构建会在 Docker 中还原锁定的 Python 依赖，并下载固定 revision 的 Docling tokenizer、layout 和 TableFormer 模型；耗时和网络要求高于拉取成品镜像。后续只修改 Provider/API 源码时，Docker 会复用依赖和模型缓存层。
 
 PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像；Knowledge 镜像始终从当前工作区源码构建。默认只在 `127.0.0.1:8321` 暴露 Knowledge API，三个 Docker named volume 保存 PostgreSQL、Qdrant 和本地原文件。
+
+专题文档：
+
+- [OGX 方案与 Haystack 方案详情](docs/01-ogx-and-haystack-solutions.md)
+- [当前 OGX 方案：改造、能力、资源与优化项](docs/02-ogx-current-implementation.md)
+- [Knowledge API Reference 与产品接入](docs/03-api-reference-and-product-integration.md)
 
 详细设计见 [solution.md](docs/changes/shared-knowledge-service/solution.md)，两侧映射见 [product-integration.md](docs/product-integration.md)，开发和运行排障见 [deployment-troubleshooting.md](docs/deployment-troubleshooting.md)。
 

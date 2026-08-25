@@ -449,7 +449,7 @@ shared-knowledge-service/
 **预期结果**
 
 - 使用方拿到完整源码后可以修改 Provider、API、配置、依赖和 Dockerfile。
-- 宿主机只需 Linux amd64、Docker、Compose 与 curl；Python、uv 和 Docling 模型在镜像构建阶段处理。
+- 已验证的 Linux amd64 宿主机只需 Docker、Compose 与 curl；macOS 使用 Docker Desktop，交付脚本兼容系统自带 Bash 3.2 与 BSD 工具。Python、uv 和 Docling 模型均在镜像构建阶段处理。
 - PostgreSQL 与 Qdrant 使用固定官方镜像，Knowledge 从当前工作区源码构建。
 
 **已实现**
@@ -463,6 +463,7 @@ shared-knowledge-service/
 
 - 已从排除 `.git`、`.venv`、`.env` 和本地缓存的全新源码副本执行完整流程。
 - `init-env.sh` 生成的 `.env` 权限为 `0600`，四项示例凭证均被随机值替换，Compose 配置和全部辅助脚本语法检查通过。
+- 四个交付脚本已通过 Bash 3.2 语法检查；`init-env.sh` 已在 Bash 3.2 环境实际生成有效 `.env`，不依赖 GNU `sed -i` 或 `dirname --`。Apple Silicon 完整链路仍待真机验证。
 - `build-production-image.sh` 完成固定模型端点探测并从源码构建镜像；依赖和 Docling 模型层命中缓存，只有业务源码层重建。
 - 独立 Compose 项目中的 PostgreSQL、Qdrant、Knowledge 三个容器全部 healthy，宿主机 `/v1/health` 返回正常；验证后的临时容器和三个测试数据卷已清理。
 
