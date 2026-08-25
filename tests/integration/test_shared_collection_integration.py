@@ -72,8 +72,8 @@ async def test_two_logical_vector_stores_share_collection_without_leaking() -> N
     # 本地测试地址不应经过开发机代理，否则代理依赖会掩盖真实 Qdrant 行为。
     client = AsyncQdrantClient(url=qdrant_url, trust_env=False, check_compatibility=False)
     collection_lock = asyncio.Lock()
-    index_a = SharedQdrantIndex(client, _vector_store("vs-a"), config, collection_lock)
-    index_b = SharedQdrantIndex(client, _vector_store("vs-b"), config, collection_lock)
+    index_a = SharedQdrantIndex(client, _vector_store("vs-a"), config, collection_lock, collection_name)
+    index_b = SharedQdrantIndex(client, _vector_store("vs-b"), config, collection_lock, collection_name)
 
     try:
         await index_a.initialize()

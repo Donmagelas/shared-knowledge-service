@@ -6,16 +6,19 @@
 
 | 产品概念 | 统一知识库概念 | Qdrant 表达 |
 | --- | --- | --- |
-| 逻辑知识库 | OGX VectorStore，ID 对外称 `knowledge_base_id` | Point 的 `vector_store_id` Payload；不是 Collection |
+| 租户 | VectorStore `metadata.tenant_id` 中的可信路由信息 | 一个独立 Collection；原始租户 ID 不写入 Collection 名或 Point Payload |
+| 逻辑知识库 | OGX VectorStore，ID 对外称 `knowledge_base_id` | 租户 Collection 内 Point 的 `vector_store_id` Payload |
 | 上传文件 | OGX File + VectorStoreFile | 原文件在 File Store，Chunk 在共享 Collection |
 | 产品过滤字段 | Ingest `attributes` | `attributes.<field>` Payload |
 | 本次可检索范围 | Search `knowledge_base_ids + filters` | 服务强制生成 `vector_store_id IN [...] AND filter` |
 
-一个客户环境只有一个共享 Qdrant Collection。Embedding Endpoint、模型 ID 和维度由每套部署配置，不在代码中固定。维度在 Collection 初始化时确定，当前部署内不再修改；模型 ID 由部署方选择。当前范围不设计已有数据的模型切换流程。新增业务知识库只是新增 VectorStore ID 和 Payload 值，不会新建 Dense/BM25 索引结构。
+一个租户只有一个共享 Qdrant Collection；同一服务可以承载多个相互隔离的租户 Collection。创建 VectorStore 时写入一次可信 `tenant_id`，后续 Ingest/Search 只传 `knowledge_base_id(s)`，Provider 根据已持久化的 metadata 路由，不要求产品重复传租户 ID。没有 `tenant_id` 的 VectorStore 进入单租户默认 Collection。
+
+Embedding Endpoint、模型 ID 和维度由每套部署配置，不在代码中固定。维度在每个 Collection 初始化时确定，当前部署内不再修改；模型 ID 由部署方选择。当前范围不设计已有数据的模型切换流程。租户内新增业务知识库只是新增 VectorStore ID 和 Payload 值，不会新建 Dense/BM25 索引结构。
 
 ## 2. Stella
 
-Stella 在部署初始化时创建一个隐藏 VectorStore，并把返回 ID 保存在产品配置或数据库中。上传时，Stella 从可信运行时写入四级范围 attributes：
+Stella 在部署初始化时创建一个隐藏 VectorStore，并把返回 ID 保存在产品配置或数据库中。若部署需要和其他租户共用统一服务，创建时写入稳定的部署/租户 ID；独占单租户部署可以使用默认 Collection。上传时，Stella 从可信运行时写入四级范围 attributes：
 
 | scope | `user_id` | `agent_id` |
 | --- | --- | --- |
@@ -52,7 +55,7 @@ Stella 负责确保 `scope / user_id / agent_id` 来自可信身份，不接受�
 
 ## 3. Cherry Studio 企业版
 
-公司、部门、产品等知识库是企业版显式业务对象。企业版创建业务对象时调用 `POST /v1/vector_stores`，把自己的业务 ID 与返回的 `vector_store_id` 一对一保存。
+公司、部门、产品等知识库是企业版显式业务对象。企业版创建业务对象时调用 `POST /v1/vector_stores`，在 metadata 中写入当前可信租户 ID，并把自己的业务 ID 与返回的 `vector_store_id` 一对一保存。`tenant_id` 只决定存储路由，创建后不可修改。
 
 企业版负责：
 
@@ -60,7 +63,7 @@ Stella 负责确保 `scope / user_id / agent_id` 来自可信身份，不接受�
 - 用户、组织、角色到业务知识库的授权和挂载关系。
 - 每次 Search 前把允许访问的业务知识库映射成 `knowledge_base_ids`。
 
-例如当前用户可访问公司库与产品 A 库，Search 传入两个 ID；统一服务在同一个 Collection 中执行一条 `vector_store_id IN [company, product-a]` 的 Dense/BM25/Hybrid 查询，不进行两次检索后的二次融合。
+例如当前用户可访问公司库与产品 A 库，Search 传入两个 ID；统一服务确认两者属于同一租户后，在该租户 Collection 中执行一条 `vector_store_id IN [company, product-a]` 的 Dense/BM25/Hybrid 查询，不进行两次检索后的二次融合。如果两者来自不同租户，服务返回 422，不读取任何一个 Collection。
 
 ## 4. 统一知识库维护范围
 

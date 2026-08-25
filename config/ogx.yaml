@@ -17,6 +17,13 @@ providers:
       config:
         api_key: ${env.EMBEDDING_API_KEY:=}
         base_url: ${env.EMBEDDING_BASE_URL}
+    - provider_id: rerank
+      provider_type: remote::shared-rerank
+      module: shared_knowledge_service.rerank
+      config:
+        api_token: ${env.RERANK_API_KEY:=}
+        base_url: ${env.RERANK_BASE_URL:=https://api.example.com/v1}
+        enabled: ${env.RERANK_ENABLED:=false}
 
   vector_io:
     - provider_id: shared-qdrant
@@ -31,6 +38,9 @@ providers:
         persistence:
           backend: kv_default
           namespace: vector_io::shared_qdrant
+        rerank_candidate_limit: ${env.RERANK_CANDIDATE_LIMIT:=50}
+        rerank_enabled: ${env.RERANK_ENABLED:=false}
+        rerank_model: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
         sparse_vector_name: bm25
         url: ${env.QDRANT_URL:=http://localhost:6333}
 
@@ -96,6 +106,10 @@ registered_resources:
       provider_id: embedding
       provider_model_id: ${env.EMBEDDING_MODEL:=replace-with-embedding-model}
       model_type: embedding
+    - model_id: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
+      provider_id: rerank
+      provider_model_id: ${env.RERANK_MODEL:=qwen/qwen3-reranker-0.6b}
+      model_type: rerank
   vector_stores: []
 
 server:

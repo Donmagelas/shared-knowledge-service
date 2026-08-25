@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
 from ogx.core.storage.datatypes import KVStoreReference
-from ogx_api import ChunkMetadata, EmbeddedChunk, VectorStore
+from ogx.providers.utils.memory.vector_store import VectorStoreWithIndex
+from ogx_api import ChunkMetadata, EmbeddedChunk, OpenAIUpdateVectorStoreRequest, VectorStore
 from qdrant_client import AsyncQdrantClient, models
 
+from shared_knowledge_service.provider.adapter import SharedQdrantVectorIOAdapter
 from shared_knowledge_service.provider.config import SharedQdrantVectorIOConfig
 from shared_knowledge_service.provider.index import SharedQdrantIndex, compound_point_id
 
@@ -32,7 +34,13 @@ def _index(identifier: str) -> SharedQdrantIndex:
         url="http://qdrant.test",
         persistence=KVStoreReference(backend="test", namespace="test"),
     )
-    return SharedQdrantIndex(client, _vector_store(identifier), config, asyncio.Lock())
+    return SharedQdrantIndex(
+        client,
+        _vector_store(identifier),
+        config,
+        asyncio.Lock(),
+        collection_name=config.collection_name,
+    )
 
 
 def _chunk(metadata: dict[str, object] | None = None) -> EmbeddedChunk:
@@ -50,6 +58,26 @@ def _chunk(metadata: dict[str, object] | None = None) -> EmbeddedChunk:
 def test_point_id_is_stable_but_scoped_by_vector_store() -> None:
     assert compound_point_id("vs-a", "chunk-a") == compound_point_id("vs-a", "chunk-a")
     assert compound_point_id("vs-a", "chunk-a") != compound_point_id("vs-b", "chunk-a")
+
+
+def test_tenant_collection_name_is_stable_and_does_not_expose_tenant_id() -> None:
+    config = _index("vs-a").config
+
+    tenant_a = config.collection_name_for_tenant("company-a")
+    tenant_b = config.collection_name_for_tenant("company-b")
+
+    assert tenant_a == config.collection_name_for_tenant("company-a")
+    assert tenant_a != tenant_b
+    assert "company-a" not in tenant_a
+    assert config.collection_name_for_tenant(None) == config.collection_name
+
+
+def test_bound_collection_cannot_be_changed() -> None:
+    index = _index("vs-a")
+
+    index.bind_collection(index.config.collection_name)
+    with pytest.raises(ValueError, match="不能迁移"):
+        index.bind_collection("another-tenant")
 
 
 def test_payload_separates_service_fields_from_business_attributes() -> None:
@@ -80,6 +108,8 @@ async def test_multi_store_hybrid_search_is_one_qdrant_query() -> None:
     client = RecordingClient()
     index = _index("vs-a")
     index.client = cast(AsyncQdrantClient, client)
+    # Collection 初始化由其他测试和集成测试覆盖；本测试只记录一次查询调用。
+    index._initialized = True
 
     await index.query_hybrid_scoped(
         ["vs-a", "vs-b"],
@@ -95,3 +125,63 @@ async def test_multi_store_hybrid_search_is_one_qdrant_query() -> None:
     query_filter = cast(models.Filter, prefetch[0].filter)
     scope = cast(models.FieldCondition, query_filter.must[0])
     assert scope.match == models.MatchAny(any=["vs-a", "vs-b"])
+
+
+@pytest.mark.asyncio
+async def test_adapter_rejects_one_search_across_tenant_collections() -> None:
+    config = SharedQdrantVectorIOConfig(
+        url="http://qdrant.test",
+        persistence=KVStoreReference(backend="test", namespace="test"),
+    )
+    adapter = SharedQdrantVectorIOAdapter(config, cast(Any, object()))
+    adapter.openai_vector_stores = {
+        "vs-a": {"metadata": {"tenant_id": "tenant-a"}},
+        "vs-b": {"metadata": {"tenant_id": "tenant-b"}},
+    }
+    for vector_store_id, tenant_id in (("vs-a", "tenant-a"), ("vs-b", "tenant-b")):
+        index = SharedQdrantIndex(
+            cast(AsyncQdrantClient, object()),
+            _vector_store(vector_store_id),
+            config,
+            asyncio.Lock(),
+            config.collection_name_for_tenant(tenant_id),
+        )
+        # 本测试只验证 Provider 的路由拒绝逻辑，不访问 Qdrant。
+        index._initialized = True
+        adapter.cache[vector_store_id] = VectorStoreWithIndex(
+            _vector_store(vector_store_id),
+            index,
+            adapter.inference_api,
+        )
+
+    with pytest.raises(ValueError, match="不能跨租户 Collection"):
+        await adapter.query_multiple_vector_stores(
+            ["vs-a", "vs-b"],
+            query="退款",
+            mode="hybrid",
+            limit=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_adapter_rejects_tenant_route_change() -> None:
+    config = SharedQdrantVectorIOConfig(
+        url="http://qdrant.test",
+        persistence=KVStoreReference(backend="test", namespace="test"),
+    )
+    adapter = SharedQdrantVectorIOAdapter(config, cast(Any, object()))
+    adapter.openai_vector_stores = {
+        "vs-a": {
+            "metadata": {
+                "tenant_id": "tenant-a",
+                "embedding_model": "test-model",
+                "embedding_dimension": "3",
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="tenant_id.*不能修改"):
+        await adapter.openai_update_vector_store(
+            "vs-a",
+            OpenAIUpdateVectorStoreRequest(metadata={"tenant_id": "tenant-b"}),
+        )

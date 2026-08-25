@@ -34,3 +34,12 @@ services:
       EMBEDDING_BASE_URL: http://embedding-stub:18080/v1
       EMBEDDING_DIMENSION: "3"
       EMBEDDING_MODEL: deterministic-test
+      RERANK_API_KEY: test-only
+      RERANK_BASE_URL: http://embedding-stub:18080/v1
+      RERANK_CANDIDATE_LIMIT: "20"
+      RERANK_ENABLED: ${E2E_RERANK_ENABLED:-true}
+      RERANK_MODEL: deterministic-reranker
+    volumes:
+      # 测试环境复用已含 Docling 模型的镜像，只读挂载当前代码，避免每次迭代重新下载模型资产。
+      - ./config:/app/config:ro
+      - ./src/shared_knowledge_service:/app/.venv/lib/python3.12/site-packages/shared_knowledge_service:ro

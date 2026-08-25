@@ -60,7 +60,10 @@ def _parse_query(raw: str) -> EvaluationQuery:
 def _create_knowledge_base(client: httpx.Client, group: str) -> str:
     response = client.post(
         "/v1/vector_stores",
-        json={"name": f"live-eval-{group}-{uuid.uuid4().hex[:8]}", "metadata": {"evaluation": True}},
+        json={
+            "name": f"live-eval-{group}-{uuid.uuid4().hex[:8]}",
+            "metadata": {"evaluation": True, "tenant_id": "live-evaluation"},
+        },
     )
     response.raise_for_status()
     return str(response.json()["id"])
@@ -86,8 +89,24 @@ def _ingest_document(client: httpx.Client, knowledge_base_id: str, document: Cor
     )
     response.raise_for_status()
     body = response.json()
-    if body.get("status") != "completed":
-        raise RuntimeError(f"文档导入失败：{document.document_id}: {body.get('last_error', 'unknown error')}")
+    if response.status_code != 202 or body.get("status") != "processing":
+        raise RuntimeError(f"异步导入未被可靠接收：{document.document_id}: {body}")
+
+    operation_id = str(body["operation_id"])
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        operation = client.get(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+        )
+        operation.raise_for_status()
+        operation_body = operation.json()
+        if operation_body["status"] == "completed":
+            break
+        if operation_body["status"] in {"failed", "cancelled"}:
+            raise RuntimeError(f"文档导入失败：{document.document_id}: {operation_body.get('last_error')}")
+        time.sleep(0.1)
+    else:
+        raise TimeoutError(f"文档导入超时：{document.document_id}")
     return str(body["file_id"]), round((time.perf_counter() - started_at) * 1000, 2)
 
 

@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 
 from fastapi import UploadFile
 
-from .models import AttributeValue, IngestResponse, SearchRequest, SearchResponse
+from .models import AttributeValue, IngestOperationResponse, IngestResponse, SearchRequest, SearchResponse
 
 
 @runtime_checkable
@@ -19,5 +19,11 @@ class KnowledgeApi(Protocol):
         knowledge_base_id: str,
         attributes: dict[str, AttributeValue],
     ) -> IngestResponse: ...
+
+    async def get_ingest_operation(
+        self,
+        knowledge_base_id: str,
+        operation_id: str,
+    ) -> IngestOperationResponse: ...
 
     async def search(self, request: SearchRequest) -> SearchResponse: ...

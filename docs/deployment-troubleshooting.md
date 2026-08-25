@@ -142,7 +142,9 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 **解决**
 
 - Dockerfile 已把 Debian、PyPI 和 Hugging Face 下载地址做成构建参数；版本、commit 和 `uv.lock` 哈希校验不随镜像地址改变。
-- 在对应网络中通过 `.env` 或构建环境设置已验证可达的 `DEBIAN_MIRROR`、`DEBIAN_SECURITY_MIRROR`、`PYPI_SIMPLE_URL`、`PYPI_FILES_URL` 和 `HF_ENDPOINT`。
+- 当前默认使用阿里云 Debian 与 Debian Security 镜像，避免当前部署网络反复等待官方源；其他环境仍可显式覆盖。
+- 使用 `scripts/build-production-image.sh` 构建生产镜像。脚本先探测 `HF_ENDPOINT` 上固定 revision 的 tokenizer、layout 和 TableFormer 配置文件；任一不可达时明确提示并尝试 `HF_FALLBACK_ENDPOINT`，不会只根据站点首页判断。
+- 在对应网络中通过 `.env` 或构建环境设置已验证可达的 `DEBIAN_MIRROR`、`DEBIAN_SECURITY_MIRROR`、`PYPI_SIMPLE_URL`、`PYPI_FILES_URL`、`HF_ENDPOINT` 和 `HF_FALLBACK_ENDPOINT`。
 - 切换镜像只改变传输来源，不得去掉基础镜像 digest、Python 锁文件或 Docling 模型 revision。
 - 如果官方源只是慢而未失败，应先确认实际下载进程；不要把网络等待误判为新接口启动故障。
 
@@ -158,8 +160,8 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 
 **解决**
 
-- 第一层只复制 `pyproject.toml`、`uv.lock` 和 README，以 `uv sync --no-install-project` 固定第三方依赖并预置模型。
-- 随后再复制 `src`，单独执行一次只安装本项目的 `uv sync --no-editable`。
+- 第一层只复制 `pyproject.toml` 和 `uv.lock`，以 `uv sync --no-install-project` 固定第三方依赖并预置模型。
+- 随后再复制 README 和 `src`，单独执行一次只安装本项目的 `uv sync --no-editable`；文档与业务代码变化都不会让模型层失效。
 - 配置文件保持最后复制；普通 Provider/API 改动不再触发系统包、第三方依赖或 Docling 模型下载。
 - 依赖版本、模型 revision 或构建参数变化仍应主动使大层失效，这是正确行为。
 
@@ -190,3 +192,69 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 - 已有数据不能通过只改环境变量安全切换模型；当前范围不提供模型切换或迁移工具。若未来提出该需求，再单独设计数据重建与回滚流程。
 - 本次多模型评测为每个候选创建独立 PostgreSQL 评测数据库和 Qdrant Collection，没有清理或篡改原有注册表。
 - 正式设计迁移工具前，不自动删除 OGX Registry 记录；删除错误记录可能影响仍在使用的模型和 VectorStore。
+
+## 13. OGX vLLM Rerank 路径与版本化网关不一致
+
+**现象**
+
+模型网关的 `POST /v1/rerank` 能返回标准 `results[index, relevance_score]`，但直接配置 OGX `remote::vllm` 后，请求落到根路径 `POST /rerank`；某些网关在该路径返回 HTML 首页和 `200`，随后 OGX 在解析 JSON 时失败。
+
+**原因与解决**
+
+- OGX `1.3.0` 的 vLLM Provider 会主动去掉 Base URL 末尾的 `/v1`，这是针对原生 vLLM 路径的行为，不适用于当前版本化网关。
+- 本项目的 `remote::shared-rerank` Provider 复用 OGX vLLM 请求、鉴权和响应转换，只保留 Base URL 中的 `/v1`，最终调用 `/v1/rerank`。
+- 不使用把 Base URL 伪造成 `/v1/v1` 的配置技巧；该做法会破坏健康检查和其他模型接口语义。
+- OGX `1.3.0` 的 `--dry-run` 校验没有把当前配置传给外置 Provider Registry，可能误报 `remote::shared-rerank` 不可用。应以配置感知的 Registry 测试和真实 Compose 启动为准，不能据此判断 Provider 注册失败。
+## 14. 租户 Collection 路由
+
+- `QDRANT_COLLECTION_NAME` 是单租户默认 Collection 名，也是多租户 Collection 的前缀；它不是企业版业务知识库 ID。
+- 企业版多租户创建 VectorStore 时必须从可信产品上下文写入 `metadata.tenant_id`。后续上传和检索不重复传该字段。
+- `tenant_id` 创建后不可修改。需要改变租户归属时应新建目标租户 VectorStore 并重新导入，当前 MVP 不提供在线迁移工具。
+- 升级前已经存在且没有 `tenant_id` 的 VectorStore 会继续使用默认 Collection，不会自动迁移。部署前应确认这符合单租户语义。
+- 删除最后一个 VectorStore 只会删除其 Point，不会自动删除空的租户 Collection；租户销毁属于显式运维动作，避免误删同租户其他逻辑知识库。
+
+## 15. 代码迭代不应被模型站点网络阻塞
+
+**现象**
+
+只修改 Provider 代码后重建完整镜像，Debian 系统包可以通过镜像源完成，但构建环境无法连接 Hugging Face，固定 revision 的 Docling tokenizer/layout/TableFormer 无法重新下载。
+
+**解决**
+
+- 生产镜像仍必须在能够访问已批准模型源或内部制品库的环境中完整重建，并执行离线 Pipeline 初始化，不能跳过模型资产验收。
+- `scripts/build-production-image.sh` 可以在官方 Hugging Face 端点不可达时选择兼容镜像，并在日志中打印本次实际使用的 `HF_ENDPOINT`；正式发布流水线可以把两个端点都指向经过批准的内部制品库。
+- 测试专用 `compose.e2e.yaml` 会复用上一版已包含固定模型资产的镜像，并把当前 `src/shared_knowledge_service` 与 `config` 只读挂载进去，只用于验证代码变更。
+- 测试挂载不能作为生产镜像构建成功的证据；交付前需要在模型源可达时补跑完整 `docker compose build`。
+
+## 16. OGX FileBatch 在正常服务重启时会被标记为 cancelled
+
+**现象**
+
+单文件 FileBatch 提交后立即执行 `docker restart knowledge-ogx`，重启后的 Batch 状态是 `cancelled`，启动恢复逻辑不会继续处理。
+
+**原因**
+
+OGX `1.3.0` 在优雅关闭时取消进程内 Batch Task；后台协程捕获 `CancelledError` 后会把 Batch 状态持久化为 `cancelled`。OGX 启动时只恢复 `in_progress` Batch，因此“服务停机”和“用户主动取消”被表达成了同一种状态。
+
+**解决**
+
+- 自定义 Qdrant Provider 在 shutdown 前记录仍为 `in_progress` 的 Batch。
+- OGX 完成后台 Task 清理后，只把这批由服务停机造成的 `cancelled` 状态恢复为 `in_progress`。
+- 用户通过 Cancel API 主动取消且在 shutdown 前已是 `cancelled` 的 Batch 不会被恢复。
+- 当前已通过真实 Compose 测试验证：提交包含 1000 个段落的 HTML 后立即重启 OGX，Batch 会在启动后恢复、完成并可检索。
+- 该修正依赖当前已接受的单实例前提；未来多副本运行时必须改用带租约的全局任务领取机制，不能继续依赖进程内 `asyncio.Task`。
+
+测试环境的 `embedding-stub` 只定义在 `compose.e2e.yaml`。故障注入和服务控制命令必须同时传入 `compose.yaml` 与 `compose.e2e.yaml`，否则 Docker 会报告 `no such service: embedding-stub`。
+
+## 17. 超大文档产生过多 Chunk 时单次 Embedding 请求会被拒绝
+
+**现象**
+
+使用包含 5000 个独立标题和段落的 HTML 做异步重启测试时，Docling 可以完成解析，但 OGX 会把全部 Chunk 一次性放入 Embedding 请求，随后被请求模型的列表长度校验拒绝并把文件标记为 `failed`。
+
+**影响与处理**
+
+- 这是 OGX 当前 Embedding 批处理方式的容量边界，不是 FileBatch 重启恢复失败。
+- 异步状态接口会返回明确的 `failed` 和文件级错误，不会把该文件误报为完成。
+- 当前重启恢复测试使用 1000 个段落，既能稳定覆盖停机窗口，也不会越过当前测试模型的单请求上限。
+- 正式支持超大文档前，需要把 Chunk Embedding 按配置上限分批，并验证任一批失败时的 Qdrant 清理或幂等重试；不能只放宽 Pydantic 校验。

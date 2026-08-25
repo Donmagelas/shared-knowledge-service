@@ -10,18 +10,30 @@ type AttributeValue = str | float | bool
 
 
 class IngestLastError(BaseModel):
-    """同步导入失败时返回的稳定错误信息。"""
+    """异步导入失败时返回的稳定错误信息。"""
 
     code: str
     message: str
 
 
 class IngestResponse(BaseModel):
-    """一次同步上传和建索引的结果。"""
+    """原文件与单文件 OGX Batch 已可靠创建后的提交结果。"""
 
+    operation_id: str
     file_id: str
     knowledge_base_id: str
-    status: Literal["completed", "failed"]
+    status: Literal["processing"]
+
+
+type IngestOperationStatus = Literal["processing", "completed", "failed", "cancelled"]
+
+
+class IngestOperationResponse(BaseModel):
+    """单文件导入任务的稳定状态，不暴露 OGX FileBatch 结构。"""
+
+    operation_id: str
+    knowledge_base_id: str
+    status: IngestOperationStatus
     last_error: IngestLastError | None = None
 
 

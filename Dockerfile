@@ -2,8 +2,8 @@ FROM ghcr.io/astral-sh/uv:0.12.5 AS uv
 
 FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
 
-ARG DEBIAN_MIRROR=http://deb.debian.org/debian
-ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
+ARG DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
+ARG DEBIAN_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security
 ARG DOCLING_LAYOUT_MODEL_REVISION=8f39ad3c0b4c58e9c2d2c84a38465abf757272d8
 ARG DOCLING_TABLE_MODEL_REVISION=fc0f2d45e2218ea24bce5045f58a389aed16dc23
 ARG DOCLING_TOKENIZER_MODEL=sentence-transformers/all-MiniLM-L6-v2
@@ -37,7 +37,7 @@ RUN sed -i \
     && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock ./
 
 # 可选镜像只改下载地址；版本与文件哈希仍由原始 uv.lock 校验。
 # HybridChunker 的默认 tokenizer 也在构建时固定，首次导入不允许在线下载。
@@ -59,6 +59,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && useradd --uid 10001 --gid knowledge --no-create-home --shell /usr/sbin/nologin knowledge \
     && chown -R knowledge:knowledge /app /data/files
 
+# README 只参与本项目打包，不应让文档修改使第三方依赖和 Docling 模型层失效。
+COPY --chown=knowledge:knowledge README.md ./README.md
 COPY --chown=knowledge:knowledge src ./src
 
 ENV HF_HUB_OFFLINE=1 \

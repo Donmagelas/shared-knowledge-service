@@ -13,7 +13,7 @@ from ogx_api.common.upload_limits import (
 )
 from pydantic import ValidationError
 
-from .models import AttributeValue, IngestResponse, SearchRequest, SearchResponse
+from .models import AttributeValue, IngestOperationResponse, IngestResponse, SearchRequest, SearchResponse
 from .protocol import KnowledgeApi
 
 
@@ -39,7 +39,12 @@ def create_router(
 
     router = APIRouter(prefix="/knowledge/v1", tags=["Knowledge"])
 
-    @router.post("/ingest", response_model=IngestResponse, summary="同步导入一个原始文件")
+    @router.post(
+        "/ingest",
+        response_model=IngestResponse,
+        status_code=202,
+        summary="异步提交一个原始文件",
+    )
     async def ingest(
         file: Annotated[UploadFile, File(description="原始文件二进制及文件名")],
         knowledge_base_id: Annotated[str, Form(description="逻辑知识库 ID，不是 Qdrant Collection ID")],
@@ -53,6 +58,20 @@ def create_router(
             content = await read_upload_with_size_limit(file, max_upload_size_bytes)
             safe_file = PreReadUploadFile(content, filename=file.filename, content_type=file.content_type)
             return await impl.ingest(safe_file, knowledge_base_id, parsed_attributes)
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get(
+        "/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+        response_model=IngestOperationResponse,
+        summary="查询异步导入状态",
+    )
+    async def get_ingest_operation(
+        knowledge_base_id: str,
+        operation_id: str,
+    ) -> IngestOperationResponse:
+        try:
+            return await impl.get_ingest_operation(knowledge_base_id, operation_id)
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

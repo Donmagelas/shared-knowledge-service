@@ -3,24 +3,43 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from ogx.core.storage.kvstore import kvstore_impl
+from ogx.log import get_logger
 from ogx.providers.remote.vector_io.qdrant.qdrant import VECTOR_DBS_PREFIX, QdrantVectorIOAdapter
+from ogx.providers.utils.inference.prompt_adapter import interleaved_content_as_str
 from ogx.providers.utils.memory.vector_store import VectorStoreWithIndex
 from ogx_api import (
     ComparisonFilter,
     CompoundFilter,
+    OpenAICreateVectorStoreRequestWithExtraBody,
     OpenAIEmbeddingsRequestWithExtraBody,
+    OpenAIUpdateVectorStoreRequest,
     QueryChunksResponse,
     VectorStore,
+    VectorStoreDeleteResponse,
     VectorStoreNotFoundError,
+    VectorStoreObject,
 )
+from ogx_api.inference import RerankRequest
 from qdrant_client import AsyncQdrantClient
 
 from .config import SharedQdrantVectorIOConfig
 from .index import SharedQdrantIndex
+
+log = get_logger(name=__name__, category="vector_io::shared_qdrant")
+TENANT_METADATA_KEY = "tenant_id"
+_IMMUTABLE_METADATA_KEYS = frozenset(
+    {
+        TENANT_METADATA_KEY,
+        "embedding_dimension",
+        "embedding_model",
+        "provider_id",
+        "provider_vector_store_id",
+    }
+)
 
 
 class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
@@ -41,6 +60,47 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             collection_lock=self._shared_collection_lock,
         )
 
+    @staticmethod
+    def _tenant_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+        """读取用于存储路由的可信租户 ID；缺失表示单租户默认 Collection。"""
+
+        if not metadata or TENANT_METADATA_KEY not in metadata:
+            return None
+        value = metadata[TENANT_METADATA_KEY]
+        if not isinstance(value, str):
+            raise ValueError("VectorStore metadata.tenant_id 必须是字符串")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("VectorStore metadata.tenant_id 不能为空")
+        if len(normalized) > 256:
+            raise ValueError("VectorStore metadata.tenant_id 不能超过 256 个字符")
+        return normalized
+
+    def _tenant_id_for_vector_store(self, vector_store_id: str) -> str | None:
+        store_info = self.openai_vector_stores.get(vector_store_id)
+        if store_info is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        metadata = store_info.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("VectorStore metadata 必须是对象")
+        return self._tenant_id_from_metadata(metadata)
+
+    async def _bind_cached_store(
+        self,
+        cached: VectorStoreWithIndex,
+        tenant_id: str | None,
+    ) -> str:
+        if not isinstance(cached.index, SharedQdrantIndex):
+            raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
+        collection_name = self.config.collection_name_for_tenant(tenant_id)
+        cached.index.bind_collection(collection_name)
+        await cached.index.initialize()
+        return collection_name
+
+    async def _ensure_cached_store_route(self, vector_store_id: str, cached: VectorStoreWithIndex) -> str:
+        tenant_id = self._tenant_id_for_vector_store(vector_store_id)
+        return await self._bind_cached_store(cached, tenant_id)
+
     async def initialize(self) -> None:
         self.client = AsyncQdrantClient(**self.config.qdrant_client_kwargs())
         self.kvstore = await kvstore_impl(self.config.persistence)
@@ -57,13 +117,33 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
         for vector_store_data in stored_vector_stores:
             vector_store = VectorStore.model_validate_json(vector_store_data)
             shared_index = self._new_index(vector_store)
-            await shared_index.initialize()
             self.cache[vector_store.identifier] = VectorStoreWithIndex(
                 vector_store,
                 shared_index,
                 self.inference_api,
             )
         await self.initialize_openai_vector_stores()
+        for vector_store_id, cached in self.cache.items():
+            await self._ensure_cached_store_route(vector_store_id, cached)
+
+    async def shutdown(self) -> None:
+        """优雅停机时保留未完成 Batch，供单实例重启后自动恢复。"""
+
+        resumable_batch_ids = {
+            batch_id
+            for batch_id, batch_info in self.openai_file_batches.items()
+            if batch_info.get("status") == "in_progress"
+        }
+        await super().shutdown()
+
+        # OGX 原生 shutdown 会把后台 Task 的 CancelledError 持久化成 cancelled。
+        # 服务停机不等于用户取消任务，因此把本次停机前仍在处理的 Batch 恢复为 in_progress。
+        for batch_id in resumable_batch_ids:
+            batch_info = self.openai_file_batches.get(batch_id)
+            if batch_info is None or batch_info.get("status") != "cancelled":
+                continue
+            batch_info["status"] = "in_progress"
+            await self._save_openai_vector_store_file_batch(batch_id, batch_info)
 
     async def register_vector_store(self, vector_store: VectorStore) -> None:
         if self.kvstore is None:
@@ -73,12 +153,59 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             value=vector_store.model_dump_json(),
         )
         shared_index = self._new_index(vector_store)
-        await shared_index.initialize()
         self.cache[vector_store.identifier] = VectorStoreWithIndex(
             vector_store=vector_store,
             index=shared_index,
             inference_api=self.inference_api,
         )
+
+    async def openai_create_vector_store(
+        self,
+        params: OpenAICreateVectorStoreRequestWithExtraBody,
+    ) -> VectorStoreObject:
+        """在 OGX 保存对象前，把内部 VectorStore 绑定到租户 Collection。"""
+
+        extra = params.model_extra or {}
+        vector_store_id = extra.get("provider_vector_store_id")
+        if not isinstance(vector_store_id, str) or not vector_store_id:
+            raise ValueError("OGX 没有向 Provider 传入 provider_vector_store_id")
+        cached = self.cache.get(vector_store_id)
+        if cached is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        tenant_id = self._tenant_id_from_metadata(params.metadata)
+        await self._bind_cached_store(cached, tenant_id)
+        return await super().openai_create_vector_store(params)
+
+    async def openai_update_vector_store(
+        self,
+        vector_store_id: str,
+        request: OpenAIUpdateVectorStoreRequest,
+    ) -> VectorStoreObject:
+        """允许修改业务 metadata，但禁止变更已确定的租户和索引配置。"""
+
+        if request.metadata is None:
+            return await super().openai_update_vector_store(vector_store_id, request)
+
+        current = self.openai_vector_stores.get(vector_store_id)
+        if current is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        current_metadata = dict(current.get("metadata") or {})
+        incoming_metadata = dict(request.metadata)
+        for key in _IMMUTABLE_METADATA_KEYS:
+            if key in incoming_metadata and incoming_metadata[key] != current_metadata.get(key):
+                raise ValueError(f"VectorStore metadata.{key} 创建后不能修改")
+        merged_metadata = {**current_metadata, **incoming_metadata}
+        updated_request = request.model_copy(update={"metadata": merged_metadata})
+        return await super().openai_update_vector_store(vector_store_id, updated_request)
+
+    async def openai_delete_vector_store(self, vector_store_id: str) -> VectorStoreDeleteResponse:
+        """在 OGX 删除 metadata 前固定路由，保证 scoped delete 仍能找到 Collection。"""
+
+        cached = await self._get_and_cache_vector_store_index(vector_store_id)
+        if cached is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        await self._ensure_cached_store_route(vector_store_id, cached)
+        return await super().openai_delete_vector_store(vector_store_id)
 
     async def unregister_vector_store(self, vector_store_id: str) -> None:
         cached = self.cache.pop(vector_store_id, None)
@@ -90,7 +217,9 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
 
     async def _get_and_cache_vector_store_index(self, vector_store_id: str) -> VectorStoreWithIndex | None:
         if vector_store_id in self.cache:
-            return self.cache[vector_store_id]
+            cached = self.cache[vector_store_id]
+            await self._ensure_cached_store_route(vector_store_id, cached)
+            return cached
         if self.kvstore is None:
             raise RuntimeError("KVStore 尚未初始化")
         vector_store_data = await self.kvstore.get(f"{VECTOR_DBS_PREFIX}{vector_store_id}")
@@ -98,9 +227,9 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             raise VectorStoreNotFoundError(vector_store_id)
         vector_store = VectorStore.model_validate_json(vector_store_data)
         shared_index = self._new_index(vector_store)
-        await shared_index.initialize()
         cached = VectorStoreWithIndex(vector_store, shared_index, self.inference_api)
         self.cache[vector_store_id] = cached
+        await self._ensure_cached_store_route(vector_store_id, cached)
         return cached
 
     async def query_multiple_vector_stores(
@@ -117,11 +246,18 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             raise ValueError("vector_store_ids 不能为空")
 
         cached_stores: list[VectorStoreWithIndex] = []
+        collection_names: set[str] = set()
         for vector_store_id in vector_store_ids:
             cached = await self._get_and_cache_vector_store_index(vector_store_id)
             if cached is None:
                 raise VectorStoreNotFoundError(vector_store_id)
             cached_stores.append(cached)
+            if not isinstance(cached.index, SharedQdrantIndex):
+                raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
+            collection_names.add(cached.index.bound_collection_name)
+
+        if len(collection_names) != 1:
+            raise ValueError("一次检索中的 knowledge_base_ids 不能跨租户 Collection")
 
         first = cached_stores[0]
         expected_model = first.vector_store.embedding_model
@@ -148,12 +284,64 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
         query_vector = np.asarray(embeddings.data[0].embedding, dtype=np.float32)
         if mode == "dense":
             return await first.index.query_vector_scoped(vector_store_ids, query_vector, limit, 0.0, filters)
-        return await first.index.query_hybrid_scoped(
+        candidate_limit = max(limit, self.config.rerank_candidate_limit) if self.config.rerank_enabled else limit
+        candidates = await first.index.query_hybrid_scoped(
             vector_store_ids,
             query_vector,
             query,
-            limit,
+            candidate_limit,
             0.0,
             "rrf",
             filters=filters,
         )
+        return await self._apply_optional_rerank(query, candidates, limit)
+
+    async def _apply_optional_rerank(
+        self,
+        query: str,
+        candidates: QueryChunksResponse,
+        limit: int,
+    ) -> QueryChunksResponse:
+        """按部署开关重排 Hybrid 候选；远程失败时保留 RRF 结果。"""
+
+        fallback = QueryChunksResponse(
+            chunks=candidates.chunks[:limit],
+            scores=candidates.scores[:limit],
+        )
+        if not self.config.rerank_enabled or not candidates.chunks:
+            return fallback
+
+        try:
+            response = await self.inference_api.rerank(
+                RerankRequest(
+                    model=f"rerank/{self.config.rerank_model}",
+                    query=query,
+                    items=[interleaved_content_as_str(chunk.content) for chunk in candidates.chunks],
+                    max_num_results=limit,
+                )
+            )
+        except Exception as exc:
+            # Rerank 是可选的效果增强层；上游故障不应让基础检索整体不可用。
+            log.error(
+                "Remote reranking failed; returning Qdrant RRF results",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return fallback
+
+        reranked_chunks = []
+        reranked_scores = []
+        used_indexes: set[int] = set()
+        for item in response.data:
+            if item.index in used_indexes or item.index >= len(candidates.chunks):
+                continue
+            used_indexes.add(item.index)
+            reranked_chunks.append(candidates.chunks[item.index])
+            reranked_scores.append(item.relevance_score)
+            if len(reranked_chunks) == limit:
+                break
+
+        if not reranked_chunks:
+            log.error("Remote reranking returned no valid candidate indexes; returning Qdrant RRF results")
+            return fallback
+        return QueryChunksResponse(chunks=reranked_chunks, scores=reranked_scores)

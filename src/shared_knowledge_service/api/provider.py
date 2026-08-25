@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import Any, cast
 
 from fastapi import UploadFile
+from ogx.log import get_logger
 from ogx.providers.utils.inference.prompt_adapter import interleaved_content_as_str
 from ogx.providers.utils.vector_io.filters import parse_filter
 from ogx_api import (
     Api,
     Files,
     InlineProviderSpec,
-    OpenAIAttachFileRequest,
+    OpenAICreateVectorStoreFileBatchRequestWithExtraBody,
     QueryChunksResponse,
     UploadFileRequest,
     VectorIO,
@@ -24,11 +25,15 @@ from shared_knowledge_service.provider.adapter import SharedQdrantVectorIOAdapte
 from .models import (
     AttributeValue,
     IngestLastError,
+    IngestOperationResponse,
+    IngestOperationStatus,
     IngestResponse,
     SearchHit,
     SearchRequest,
     SearchResponse,
 )
+
+log = get_logger(name=__name__, category="providers")
 
 # 这些字段由文件处理、索引或引用定位链路生成，产品不能借 attributes 伪造。
 RESERVED_INGEST_ATTRIBUTES = frozenset(
@@ -99,7 +104,7 @@ class KnowledgeApiProvider:
         knowledge_base_id: str,
         attributes: dict[str, AttributeValue],
     ) -> IngestResponse:
-        """同步完成原文件持久化、Docling 处理、Embedding 和 Qdrant 写入。"""
+        """持久化原文件和单文件 FileBatch，并立即返回异步任务标识。"""
 
         normalized_id = knowledge_base_id.strip()
         if not normalized_id:
@@ -107,8 +112,6 @@ class KnowledgeApiProvider:
         forbidden = RESERVED_INGEST_ATTRIBUTES.intersection(attributes)
         if forbidden:
             raise ValueError(f"attributes 不能覆盖保留字段：{', '.join(sorted(forbidden))}")
-        attach_request = OpenAIAttachFileRequest(attributes=attributes, file_id="pending")
-
         # 上传前验证知识库，避免明显的错误 ID 产生孤立原文件。
         await self._shared_provider([normalized_id])
         uploaded = await self.files_api.openai_upload_file(
@@ -117,34 +120,91 @@ class KnowledgeApiProvider:
         )
 
         try:
-            attach_request.file_id = uploaded.id
-            attached = await self.vector_io.openai_attach_file_to_vector_store(
-                normalized_id,
-                attach_request,
+            batch = await self.vector_io.openai_create_vector_store_file_batch(
+                vector_store_id=normalized_id,
+                params=OpenAICreateVectorStoreFileBatchRequestWithExtraBody(
+                    file_ids=[uploaded.id],
+                    attributes=attributes,
+                ),
             )
         except Exception as exc:
-            # 原文件已经可靠保存；返回 file_id 让调用方可按显式恢复协议删除或重试。
-            return IngestResponse(
-                file_id=uploaded.id,
-                knowledge_base_id=normalized_id,
-                status="failed",
-                last_error=IngestLastError(code="server_error", message=str(exc)),
-            )
+            # Batch 是否已经持久化在异常边界上无法完全确认，因此不自动删除原文件。
+            raise RuntimeError(f"异步导入任务创建失败，原文件已保存为 {uploaded.id}：{exc}") from exc
 
-        last_error = None
-        if attached.last_error is not None:
-            last_error = IngestLastError(code=attached.last_error.code, message=attached.last_error.message)
-        elif attached.status != "completed":
-            last_error = IngestLastError(
-                code="unexpected_status",
-                message=f"同步导入返回了非终态成功状态：{attached.status}",
-            )
         return IngestResponse(
+            operation_id=batch.id,
             file_id=uploaded.id,
             knowledge_base_id=normalized_id,
-            status="completed" if attached.status == "completed" else "failed",
+            status="processing",
+        )
+
+    async def get_ingest_operation(
+        self,
+        knowledge_base_id: str,
+        operation_id: str,
+    ) -> IngestOperationResponse:
+        """把 OGX 单文件 FileBatch 状态转换成稳定的异步导入状态。"""
+
+        normalized_knowledge_base_id = knowledge_base_id.strip()
+        normalized_operation_id = operation_id.strip()
+        if not normalized_knowledge_base_id:
+            raise ValueError("knowledge_base_id 不能为空")
+        if not normalized_operation_id:
+            raise ValueError("operation_id 不能为空")
+
+        batch = await self.vector_io.openai_retrieve_vector_store_file_batch(
+            batch_id=normalized_operation_id,
+            vector_store_id=normalized_knowledge_base_id,
+        )
+        status = self._operation_status(batch.status, batch.file_counts.model_dump())
+        last_error = None
+        if status == "failed":
+            last_error = await self._operation_last_error(
+                normalized_knowledge_base_id,
+                normalized_operation_id,
+            )
+        return IngestOperationResponse(
+            operation_id=normalized_operation_id,
+            knowledge_base_id=normalized_knowledge_base_id,
+            status=status,
             last_error=last_error,
         )
+
+    @staticmethod
+    def _operation_status(batch_status: str, file_counts: dict[str, int]) -> IngestOperationStatus:
+        """修正 OGX Batch completed 仍可能包含失败文件的状态语义。"""
+
+        if batch_status == "in_progress":
+            return "processing"
+        if batch_status == "cancelled":
+            return "cancelled"
+        if batch_status == "failed" or file_counts.get("failed", 0) > 0:
+            return "failed"
+        if batch_status == "completed" and file_counts.get("completed", 0) == file_counts.get("total", 0) == 1:
+            return "completed"
+        return "failed"
+
+    async def _operation_last_error(self, knowledge_base_id: str, operation_id: str) -> IngestLastError:
+        """尽量读取单文件 Batch 的具体错误，缺失时返回稳定的通用错误。"""
+
+        try:
+            files = await self.vector_io.openai_list_files_in_vector_store_file_batch(
+                batch_id=operation_id,
+                vector_store_id=knowledge_base_id,
+                limit=1,
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to load file-level error for ingest operation",
+                operation_id=operation_id,
+                vector_store_id=knowledge_base_id,
+                error=str(exc),
+            )
+            return IngestLastError(code="operation_failed", message="异步导入失败，文件级错误读取失败")
+        if files.data and files.data[0].last_error is not None:
+            error = files.data[0].last_error
+            return IngestLastError(code=error.code, message=error.message)
+        return IngestLastError(code="operation_failed", message="异步导入失败，但 OGX 未返回文件级错误")
 
     async def search(self, request: SearchRequest) -> SearchResponse:
         """执行一次带强制知识库范围和可选业务 Filter 的 Qdrant 查询。"""

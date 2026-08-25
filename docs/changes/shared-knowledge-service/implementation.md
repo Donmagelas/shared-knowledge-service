@@ -14,7 +14,7 @@
 2. **统一产品接口**：MVP 后先确认导入语义，再在同一 OGX 进程中挂载外置 Knowledge API，提供 `ingest` 和多知识库 `search`。
 3. **生产化**：认证、备份、S3、可观测性、资源边界和运维文档。
 
-实施必须保持方案中的对象模型、权限边界、Collection 组织、任务可靠性边界和非目标，不在编码阶段重新引入 Haystack、Revision、PgQueuer、River 或独立 API 服务；若 MVP 证明持久异步导入是硬需求，必须先回到方案阶段更新边界。
+实施必须保持方案中的对象模型、权限边界、Collection 组织、任务可靠性边界和非目标，不在编码阶段重新引入 Haystack、Revision、PgQueuer、River 或独立 API 服务。异步导入复用 OGX 单文件 FileBatch 及 PostgreSQL 状态，不新增可部署组件。
 
 ### 1.1 2026-08-24 实施快照
 
@@ -22,17 +22,21 @@
 | --- | --- | --- |
 | 1. 依赖与探针 | 完成 | `uv.lock`、Embedding/Qdrant 探针、无密钥配置和真实 Endpoint live check 均通过；项目采用 MIT License |
 | 2. 最小 Distribution | 完成 | 生产 Compose 只有 OGX、PostgreSQL、Qdrant；无关 OGX 路由未注册 |
-| 3. 共享 Collection | 完成 | 单 Collection、稳定复合 Point ID、保留 Payload Index 与 scoped delete 已通过真实 Qdrant 集成测试 |
+| 3. 租户 Collection | 完成 | 每租户一个 Collection、租户内逻辑 VectorStore、稳定复合 Point ID、Payload Index 与 scoped delete 已通过测试 |
 | 4. Dense 纵向链路 | 完成 | Stub 下覆盖 Markdown/PDF 与恢复；真实 Qwen3 Embedding 下完成 5 份项目文档导入和跨库 Dense 检索 |
 | 5. 通用 Filter | Provider 完成 | 全部 OGX 操作符、保留字段保护和服务端 `vector_store_id` 强制条件已有单元测试；两侧产品契约在步骤 12 完成 |
 | 6. 中文 BM25 选型 | 完成 | 工程语料与 5 份两侧真实项目文档均通过；真实语料的 8 条查询为 8/8 Top1、MRR 1.0，继续采用 Qdrant multilingual |
 | 7. Hybrid RRF | 完成 | 0.6B/4B/8B 三种真实 Embedding 的 Hybrid 均为 8/8 Top1，且与相同 Payload Filter 共用一条 Qdrant Query |
 | 8. 生命周期 | 完成 | 同一 File 双 VectorStore、单侧删除、VectorStore 删除与失败挂载重试均已验证 |
-| 9. 恢复 | MVP 完成 | PostgreSQL/Qdrant/OGX 分别重启、Embedding 失败恢复和 Docling Worker 租约回收均通过；Qdrant Upsert 窗口杀进程未单独注入 |
+| 9. 恢复 | MVP 完成 | PostgreSQL/Qdrant/OGX 分别重启、Embedding 失败恢复、异步 FileBatch 重启恢复和 Docling Worker 租约回收均通过；Qdrant Upsert 窗口杀进程未单独注入 |
 | 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding 和第一轮两侧项目文档效果均有新鲜证据，OGX 路线继续 |
-| 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供同步 Ingest、多知识库 Search 和稳定 SearchHit |
+| 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供异步 Ingest、Operation 状态、多知识库 Search 和稳定 SearchHit |
 | 12. 两侧契约 | 服务端完成 | Stella 四级范围和企业版显式知识库映射、过滤与 E2E 已固化；产品仓库适配后续各自实施 |
 | 13. 生产化 | 未开始 | 认证、S3、备份恢复、监控和更大业务语料仍待实施 |
+
+租户 Collection 与产品调用模拟已完成一轮本地采样：67 个创建、导入、权限/挂载检索和跨租户拒绝场景全部通过；8 并发下执行 700 个 Hybrid 请求，吞吐约 `62.95 req/s`，平均 `126.26 ms`，P95 `181.76 ms`，最大 `428.39 ms`。并发阶段 OGX CPU 平均约 `92.82%`、P95 `105.60%`、内存最大约 `1172.48 MiB`；Qdrant CPU 平均约 `14.60%`、P95 `18.31%`、内存最大约 `165.70 MiB`；PostgreSQL CPU 平均约 `7.75%`、内存最大约 `70.68 MiB`。CPU `100%` 约等于一个逻辑核。
+
+该采样使用 3 维确定性 Embedding/Rerank 测试桩和小型 Markdown，只验证接口、隔离、并发路径及本地组件量级，不代表真实模型延迟、检索效果、容量或生产 SLA。原始 JSON、CSV 和 Markdown 报告保存在本地 `.reports/product-simulation-final/`，不进入 Git。
 
 当前镜像已只预置 Docling PDF 默认路径需要的模型：Transformers layout、Accurate TableFormer 和 HybridChunker tokenizer，且都固定到 commit。构建阶段在离线模式初始化 PDF Pipeline，最终镜像约 `1.08 GB`，而不是此前包含未使用 ONNX/Fast 变体时的约 `4.55 GB`。
 
@@ -44,7 +48,7 @@
 - 使用 `uv` 管理 Python 依赖并提交锁文件；Docker 镜像和 Qdrant 镜像使用不可漂移的精确版本。
 - 不修改 OGX Core。VectorIO 通过外置 Provider 接入；统一产品接口通过 OGX `external_apis_dir` 接入。
 - 生产 Compose 始终只有 `knowledge-ogx / postgres / qdrant` 三个服务；测试桩不进入生产 Compose。
-- 一个部署默认一个 Qdrant Collection；VectorStore 是 Payload 中的逻辑范围，不创建独立 Collection。
+- 每租户一个 Qdrant Collection；同租户 VectorStore 是 Payload 中的逻辑范围，不为每个知识库创建 Collection。没有租户 ID 的单租户部署使用默认 Collection。
 - Embedding Endpoint、模型和维度均为部署级配置；维度在初始化后保持不变，模型可调整但必须维度一致，并在切换时全量重新向量化已有 Chunk。
 - 产品负责权限计算；知识库服务校验并完整执行 `knowledge_base_ids + filters`，不推断权限。
 - 保留字段 `vector_store_id / file_id / chunk_id` 只能由服务生成，调用方 attributes 不能覆盖。
@@ -350,9 +354,8 @@ shared-knowledge-service/
 
 **预期结果**
 
-- 先依据步骤 9～10 的恢复验证和产品需求确认 `ingest` 语义：若显式恢复可接受，使用同步包装；若必须持久续跑，先更新 `solution.md` 和本计划，再引入完整任务模型，不在本步骤中临时拼补。
 - 通过 OGX `external_apis_dir` 注册 `/knowledge/v1/ingest` 和 `/knowledge/v1/search`，不增加部署服务、不修改 Core。
-- 同步分支的一次请求内部完成 Files upload + VectorStore attach，返回 `completed` 或 `failed`；异步分支的请求与状态接口必须以更新后的方案为准。
+- `ingest` 完成 Files upload + 单文件 FileBatch 持久化后返回 HTTP `202`；Operation 状态接口将 OGX Batch 转换为稳定终态。
 - `search` 接收一个或多个 `knowledge_base_ids`，在一次 Qdrant 查询中转换为 `vector_store_id IN [...]`。
 - 返回稳定 `SearchHit`，不暴露 Qdrant Point 或 OGX EmbeddedChunk。
 
@@ -369,7 +372,8 @@ shared-knowledge-service/
 
 **验证方法**
 
-- 按已确认的导入语义执行契约测试；同步分支的一次 `ingest` 请求产生 File、VectorStoreFile、原文和 Qdrant Point，失败时返回稳定错误结构。
+- 按已确认的导入语义执行契约测试；一次 `ingest` 请求立即返回 File 与 Operation ID，后台最终产生 VectorStoreFile 和 Qdrant Point。
+- 注入 Embedding 失败和 OGX 正常重启，验证失败错误、显式重试与 FileBatch 自动恢复。
 - 一次 `search` 同时查询三个知识库，Qdrant 只收到一条 Hybrid Query。
 - Stella 单隐藏知识库和企业版多知识库请求均映射正确。
 - attributes 不能覆盖保留字段；外部请求不能绕过 `knowledge_base_ids`。
@@ -377,10 +381,10 @@ shared-knowledge-service/
 
 **实测结果**
 
-- 已选择同步分支，不新增完整 Ingest 任务实体；一次调用内部复用 OGX Files upload 和 VectorStore attach。
-- `external_apis_dir` 已在同一 OGX 进程注册 `/knowledge/v1/ingest` 与 `/knowledge/v1/search`。
+- 已选择异步分支，不新增独立任务实体；`operation_id` 复用 OGX 单文件 `file_batch_id`。
+- `external_apis_dir` 已在同一 OGX 进程注册 `/knowledge/v1/ingest`、Operation 状态与 `/knowledge/v1/search`。
 - 两个逻辑知识库的混合检索已验证通过；Provider 单元测试确认 Dense + BM25 + RRF 只调用一次 Qdrant Query API，并使用 `vector_store_id MatchAny`。
-- `hybrid / dense / bm25`、业务 Filter、保留 attributes、稳定 SearchHit 和同步失败结构均进入自动化测试。
+- `hybrid / dense / bm25`、业务 Filter、保留 attributes、稳定 SearchHit、异步失败结构和重启恢复均进入自动化测试。
 
 ### 步骤 12：固化 Stella 与企业版集成契约（服务端契约已完成）
 

@@ -15,6 +15,12 @@ import pytest
 pytestmark = [pytest.mark.e2e]
 
 
+def _compose_command() -> list[str]:
+    """测试服务同时由生产 Compose 与 E2E 覆盖文件定义。"""
+
+    return ["docker", "compose", "-f", "compose.yaml", "-f", "compose.e2e.yaml"]
+
+
 def _fixture_bytes() -> bytes:
     fixture_path = Path(__file__).parents[1] / "fixtures" / "knowledge.md"
     return fixture_path.read_bytes()
@@ -65,10 +71,13 @@ def _minimal_text_pdf() -> bytes:
     return bytes(document)
 
 
-def _create_vector_store(client: httpx.Client) -> str:
+def _create_vector_store(client: httpx.Client, *, tenant_id: str = "e2e-default") -> str:
     response = client.post(
         "/v1/vector_stores",
-        json={"name": f"e2e-{uuid.uuid4().hex[:8]}", "metadata": {"test": True}},
+        json={
+            "name": f"e2e-{uuid.uuid4().hex[:8]}",
+            "metadata": {"test": True, "tenant_id": tenant_id},
+        },
     )
     response.raise_for_status()
     return str(response.json()["id"])
@@ -90,6 +99,56 @@ def _attach_file(
     assert body["status"] == "completed", body
 
 
+def _submit_knowledge_ingest(
+    client: httpx.Client,
+    vector_store_id: str,
+    *,
+    filename: str,
+    department_id: str,
+    content: bytes | None = None,
+    content_type: str = "text/markdown",
+) -> dict[str, object]:
+    """提交单文件异步导入，并返回已经持久化的任务标识。"""
+
+    response = client.post(
+        "/knowledge/v1/ingest",
+        files={"file": (filename, content if content is not None else _fixture_bytes(), content_type)},
+        data={
+            "knowledge_base_id": vector_store_id,
+            "attributes": json.dumps({"department_id": department_id}),
+        },
+    )
+    response.raise_for_status()
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "processing", body
+    assert body["operation_id"]
+    assert body["file_id"]
+    return body
+
+
+def _wait_knowledge_ingest(
+    client: httpx.Client,
+    vector_store_id: str,
+    operation_id: str,
+    *,
+    timeout: float = 180,
+) -> dict[str, object]:
+    """轮询统一状态接口，返回 completed、failed 或 cancelled 终态。"""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/knowledge/v1/knowledge-bases/{vector_store_id}/operations/{operation_id}",
+        )
+        response.raise_for_status()
+        body = response.json()
+        if body["status"] in {"completed", "failed", "cancelled"}:
+            return body
+        time.sleep(0.1)
+    raise TimeoutError(f"异步导入任务 {operation_id} 在 {timeout} 秒内未完成")
+
+
 def _knowledge_ingest(
     client: httpx.Client,
     vector_store_id: str,
@@ -97,20 +156,17 @@ def _knowledge_ingest(
     filename: str,
     department_id: str,
 ) -> str:
-    """通过统一同步接口完成原文件上传和 VectorStore 挂载。"""
+    """提交异步导入并等待成功，供不关心中间状态的 E2E 场景复用。"""
 
-    response = client.post(
-        "/knowledge/v1/ingest",
-        files={"file": (filename, _fixture_bytes(), "text/markdown")},
-        data={
-            "knowledge_base_id": vector_store_id,
-            "attributes": json.dumps({"department_id": department_id}),
-        },
+    submitted = _submit_knowledge_ingest(
+        client,
+        vector_store_id,
+        filename=filename,
+        department_id=department_id,
     )
-    response.raise_for_status()
-    body = response.json()
-    assert body["status"] == "completed", body
-    return str(body["file_id"])
+    completed = _wait_knowledge_ingest(client, vector_store_id, str(submitted["operation_id"]))
+    assert completed["status"] == "completed", completed
+    return str(submitted["file_id"])
 
 
 def _search(
@@ -139,13 +195,13 @@ def _restart_compose_service(service: str) -> None:
 
     repository_root = Path(__file__).parents[2]
     subprocess.run(
-        ["docker", "compose", "restart", service],
+        [*_compose_command(), "restart", service],
         cwd=repository_root,
         check=True,
         timeout=60,
     )
     container_id = subprocess.check_output(
-        ["docker", "compose", "ps", "-q", service],
+        [*_compose_command(), "ps", "-q", service],
         cwd=repository_root,
         text=True,
         timeout=10,
@@ -172,7 +228,7 @@ def _set_embedding_stub_failure(enabled: bool) -> None:
     repository_root = Path(__file__).parents[2]
     stub_service = os.environ.get("OGX_EMBEDDING_STUB_SERVICE", "embedding-stub")
     container_id = subprocess.check_output(
-        ["docker", "compose", "ps", "-q", stub_service],
+        [*_compose_command(), "ps", "-q", stub_service],
         cwd=repository_root,
         text=True,
         timeout=10,
@@ -188,7 +244,7 @@ def _kill_docling_workers() -> int:
 
     repository_root = Path(__file__).parents[2]
     container_id = subprocess.check_output(
-        ["docker", "compose", "ps", "-q", "knowledge-ogx"],
+        [*_compose_command(), "ps", "-q", "knowledge-ogx"],
         cwd=repository_root,
         text=True,
         timeout=10,
@@ -259,6 +315,7 @@ def test_minimal_distribution_only_registers_required_api_families() -> None:
         "/v1/vector_stores/{vector_store_id}/search",
         "/v1alpha/file-processors/jobs",
         "/knowledge/v1/ingest",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
         "/knowledge/v1/search",
     }
     assert required <= paths
@@ -307,6 +364,11 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
         hits = response.json()["hits"]
         assert {hit["file_id"] for hit in hits} == {company_file, product_file}
         assert all(set(hit) == {"file_id", "chunk_id", "content", "locator", "score", "attributes"} for hit in hits)
+        if os.environ.get("E2E_EXPECT_RERANK", "1") == "1":
+            # 测试 Reranker 返回 1000 起始的特殊分数，避免把 Qdrant RRF 分数误判为已完成远程重排。
+            assert hits[0]["score"] == 1000.0
+        else:
+            assert hits[0]["score"] != 1000.0
 
         # Stub 只是文本哈希，不具备语义相似性；用已命中原文验证 Dense 协议，避免把随机余弦当效果评测。
         exact_chunk_text = hits[0]["content"]
@@ -343,6 +405,92 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
         for file_id in file_ids:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
+        client.close()
+
+
+def test_multiple_async_ingests_complete_without_losing_files() -> None:
+    """同时提交多个单文件 Batch，验证小并发下状态和索引都不会丢失。"""
+
+    base_url = os.environ.get("OGX_E2E_URL")
+    if not base_url:
+        pytest.skip("未设置 OGX_E2E_URL")
+
+    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    vector_store_id: str | None = None
+    submitted: list[dict[str, object]] = []
+    try:
+        vector_store_id = _create_vector_store(client)
+        for index in range(4):
+            submitted.append(
+                _submit_knowledge_ingest(
+                    client,
+                    vector_store_id,
+                    filename=f"async-{index}.md",
+                    department_id=f"async-{index}",
+                )
+            )
+
+        assert len({str(item["operation_id"]) for item in submitted}) == len(submitted)
+        assert len({str(item["file_id"]) for item in submitted}) == len(submitted)
+        for item in submitted:
+            completed = _wait_knowledge_ingest(client, vector_store_id, str(item["operation_id"]))
+            assert completed["status"] == "completed", completed
+
+        listed = client.get(f"/v1/vector_stores/{vector_store_id}/files", params={"limit": 100})
+        listed.raise_for_status()
+        assert {item["file_id"] for item in submitted} <= {item["id"] for item in listed.json()["data"]}
+    finally:
+        if vector_store_id is not None:
+            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
+            assert delete_vector_store.status_code in {200, 404}
+        for item in submitted:
+            delete_file = client.delete(f"/v1/files/{item['file_id']}")
+            assert delete_file.status_code in {200, 404}
+        client.close()
+
+
+def test_unified_api_allows_same_tenant_and_rejects_cross_tenant_search() -> None:
+    """验证 Collection 是租户边界，而 VectorStore 只是租户内逻辑范围。"""
+
+    base_url = os.environ.get("OGX_E2E_URL")
+    if not base_url:
+        pytest.skip("未设置 OGX_E2E_URL")
+
+    client = httpx.Client(base_url=base_url, timeout=180, trust_env=False)
+    vector_store_ids: list[str] = []
+    try:
+        tenant_a_first = _create_vector_store(client, tenant_id="e2e-tenant-a")
+        tenant_a_second = _create_vector_store(client, tenant_id="e2e-tenant-a")
+        tenant_b = _create_vector_store(client, tenant_id="e2e-tenant-b")
+        vector_store_ids.extend([tenant_a_first, tenant_a_second, tenant_b])
+
+        same_tenant = client.post(
+            "/knowledge/v1/search",
+            json={
+                "query": "空知识库路由探针",
+                "knowledge_base_ids": [tenant_a_first, tenant_a_second],
+                "mode": "bm25",
+                "limit": 10,
+            },
+        )
+        same_tenant.raise_for_status()
+        assert same_tenant.json()["hits"] == []
+
+        cross_tenant = client.post(
+            "/knowledge/v1/search",
+            json={
+                "query": "跨租户路由探针",
+                "knowledge_base_ids": [tenant_a_first, tenant_b],
+                "mode": "bm25",
+                "limit": 10,
+            },
+        )
+        assert cross_tenant.status_code == 422
+        assert "不能跨租户 Collection" in cross_tenant.text
+    finally:
+        for vector_store_id in vector_store_ids:
+            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
+            assert delete_vector_store.status_code in {200, 404}
         client.close()
 
 
@@ -476,19 +624,16 @@ def test_failed_attachment_can_be_deleted_and_retried() -> None:
         vector_store_id = _create_vector_store(client)
 
         _set_embedding_stub_failure(True)
-        failed = client.post(
-            "/knowledge/v1/ingest",
-            files={"file": ("knowledge.md", _fixture_bytes(), "text/markdown")},
-            data={
-                "knowledge_base_id": vector_store_id,
-                "attributes": json.dumps({"department_id": "retry-test"}),
-            },
+        submitted = _submit_knowledge_ingest(
+            client,
+            vector_store_id,
+            filename="knowledge.md",
+            department_id="retry-test",
         )
-        failed.raise_for_status()
-        failed_body = failed.json()
-        assert failed_body["status"] == "failed", failed_body
-        assert failed_body["last_error"]
-        file_id = str(failed_body["file_id"])
+        failed = _wait_knowledge_ingest(client, vector_store_id, str(submitted["operation_id"]))
+        assert failed["status"] == "failed", failed
+        assert failed["last_error"]
+        file_id = str(submitted["file_id"])
 
         _set_embedding_stub_failure(False)
         delete_failed = client.delete(f"/v1/vector_stores/{vector_store_id}/files/{file_id}")
@@ -498,6 +643,63 @@ def test_failed_attachment_can_be_deleted_and_retried() -> None:
         assert recovered["data"]
     finally:
         _set_embedding_stub_failure(False)
+        if vector_store_id is not None:
+            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
+            assert delete_vector_store.status_code in {200, 404}
+        if file_id is not None:
+            delete_file = client.delete(f"/v1/files/{file_id}")
+            assert delete_file.status_code in {200, 404}
+        client.close()
+
+
+@pytest.mark.recovery
+def test_async_ingest_resumes_after_ogx_restart() -> None:
+    """提交成功后立即重启 OGX，验证持久化 FileBatch 会恢复完整导入。"""
+
+    base_url = os.environ.get("OGX_E2E_URL")
+    if not base_url or os.environ.get("OGX_ASYNC_RESTART_E2E") != "1":
+        pytest.skip("需同时设置 OGX_E2E_URL 与 OGX_ASYNC_RESTART_E2E=1")
+
+    # 大文件用于确保重启发生时任务仍在处理，避免只验证已完成结果的读取。
+    paragraphs = "".join(
+        f"<h2>异步恢复规则 {index}</h2><p>退款必须提供订单编号和付款凭证。</p>" for index in range(1_000)
+    )
+    html = f"<!doctype html><html><body>{paragraphs}</body></html>".encode()
+    client = httpx.Client(base_url=base_url, timeout=240, trust_env=False)
+    vector_store_id: str | None = None
+    file_id: str | None = None
+    try:
+        vector_store_id = _create_vector_store(client)
+        submitted = _submit_knowledge_ingest(
+            client,
+            vector_store_id,
+            filename="async-restart.html",
+            department_id="async-restart",
+            content=html,
+            content_type="text/html",
+        )
+        file_id = str(submitted["file_id"])
+        operation_id = str(submitted["operation_id"])
+
+        client.close()
+        _restart_compose_service("knowledge-ogx")
+        client = httpx.Client(base_url=base_url, timeout=240, trust_env=False)
+
+        completed = _wait_knowledge_ingest(
+            client,
+            vector_store_id,
+            operation_id,
+            timeout=240,
+        )
+        assert completed["status"] == "completed", completed
+        result = _search(
+            client,
+            vector_store_id,
+            department_id="async-restart",
+            query="退款需要哪些凭证",
+        )
+        assert result["data"]
+    finally:
         if vector_store_id is not None:
             delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
             assert delete_vector_store.status_code in {200, 404}

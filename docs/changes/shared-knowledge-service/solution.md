@@ -32,6 +32,7 @@ Stella 与 Cherry Studio 企业版都需要文档上传、原文保存、解析�
 - Docling 文档解析和 Docling `HybridChunker` 切块。
 - 外部 OpenAI-compatible Embedding 服务。
 - Qdrant Dense 向量、BM25 Sparse 向量、Payload Filter 和 RRF。
+- 可由部署开关启用的远程神经 Reranker。
 - PostgreSQL 中的 OGX 文件元数据、VectorStore 元数据和内部任务数据。
 - Stella 四级范围与企业版显式知识库到统一对象和 Qdrant Payload 的映射。
 - MVP 原生接口、后续统一产品接口，以及文件和逻辑知识库的管理接口。
@@ -43,7 +44,7 @@ Stella 与 Cherry Studio 企业版都需要文档上传、原文保存、解析�
 - 不在知识库服务中实现 Stella 或企业版的用户、组织、角色和授权规则。
 - 不建设跨客户共享的全局知识库；默认一个客户环境部署一套服务。
 - MVP 不支持多副本 OGX 服务，不为超大规模或高并发提前设计分片调度。
-- MVP 不提供 OCR、VLM 解析和神经 Reranker。
+- MVP 不提供 OCR 和 VLM 解析。
 - MVP 不引入自定义 `Document / Revision` 领域模型，也不承诺 Revision 原子切换。
 - 不启用 OGX 的 Responses、Agent、Messages、Tools、Eval 等无关 API。
 - 不引入 Haystack、PgQueuer、River、Weaviate 或额外 FastAPI 服务。
@@ -207,7 +208,7 @@ MVP 默认检索模式为 `hybrid`：Dense 与 BM25 使用完全相同的 Payloa
 | Chunk Point | 某次 File 挂载产生的可检索切块 | Qdrant |
 | Collection | 一个客户环境或租户的物理索引边界 | Qdrant |
 
-`VectorStore` 不对应独立 Qdrant Collection。一个部署默认只有一个 Collection，多个逻辑 VectorStore 通过 `vector_store_id` Payload 区分。新增部门知识库只是新增一个 VectorStore 和新的 `vector_store_id` 值，不创建 Payload Index，也不重建 HNSW。
+`VectorStore` 不对应独立 Qdrant Collection。物理边界是租户：每个租户一个 Collection，租户内多个逻辑 VectorStore 通过 `vector_store_id` Payload 区分。没有 `tenant_id` 的单租户部署使用默认 Collection。租户内新增部门知识库只是新增一个 VectorStore 和新的 `vector_store_id` 值，不创建 Payload Index，也不重建 HNSW。
 
 ### 5.6 Qdrant Point 结构
 
@@ -291,7 +292,7 @@ Stella 通常不需要面向用户展示 VectorStore 创建、命名和列表功
 
 ### 6.2 Cherry Studio 企业版
 
-公司、部门、产品等知识库是显式业务对象，需要创建、展示、修改、挂载和删除。每个业务知识库一对一映射一个 OGX VectorStore，但所有 VectorStore 仍写入同一个 Qdrant Collection。
+公司、部门、产品等知识库是显式业务对象，需要创建、展示、修改、挂载和删除。每个业务知识库一对一映射一个 OGX VectorStore；创建时写入可信 `tenant_id`。同租户 VectorStore 写入同一个 Qdrant Collection，不同租户使用不同 Collection。
 
 企业版产品数据库保存：
 
@@ -308,7 +309,7 @@ Stella 通常不需要面向用户展示 VectorStore 创建、命名和列表功
 vector_store_id IN [公司知识库, 部门A知识库, 产品B知识库]
 ```
 
-因为这些数据位于同一个 Collection，这是一条带过滤的 Dense + BM25 + RRF 查询，不需要分别搜索多个物理库后再次融合。
+因为同租户数据位于同一个 Collection，这是一条带过滤的 Dense + BM25 + RRF 查询，不需要分别搜索多个物理库后再次融合。一次请求如果混入不同租户的 VectorStore，服务直接拒绝，不做跨 Collection 融合。
 
 ### 6.3 统一知识库服务
 
@@ -330,9 +331,11 @@ vector_store_id IN [公司知识库, 部门A知识库, 产品B知识库]
 
 | 行为 | 接口 | 说明 |
 | --- | --- | --- |
-| 创建逻辑知识库 | `POST /v1/vector_stores` | Stella 初始化一次；企业版按业务知识库创建 |
+| 创建逻辑知识库 | `POST /v1/vector_stores` | Stella 初始化一次；企业版按业务知识库创建；多租户部署在 metadata 写可信 `tenant_id` |
 | 上传原文件 | `POST /v1/files` | multipart 上传并先持久化原文件 |
 | 挂载并处理文件 | `POST /v1/vector_stores/{vector_store_id}/files` | 传 `file_id`、attributes 和 chunking strategy；当前调用会等待完整处理结果 |
+| 异步处理单个或多个文件 | `POST /v1/vector_stores/{vector_store_id}/file_batches` | 持久化 Batch 后立即返回；统一 Ingest 用单文件 Batch 作为 Operation |
+| 查询异步任务 | `GET /v1/vector_stores/{vector_store_id}/file_batches/{batch_id}` | 返回 Batch 状态和文件计数；统一接口修正“completed 但包含失败文件”的语义 |
 | 查询挂载状态 | `GET /v1/vector_stores/{vector_store_id}/files/{file_id}` | 返回 `in_progress / completed / failed` 等状态 |
 | 混合检索 | `POST /v1/vector_stores/{vector_store_id}/search` | `search_mode=hybrid`，支持 filters 和结果数量 |
 | 删除文件挂载 | `DELETE /v1/vector_stores/{vector_store_id}/files/{file_id}` | 删除该逻辑知识库内对应 Point |
@@ -348,7 +351,7 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 
 #### `POST /knowledge/v1/ingest`
 
-用于在一次产品调用中完成“上传 File + 挂载 VectorStore”。MVP 已确定使用同步语义，返回时 `status` 是 `completed` 或 `failed`，不新增完整导入任务实体。
+用于在一次产品调用中完成“上传 File + 创建单文件 FileBatch”。原文件和 Batch 持久化后立即返回 HTTP `202`，后台继续执行 Docling、HybridChunker、Embedding 和 Qdrant 写入；不新增 PgQueuer、River 或独立任务服务。
 
 | 字段 | 必须 | 含义 |
 | --- | --- | --- |
@@ -356,7 +359,11 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 | `knowledge_base_id` | 是 | 逻辑知识库 ID；映射 OGX VectorStore 和 Qdrant `vector_store_id`，不是物理 Collection ID |
 | `attributes` | 否 | 产品写入的通用过滤元数据；Stella 在这里写四级范围字段 |
 
-返回固定包含：`file_id`、`knowledge_base_id`、`status` 和可选 `last_error`。上传完成后若后续处理失败，原文件和失败挂载记录保留，调用方使用辅助接口显式删除或重试。
+返回固定包含：`operation_id`、`file_id`、`knowledge_base_id` 和 `status=processing`。`operation_id` 当前映射 OGX `file_batch_id`。
+
+#### `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}`
+
+查询单文件异步导入状态，返回 `processing / completed / failed / cancelled` 和可选 `last_error`。OGX Batch 即使包含失败文件也可能返回 `completed`，统一接口必须依据 `file_counts` 转换为 `failed`。
 
 #### `POST /knowledge/v1/search`
 
@@ -378,34 +385,25 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 | 上传、查看和删除文件 | 需要 | 需要 |
 | 挂载多个知识库检索 | 固定隐藏知识库 + 四级 Filter | 需要，按业务权限生成知识库 ID 列表 |
 | 查询处理状态 | 需要 | 需要 |
-| 删除整个知识库 | 部署清理等少量场景 | 需要 |
+| 删除整个知识库 | 不需要 | 需要 |
 | 用户管理 | 不由知识库服务提供 | 不由知识库服务提供 |
 
 ## 8. 生命周期与失败恢复
 
-### 8.1 文件替换
-
-MVP 没有 Revision。替换文件采用：
-
-1. 上传新 File。
-2. 挂载新 File 并等待完成。
-3. 新 File 可检索后，删除旧 VectorStoreFile。
-4. 旧 File 没有其他挂载后再删除原文。
-
-这不是原子切换，短时间内可能同时检索到新旧版本。该限制是选择 OGX 原生文件模型的明确取舍。
-
-### 8.2 幂等与重试
+### 8.1 异步恢复与重试
 
 - Qdrant Point ID 使用 `hash(vector_store_id + chunk_id)`，重复 Upsert 覆盖同一 Point，不生成重复数据。
 - Docling Worker 崩溃后由 OGX Job Queue 回收租约并重试，默认最多 3 次。
-- OGX Server 在 Embedding 或 Qdrant Upsert 阶段崩溃时，完整导入不会自动恢复。调用方需要重试挂载操作。
+- 单文件 FileBatch 在 PostgreSQL 持久化后返回；OGX 重启时扫描 `in_progress` Batch 并恢复剩余文件。
+- OGX 原生优雅关闭会把运行中的 Batch 标记为 `cancelled`；自定义 Provider 只对“服务停机前仍为 in_progress”的 Batch 恢复该状态，用户主动取消不恢复。
 - 如果 OGX 已经保存了 `failed` VectorStoreFile，同一个 attach 请求只会返回已有对象，不会自动重跑；恢复协议必须先删除失败挂载，再重新 attach。
-- MVP 必须通过故障注入验证“删除失败挂载 + 重新挂载”不会遗留重复 Point、跨 VectorStore 数据或错误完成状态。
+- 已通过真实故障注入验证正常完成、Embedding 失败、失败挂载删除重试、四个并发单文件 Batch 和 OGX 重启恢复。
+- 当前复用 OGX FileBatch 的单实例恢复机制，不宣称支持多副本并发领取。
 
-### 8.3 删除
+### 8.2 删除
 
 - 删除 VectorStoreFile 只删除对应 `(vector_store_id, file_id)` 的 Chunk Point。
-- 删除 VectorStore 按 `vector_store_id` Filter 删除其全部 Point，不删除共享 Collection。
+- 删除 VectorStore 按 `vector_store_id` Filter 删除其全部 Point，不删除租户 Collection。
 - 删除 File 前必须确认没有其他 VectorStoreFile 引用；同一 File 多次挂载是合法行为。
 - 产品删除权限对象时，先由产品计算需要清理的 File/VectorStore，再调用知识库接口；Provider 不理解用户或组织生命周期。
 
@@ -428,7 +426,7 @@ MVP 没有 Revision。替换文件采用：
 | 多重挂载 | 同一 File 挂载两个 VectorStore | Point 不互相覆盖，删除一侧不影响另一侧 |
 | 删除 | 删除挂载、File 和 VectorStore | Qdrant、PostgreSQL、原文符合预期生命周期 |
 | 解析恢复 | 处理时终止 Docling Worker | 任务被重新租约并在尝试预算内完成或失败 |
-| 全链路恢复 | Embedding/Upsert 时终止 OGX | 显式恢复协议可修复且无重复、串库和假完成 |
+| 全链路恢复 | 异步导入处理中重启 OGX | FileBatch 恢复并完成，无重复、串库和假完成 |
 | 持久化 | 分别重启 OGX、PostgreSQL、Qdrant | 已完成资源和检索结果仍存在 |
 | 资源测量 | 空闲、解析、Embedding、导入、检索 | 记录 CPU、内存、磁盘和延迟，为生产配额提供证据 |
 
@@ -448,13 +446,13 @@ MVP 没有 Revision。替换文件采用：
 | 风险 | 影响 | 处理方式 |
 | --- | --- | --- |
 | 自定义 Provider 承担核心检索语义 | 它不是薄适配层，错误会造成漏召回、串库或错误删除 | 单元测试过滤翻译；集成测试 Qdrant；以 OGX 官方 Provider 和 Qdrant 官方示例为参考，但独立维护契约测试 |
-| 完整导入不是持久任务 | OGX Server 崩溃后不能自动续跑 Embedding/Upsert | MVP 接受显式恢复；用幂等 Point ID、失败挂载删除重试和对账工具降低代价 |
+| FileBatch 仍是单实例后台任务 | 多副本会重复恢复或缺少全局并发控制 | 当前固定单实例；Provider 修正优雅停机状态，真实重启测试覆盖恢复；多副本时重新设计租约领取 |
 | Qdrant 原生 BM25 与服务版本耦合 | tokenizer 选项或语言处理在升级后可能改变 | 固定 Qdrant 1.18.2；文档和查询共用同一配置；升级必须重跑原生 BM25 探针与真实语料评测 |
 | 产品生成错误 Filter | 可能漏数据或越权 | 产品只从可信身份生成；服务校验语法和保留字段；为 Stella 与企业版权限矩阵建立契约测试 |
 | 新增高频过滤字段 | 已有 Collection 可能需要索引迁移和 HNSW 优化 | 常用字段在建 Collection 前声明；字段变更走显式迁移，不与“新增知识库值”混淆 |
 | 已有数据直接更换 Embedding 模型 | 即使维度相同，新旧向量空间通常也不兼容；OGX VectorStore 还会保存原模型 ID | 当前不支持，也不纳入本期；若未来提出该需求，再单独设计 |
 | OGX 模型注册信息与配置漂移 | 原地修改模型后可能因自动发现记录类型冲突而启动失败 | 模型迁移同时处理 PostgreSQL Registry 与 Qdrant 全量重建；不把修改环境变量当成完整迁移 |
-| 无 Revision 原子发布 | 文件替换存在短时双版本 | MVP 明确接受；若成为硬需求，重新评估扩展 OGX 或切换 Haystack |
+| 远程 Rerank 服务超时或不可用 | Hybrid 排序效果暂时退化 | Rerank 是部署级可选增强；失败时保留 Qdrant RRF Top K，并记录错误 |
 | OGX 上游变化 | 升级可能破坏 Provider 契约 | 固定 v1.3.0；升级必须通过兼容性测试，允许选择不跟进 |
 | 单实例限制 | 无法独立横向扩展 API 和导入吞吐 | 当前客户部署和规模接受；多副本成为需求时重新设计 |
 | 公开仓库泄露凭证或遗漏第三方许可声明 | 安全与合规风险 | 所有密钥只从环境/Secret 注入；不提交真实 Endpoint Token；项目采用 MIT License，复用第三方代码时保留其许可声明 |
@@ -464,9 +462,9 @@ MVP 没有 Revision。替换文件采用：
 以下问题不改变 OGX + Qdrant 方案，可以在后续实施中确定：
 
 1. 生产环境原始文件使用本地持久卷还是 S3。
-2. Reranker 的模型、接入位置和启用条件。
+2. Reranker 最终使用哪个模型；接入位置和启用条件已确定，MVP 默认模型可由部署配置替换。
 
-MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。这一轮用于验证模型服务兼容性、维度配置和检索链路，不用于在架构阶段固定具体模型。后续使用更大业务语料，综合效果、延迟和成本再确定部署模型；如果 multilingual BM25 或 Dense 在扩大语料后退化，再加入 Jieba 或 Reranker 对照。
+MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。这一轮用于验证模型服务兼容性、维度配置和检索链路，不用于在架构阶段固定具体模型。远程 Rerank 已固定在 Qdrant RRF 候选之后，通过 OGX `Inference.rerank` 调用；MVP 默认 `qwen/qwen3-reranker-0.6b`，最终模型仍由更大业务语料上的效果、延迟和成本决定。
 
 Qdrant Server 已固定为 `1.18.2`，qdrant-client 已固定为 `1.18.0`；真实探针已覆盖 IDF Sparse、Payload Filter、Query API 和原生 RRF，因此版本能力不再是未决项。
 

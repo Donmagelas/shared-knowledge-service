@@ -45,7 +45,7 @@ def _payload_schema(index_type: PayloadIndexType) -> models.PayloadSchemaType:
 
 
 class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
-    """一个物理 Collection 内由 ``vector_store_id`` 隔离的逻辑索引。"""
+    """一个租户 Collection 内由 ``vector_store_id`` 隔离的逻辑索引。"""
 
     def __init__(
         self,
@@ -53,20 +53,49 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         vector_store: VectorStore,
         config: SharedQdrantVectorIOConfig,
         collection_lock: asyncio.Lock,
+        collection_name: str | None = None,
     ) -> None:
         self.client = client
         self.vector_store_id = vector_store.identifier
         self.dimension = vector_store.embedding_dimension
         self.config = config
         self.collection_lock = collection_lock
+        self.collection_name = collection_name
+        self._initialized = False
+
+    def bind_collection(self, collection_name: str) -> None:
+        """把逻辑 VectorStore 绑定到不可变的租户 Collection。"""
+
+        if not collection_name:
+            raise ValueError("Qdrant Collection 名不能为空")
+        if self.collection_name is not None and self.collection_name != collection_name:
+            raise ValueError("VectorStore 创建后不能迁移到另一个租户 Collection")
+        self.collection_name = collection_name
+
+    def _require_collection_name(self) -> str:
+        if self.collection_name is None:
+            raise RuntimeError("VectorStore 尚未绑定租户 Collection")
+        return self.collection_name
+
+    @property
+    def bound_collection_name(self) -> str:
+        """返回已验证的物理 Collection 名，供 Provider 做跨租户检查。"""
+
+        return self._require_collection_name()
 
     async def initialize(self) -> None:
-        """按首个 VectorStore 的维度创建 Collection，后续注册只校验并复用。"""
+        """按租户首个 VectorStore 的维度创建 Collection，后续注册只校验并复用。"""
+
+        if self._initialized:
+            return
+        collection_name = self._require_collection_name()
 
         async with self.collection_lock:
-            if not await self.client.collection_exists(self.config.collection_name):
+            if self._initialized:
+                return
+            if not await self.client.collection_exists(collection_name):
                 await self.client.create_collection(
-                    collection_name=self.config.collection_name,
+                    collection_name=collection_name,
                     vectors_config={
                         self.config.dense_vector_name: models.VectorParams(
                             size=self.dimension,
@@ -79,9 +108,11 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                 )
             await self._validate_collection_schema()
             await self._ensure_payload_indexes()
+            self._initialized = True
 
     async def _validate_collection_schema(self) -> None:
-        info = await self.client.get_collection(self.config.collection_name)
+        collection_name = self._require_collection_name()
+        info = await self.client.get_collection(collection_name)
         vectors = info.config.params.vectors
         sparse_vectors = info.config.params.sparse_vectors
         if not isinstance(vectors, dict) or self.config.dense_vector_name not in vectors:
@@ -97,7 +128,8 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
             raise RuntimeError("Qdrant BM25 Sparse Vector 必须启用动态 IDF")
 
     async def _ensure_payload_indexes(self) -> None:
-        info = await self.client.get_collection(self.config.collection_name)
+        collection_name = self._require_collection_name()
+        info = await self.client.get_collection(collection_name)
         declared: dict[str, PayloadIndexType] = {
             "vector_store_id": PayloadIndexType.KEYWORD,
             "file_id": PayloadIndexType.KEYWORD,
@@ -108,7 +140,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
             if field_name in info.payload_schema:
                 continue
             await self.client.create_payload_index(
-                collection_name=self.config.collection_name,
+                collection_name=collection_name,
                 field_name=field_name,
                 field_schema=_payload_schema(index_type),
                 wait=True,
@@ -136,6 +168,8 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
     async def add_chunks(self, embedded_chunks: list[EmbeddedChunk]) -> None:
         if not embedded_chunks:
             return
+        await self.initialize()
+        collection_name = self._require_collection_name()
         points: list[models.PointStruct] = []
         for chunk in embedded_chunks:
             payload = self._payload_for_chunk(chunk)
@@ -150,13 +184,15 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                     payload=payload,
                 )
             )
-        await self.client.upsert(collection_name=self.config.collection_name, points=points, wait=True)
+        await self.client.upsert(collection_name=collection_name, points=points, wait=True)
 
     async def delete_chunks(self, chunks_for_deletion: list[ChunkForDeletion]) -> None:
         if not chunks_for_deletion:
             return
+        await self.initialize()
+        collection_name = self._require_collection_name()
         await self.client.delete(
-            collection_name=self.config.collection_name,
+            collection_name=collection_name,
             points_selector=models.PointIdsList(
                 points=[compound_point_id(self.vector_store_id, chunk.chunk_id) for chunk in chunks_for_deletion]
             ),
@@ -188,9 +224,11 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
     ) -> QueryChunksResponse:
         """在一次 Qdrant 查询中检索一个或多个逻辑 VectorStore。"""
 
+        await self.initialize()
+        collection_name = self._require_collection_name()
         results = (
             await self.client.query_points(
-                collection_name=self.config.collection_name,
+                collection_name=collection_name,
                 query=embedding.tolist(),
                 using=self.config.dense_vector_name,
                 query_filter=scoped_filter(vector_store_ids, filters, self.config.payload_indexes),
@@ -226,12 +264,14 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
     ) -> QueryChunksResponse:
         """在一次 Qdrant 查询中执行跨逻辑 VectorStore 的 BM25。"""
 
+        await self.initialize()
+        collection_name = self._require_collection_name()
         sparse_query = native_bm25_document(query_string)
         if sparse_query is None:
             return QueryChunksResponse(chunks=[], scores=[])
         results = (
             await self.client.query_points(
-                collection_name=self.config.collection_name,
+                collection_name=collection_name,
                 query=sparse_query,
                 using=self.config.sparse_vector_name,
                 query_filter=scoped_filter(vector_store_ids, filters, self.config.payload_indexes),
@@ -279,6 +319,8 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         if reranker_type != "rrf":
             raise NotImplementedError(f"MVP 混合检索只支持 RRF，不支持 {reranker_type}")
 
+        await self.initialize()
+        collection_name = self._require_collection_name()
         sparse_query = native_bm25_document(query_string)
         if sparse_query is None:
             return await self.query_vector_scoped(vector_store_ids, embedding, k, score_threshold, filters)
@@ -287,7 +329,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         candidate_limit = max(k * 4, 20)
         results = (
             await self.client.query_points(
-                collection_name=self.config.collection_name,
+                collection_name=collection_name,
                 prefetch=[
                     models.Prefetch(
                         query=embedding.tolist(),
@@ -321,10 +363,12 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         return QueryChunksResponse(chunks=chunks, scores=scores)
 
     async def delete(self) -> None:
-        """删除逻辑 VectorStore 的 Point，不删除共享 Collection。"""
+        """删除逻辑 VectorStore 的 Point，不删除租户 Collection。"""
 
+        await self.initialize()
+        collection_name = self._require_collection_name()
         await self.client.delete(
-            collection_name=self.config.collection_name,
+            collection_name=collection_name,
             points_selector=models.FilterSelector(filter=scoped_filter(self.vector_store_id)),
             wait=True,
         )

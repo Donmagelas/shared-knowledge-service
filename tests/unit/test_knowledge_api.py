@@ -14,7 +14,11 @@ from ogx_api import (
     OpenAIFilePurpose,
     QueryChunksResponse,
     VectorStoreChunkingStrategyAuto,
+    VectorStoreFileBatchObject,
+    VectorStoreFileCounts,
+    VectorStoreFileLastError,
     VectorStoreFileObject,
+    VectorStoreFilesListInBatchResponse,
 )
 
 from shared_knowledge_service.api.models import SearchRequest
@@ -69,21 +73,59 @@ class FakeVectorIO:
     def __init__(self, provider: FakeSharedAdapter) -> None:
         self.routing_table = FakeRoutingTable(provider)
         self.retrieved: list[str] = []
-        self.attached: list[tuple[str, Any]] = []
+        self.created_batches: list[tuple[str, Any]] = []
+        self.batch = VectorStoreFileBatchObject(
+            id="batch-1",
+            created_at=1,
+            vector_store_id="vs-a",
+            status="in_progress",
+            file_counts=VectorStoreFileCounts(
+                completed=0,
+                cancelled=0,
+                failed=0,
+                in_progress=1,
+                total=1,
+            ),
+        )
+        self.batch_files: list[VectorStoreFileObject] = []
 
     async def openai_retrieve_vector_store(self, knowledge_base_id: str) -> object:
         self.retrieved.append(knowledge_base_id)
         return object()
 
-    async def openai_attach_file_to_vector_store(self, knowledge_base_id: str, request: Any) -> VectorStoreFileObject:
-        self.attached.append((knowledge_base_id, request))
-        return VectorStoreFileObject(
-            id=request.file_id,
-            vector_store_id=knowledge_base_id,
-            attributes=request.attributes,
-            chunking_strategy=VectorStoreChunkingStrategyAuto(),
-            created_at=1,
-            status="completed",
+    async def openai_create_vector_store_file_batch(
+        self,
+        vector_store_id: str,
+        params: Any,
+    ) -> VectorStoreFileBatchObject:
+        self.created_batches.append((vector_store_id, params))
+        return self.batch
+
+    async def openai_retrieve_vector_store_file_batch(
+        self,
+        batch_id: str,
+        vector_store_id: str,
+    ) -> VectorStoreFileBatchObject:
+        assert batch_id == self.batch.id
+        assert vector_store_id == self.batch.vector_store_id
+        return self.batch
+
+    async def openai_list_files_in_vector_store_file_batch(
+        self,
+        batch_id: str,
+        vector_store_id: str,
+        **kwargs: Any,
+    ) -> VectorStoreFilesListInBatchResponse:
+        del kwargs
+        assert batch_id == self.batch.id
+        assert vector_store_id == self.batch.vector_store_id
+        first_id = self.batch_files[0].id if self.batch_files else ""
+        last_id = self.batch_files[-1].id if self.batch_files else ""
+        return VectorStoreFilesListInBatchResponse(
+            data=self.batch_files,
+            first_id=first_id,
+            last_id=last_id,
+            has_more=False,
         )
 
 
@@ -124,7 +166,7 @@ def test_parse_attributes_requires_json_object() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_reuses_files_and_vector_store_without_new_task_object() -> None:
+async def test_ingest_creates_single_file_batch_and_returns_without_waiting() -> None:
     files = FakeFiles()
     adapter = FakeSharedAdapter(_query_result())
     vector_io = FakeVectorIO(adapter)
@@ -133,12 +175,50 @@ async def test_ingest_reuses_files_and_vector_store_without_new_task_object() ->
 
     response = await provider.ingest(upload, "vs-a", {"department_id": "product-a"})
 
-    assert response.status == "completed"
+    assert response.status == "processing"
+    assert response.operation_id == "batch-1"
     assert response.file_id == "file-1"
     assert files.upload_count == 1
     assert vector_io.retrieved == ["vs-a"]
-    assert vector_io.attached[0][0] == "vs-a"
-    assert vector_io.attached[0][1].attributes == {"department_id": "product-a"}
+    assert vector_io.created_batches[0][0] == "vs-a"
+    assert vector_io.created_batches[0][1].file_ids == ["file-1"]
+    assert vector_io.created_batches[0][1].attributes == {"department_id": "product-a"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_operation_maps_failed_file_count_and_error() -> None:
+    adapter = FakeSharedAdapter(_query_result())
+    vector_io = FakeVectorIO(adapter)
+    vector_io.batch = VectorStoreFileBatchObject(
+        id="batch-1",
+        created_at=1,
+        vector_store_id="vs-a",
+        status="completed",
+        file_counts=VectorStoreFileCounts(
+            completed=0,
+            cancelled=0,
+            failed=1,
+            in_progress=0,
+            total=1,
+        ),
+    )
+    vector_io.batch_files = [
+        VectorStoreFileObject(
+            id="file-1",
+            vector_store_id="vs-a",
+            chunking_strategy=VectorStoreChunkingStrategyAuto(),
+            created_at=1,
+            status="failed",
+            last_error=VectorStoreFileLastError(code="server_error", message="embedding unavailable"),
+        )
+    ]
+    provider = KnowledgeApiProvider(files_api=FakeFiles(), vector_io=vector_io)  # type: ignore[arg-type]
+
+    response = await provider.get_ingest_operation("vs-a", "batch-1")
+
+    assert response.status == "failed"
+    assert response.last_error is not None
+    assert response.last_error.message == "embedding unavailable"
 
 
 @pytest.mark.asyncio
