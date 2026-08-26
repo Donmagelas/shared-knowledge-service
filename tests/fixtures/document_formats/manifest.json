@@ -1,0 +1,86 @@
+{
+  "fixture_set": "non_ocr_batch_1",
+  "description": "首批七类非 OCR 文档；Markdown/TXT 作为同一类的两个输入变体分别验证。",
+  "cases": [
+    {
+      "id": "markdown",
+      "category": "Markdown/TXT",
+      "filename": "format_markdown.md",
+      "mime_type": "text/markdown",
+      "marker": "MD-ALPHA-7319",
+      "question": "北辰演练的冻结窗口是什么时候？",
+      "expected_answer": "周二 20:40",
+      "features": ["标题", "有序列表", "表格"]
+    },
+    {
+      "id": "text",
+      "category": "Markdown/TXT",
+      "filename": "format_text.txt",
+      "mime_type": "text/plain",
+      "marker": "TXT-BRAVO-1842",
+      "question": "纯文本样本的应急联系人是谁？",
+      "expected_answer": "顾舟",
+      "features": ["纯文本段落"]
+    },
+    {
+      "id": "html",
+      "category": "HTML",
+      "filename": "format_html.html",
+      "mime_type": "text/html",
+      "marker": "HTML-COMET-5624",
+      "question": "HTML 样本的发布负责人是谁？",
+      "expected_answer": "苏遥",
+      "features": ["标题层级", "列表", "表格"]
+    },
+    {
+      "id": "pdf",
+      "category": "数字 PDF",
+      "filename": "format_pdf.pdf",
+      "mime_type": "application/pdf",
+      "marker": "PDF-ECHO-4176",
+      "question": "PDF 样本的总协调人是谁？",
+      "expected_answer": "唐沐",
+      "features": ["两页数字文本", "表格", "页眉页脚"]
+    },
+    {
+      "id": "docx",
+      "category": "DOCX",
+      "filename": "format_docx.docx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "marker": "DOCX-FOXTROT-2651",
+      "question": "DOCX 样本的终验负责人是谁？",
+      "expected_answer": "纪川",
+      "features": ["两页", "标题层级", "列表", "表格", "页眉页脚"]
+    },
+    {
+      "id": "pptx",
+      "category": "PPTX",
+      "filename": "format_pptx.pptx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "marker": "PPTX-GAMMA-8437",
+      "question": "PPTX 样本的上线批准人是谁？",
+      "expected_answer": "陆遥",
+      "features": ["三页", "时间线", "原生表格"]
+    },
+    {
+      "id": "xlsx",
+      "category": "XLSX",
+      "filename": "format_xlsx.xlsx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "marker": "XLSX-HOTEL-3968",
+      "question": "XLSX 样本中北区的负责人是谁？",
+      "expected_answer": "周衡",
+      "features": ["两个工作表", "公式", "原生表格", "日期和百分比"]
+    },
+    {
+      "id": "csv",
+      "category": "CSV",
+      "filename": "format_csv.csv",
+      "mime_type": "text/csv",
+      "marker": "CSV-DELTA-9083",
+      "question": "CSV-001 的负责人是谁？",
+      "expected_answer": "许墨",
+      "features": ["表头", "多行数据", "中文字段"]
+    }
+  ]
+}

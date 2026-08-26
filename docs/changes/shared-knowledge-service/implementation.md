@@ -16,7 +16,7 @@
 
 实施必须保持方案中的对象模型、权限边界、Collection 组织、任务可靠性边界和非目标，不在编码阶段重新引入 Haystack、Revision、PgQueuer、River 或独立 API 服务。异步导入复用 OGX 单文件 FileBatch 及 PostgreSQL 状态，不新增可部署组件。
 
-### 1.1 2026-08-25 实施快照
+### 1.1 2026-08-26 实施快照
 
 | 步骤 | 当前状态 | 已有证据或剩余事项 |
 | --- | --- | --- |
@@ -29,7 +29,7 @@
 | 7. Hybrid RRF | 完成 | 0.6B/4B/8B 三种真实 Embedding 的 Hybrid 均为 8/8 Top1，且与相同 Payload Filter 共用一条 Qdrant Query |
 | 8. 生命周期 | 完成 | 同一 File 双 VectorStore、单侧删除、VectorStore 删除与失败挂载重试均已验证 |
 | 9. 恢复 | MVP 完成 | PostgreSQL/Qdrant/OGX 分别重启、Embedding 失败恢复、异步 FileBatch 重启恢复和 Docling Worker 租约回收均通过；Qdrant Upsert 窗口杀进程未单独注入 |
-| 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding 和第一轮两侧项目文档效果均有新鲜证据，OGX 路线继续 |
+| 10. MVP 验收 | 完成 | 机制、恢复、资源、真实 Embedding、两侧项目文档效果和七类非 OCR 文件矩阵均有新鲜证据，OGX 路线继续 |
 | 11. 统一 Knowledge API | 完成 | 同一 OGX 进程提供异步 Ingest、Operation 状态、多知识库 Search 和稳定 SearchHit |
 | 12. 两侧契约 | 服务端完成 | Stella 四级范围和企业版显式知识库映射、过滤与 E2E 已固化；产品仓库适配后续各自实施 |
 | 13. 生产化 | 部分完成 | Runtime/Admin 认证、凭证加密、本地/S3 可选配置、稳定错误和无效文件清理已完成；真实 S3、备份恢复、监控和更大业务语料仍待验证 |
@@ -41,7 +41,7 @@
 
 当前镜像已只预置 Docling PDF 默认路径需要的模型：Transformers layout、Accurate TableFormer 和 HybridChunker tokenizer，且都固定到 commit。构建阶段在离线模式初始化 PDF Pipeline，最终镜像约 `1.08 GB`，而不是此前包含未使用 ONNX/Fast 变体时的约 `4.55 GB`。
 
-本机 Docker 基线仅用于量级判断，不是生产配额承诺：OGX 冷启动稳定后约 `1.03 GiB`，完成一份单页数字 PDF 导入后约 `1.54 GiB`；PostgreSQL 约 `58 MiB`，Qdrant 约 `120 MiB`。资源数字来自三维确定性 Embedding Stub；另行完成的真实模型评测显示，当前服务上 0.6B/1024 维的 5 文档总导入约 `11.47 s`、Hybrid 平均约 `648 ms`，4B 约 `13.61 s / 738 ms`，8B 约 `35.33 s / 5514 ms`。这些只是不同模型链路可用性的单次测试数据，不是当前选型、吞吐或 SLA 承诺。
+本机 Docker 基线仅用于量级判断，不是生产配额承诺：七类文件矩阵中 OGX 冷态约 `1.07 GiB`，默认两个 Worker 都懒加载 Docling 模型后常驻约 `2.2 GiB`，瞬时内存峰值约 `2.46 GiB`；Qdrant 预热基线/峰值约 `106/113 MiB`，PostgreSQL 约 `62/65 MiB`。资源数字来自三维确定性 Embedding Stub；另行完成的真实模型评测显示，当前服务上 0.6B/1024 维的 5 文档总导入约 `11.47 s`、Hybrid 平均约 `648 ms`，4B 约 `13.61 s / 738 ms`，8B 约 `35.33 s / 5514 ms`。这些只是不同链路可用性的单次测试数据，不是当前选型、吞吐或 SLA 承诺。
 
 ## 2. 全局约束
 
@@ -181,7 +181,7 @@ shared-knowledge-service/
 **改动区域**
 
 - Provider 的 `add_chunks / query_vector / delete_chunks` 及 OGX Adapter 桥接。
-- 数字 PDF、Markdown、纯文本等非 OCR Fixture。
+- Markdown、纯文本、HTML、数字 PDF、DOCX、PPTX、XLSX 和 CSV 非 OCR Fixture。
 - 可重复的原生 API E2E 测试。
 - 测试专用的确定性 Embedding Stub，以及真实 Endpoint 的可选 live test。
 

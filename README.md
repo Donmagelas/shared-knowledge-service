@@ -75,6 +75,24 @@ POST /knowledge/v1/search
   → 稳定 SearchHit[]
 ```
 
+## 已验证的文件类型
+
+当前固定镜像已通过七类、八个非 OCR 样本的统一 API 端到端验证：
+
+| 类型 | 扩展名 | 样本覆盖 |
+| --- | --- | --- |
+| Markdown / 纯文本 | `.md` / `.txt` | 标题、列表、表格与普通段落 |
+| HTML | `.html` | 标题层级、列表和原生表格 |
+| 数字 PDF | `.pdf` | 两页可提取文本、表格和页眉页脚 |
+| Word | `.docx` | 两页、标题层级、列表、表格和页眉页脚 |
+| PowerPoint | `.pptx` | 三页、时间线和原生表格 |
+| Excel | `.xlsx` | 两个工作表、公式、原生表格、日期和百分比 |
+| CSV | `.csv` | 中文表头和多行数据 |
+
+每个样本都完成了异步 Ingest、Operation 终态、Docling 解析与 `HybridChunker`、Qdrant 写入、BM25 / Dense / Hybrid 检索和结果范围过滤。测试使用确定性 Embedding Stub，因此只证明文件处理与检索协议链路可用，不代表真实语义召回质量，也不表示样本中每种版式元素都已证明完全保真。
+
+当前 `do_ocr=false` 且未配置 VLM，所以不承诺扫描 PDF、纯图片、密码保护/损坏文件、旧版 `.doc/.ppt/.xls`、动态 JavaScript 页面或复杂嵌入对象。以上“已验证”也只针对当前样本，不等于 Docling 所有理论格式和边界情况都已获得产品承诺。
+
 ## 配置原则
 
 - Stella 使用一个部署级租户配置；企业版按租户分别配置。
@@ -198,7 +216,7 @@ docker compose up -d
 
 构建默认使用固定 revision 的 Docling tokenizer、layout 和 Accurate TableFormer 资产，并在镜像中离线初始化 PDF Pipeline。默认 Hugging Face 端点为兼容镜像；使用方也可改为自己的镜像或内部制品库。运行时不会临时下载模型资产。
 
-本机 amd64 历史测量中，镜像约 `1.08 GB`；OGX 冷启动约 `1.03 GiB`，处理一页数字 PDF 后约 `1.54 GiB`。这些数字使用确定性模型 Stub，只用于量级参考，不是生产配额或 SLA。
+本机 amd64 历史测量中，镜像约 `1.08 GB`。七类文件连续验证时，OGX 冷态约 `1.07 GiB`；OGX `1.3.0` 默认的两个 Worker 都懒加载 Docling 模型后，稳态约 `2.2 GiB`，瞬时峰值约 `2.46 GiB`。这些数字使用确定性模型 Stub 和小型合成文件，只用于量级参考，不是生产配额或 SLA。
 
 ## 验证
 
@@ -215,6 +233,24 @@ QDRANT_INTEGRATION_URL=http://127.0.0.1:6333 \
 KNOWLEDGE_E2E_URL=http://127.0.0.1:8321 \
 KNOWLEDGE_FAILURE_E2E=1 \
   uv run pytest -q tests/e2e/test_knowledge_api_contract.py
+```
+
+在独立 E2E Compose 项目中重跑文件格式矩阵：
+
+```bash
+COMPOSE_PROJECT_NAME=document-format-validation \
+OGX_HOST_PORT=18321 \
+QDRANT_HOST_PORT=16333 \
+  docker compose -f compose.yaml -f compose.e2e.yaml up -d --build --wait --wait-timeout 300
+
+COMPOSE_PROJECT_NAME=document-format-validation \
+  uv run python tests/evaluation/validate_document_formats.py \
+    --base-url http://127.0.0.1:18321
+
+COMPOSE_PROJECT_NAME=document-format-validation \
+OGX_HOST_PORT=18321 \
+QDRANT_HOST_PORT=16333 \
+  docker compose -f compose.yaml -f compose.e2e.yaml down -v
 ```
 
 E2E 使用 `compose.e2e.yaml` 中的确定性 Embedding/Rerank Stub；该 Stub 不属于生产部署。真实业务语料评测与模型选型应单独执行，不能用确定性 Stub 的结果代替效果结论。

@@ -1,6 +1,6 @@
 # 当前 OGX 方案：改造、能力、资源与优化项
 
-> 更新日期：2026-08-25
+> 更新日期：2026-08-26
 >
 > 代码基线：本仓库当前 `main` 工作区
 >
@@ -175,26 +175,32 @@ OGX 内部模型 ID
 
 ### 4.1 已经在本项目验证
 
-| 格式 | 验证程度 | 当前结论 |
+| 格式 | 本轮样本特征 | 统一 API 验证 |
 | --- | --- | --- |
-| Markdown `.md` | 多条统一 API、OGX 原生 E2E、两侧模拟和真实项目文档评测 | 当前可用 |
-| 数字 PDF `.pdf` | 单页含文本 PDF 完成解析、切块、索引和检索 | 当前可用；不代表复杂表格或超长 PDF 已验证 |
-| HTML `.html` | 用于大文档、异步重启和 Worker 恢复测试 | 处理链路已验证；内容质量和复杂页面尚未系统评测 |
+| Markdown `.md` | 标题、有序列表、表格 | 通过 |
+| 纯文本 `.txt` | 中文段落 | 通过 |
+| HTML `.html` | 标题层级、列表、原生表格 | 通过 |
+| 数字 PDF `.pdf` | 两页可提取文本、表格、页眉页脚 | 通过 |
+| DOCX `.docx` | 两页、标题层级、列表、表格、页眉页脚 | 通过 |
+| PPTX `.pptx` | 三页、时间线、原生表格 | 通过 |
+| XLSX `.xlsx` | 两个工作表、公式、原生表格、日期和百分比 | 通过 |
+| CSV `.csv` | 中文表头和多行数据 | 通过 |
 
-### 4.2 OGX Docling Provider 声明可接收，但本项目尚未完成 E2E
+以上八个文件都通过同一套测试：单文件异步 Ingest 进入 `completed`，然后以唯一标记和文件 Payload Filter 验证 BM25 / Dense / Hybrid，并用答案探针确认解析后的正文可检索。连续三轮均为 `8/8` 通过。Dense 使用确定性测试 Stub，所以这是链路与协议验证，不是语义召回质量评测。
+
+### 4.2 Provider 声明可接收，但当前不承诺文本提取
 
 | 格式 | OGX 声明的 MIME | 当前处理原则 |
 | --- | --- | --- |
-| DOCX | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | 候选支持，正式对外前补解析/表格/图片 E2E |
-| PPTX | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | 候选支持，正式对外前补页序和文本 E2E |
-| JPEG / PNG / GIF / BMP / TIFF / WebP | 对应 `image/*` | Provider 声明可接收，但当前离线镜像与 OCR 路径未验证，不应承诺可用文本提取 |
+| JPEG / PNG / GIF / BMP / TIFF / WebP | 对应 `image/*` | Provider 声明可接收，但当前关闭 OCR 且未配置 VLM，不承诺可用文本提取 |
 
 ### 4.3 当前不应宣称支持的情况
 
 - 扫描 PDF：当前 `do_ocr=false`，很可能只能得到极少或空文本。
 - 依赖 VLM 的复杂页面理解：当前 `vlm_model=null`。
-- 密码保护、损坏或特殊编码文件：未形成支持矩阵。
-- Docling 枚举中其他格式，如 XLSX、CSV、EPUB、邮件、音视频等：虽然 Docling Core 可能具有相关能力，但 OGX 当前适配器和本项目均未验证。
+- 密码保护、损坏、特殊编码文件和旧版 `.doc/.ppt/.xls`：未形成支持矩阵。
+- 动态 JavaScript 页面、Office 复杂嵌入对象、宏、超大文件和复杂版式：当前小型样本不能支撑承诺。
+- Docling 枚举中其他格式，如 EPUB、邮件、音视频等：虽然 Docling Core 可能具有相关能力，但 OGX 当前适配器和本项目均未验证。
 
 上传接口目前不会根据扩展名提前维护一张完整白名单；无法解析的文件会在异步 Operation 中变为 `failed`。正式产品 UI 应只展示已经验证并承诺的格式，而不是直接展示 Docling 的全部理论格式。
 
@@ -233,9 +239,26 @@ OGX 的约 1.1 GiB 基线主要来自 Python、Docling、Torch、Transformers �
 | 企业版 6 个小型 Markdown | PostgreSQL | 2.94% | 4.09% | 63.95 MiB |
 | 企业版 6 个小型 Markdown | Qdrant | 9.22% | 25.01% | 159.20 MiB |
 
-另一轮单页数字 PDF 测量中，OGX 冷启动稳定后约 `1.03 GiB`，完成导入后约 `1.54 GiB`；PostgreSQL 约 `58 MiB`，Qdrant 约 `120 MiB`。该 PDF 数据与上表不是同一采样过程，只用于说明解析复杂格式时 OGX 内存会进一步上升。
+早期单页数字 PDF 测量中，OGX 冷启动稳定后约 `1.03 GiB`，完成导入后约 `1.54 GiB`。新的七类文件验证进一步表明，不能把首个 Worker 加载后的数字当成最终稳态：OGX `1.3.0` 默认启动两个任务 Worker，两者都懒加载 Docling 模型后容器常驻约 `2.2 GiB`。
 
-### 5.4 混合检索并发
+### 5.4 七类文件导入与资源观察
+
+在新建的隔离 Compose 项目中依次导入八个小型样本，并连续执行三轮完整矩阵：
+
+| 观察项 | 结果 |
+| --- | ---: |
+| 每轮格式结果 | `8/8` 通过 |
+| 数字 PDF 单次导入 | 约 `4.8 s` |
+| OGX 冷态内存 | 约 `1.07 GiB` |
+| OGX 两 Worker 预热后常驻 | 约 `2.2 GiB` |
+| OGX 瞬时内存峰值 | 约 `2.46 GiB` |
+| OGX 瞬时 CPU 峰值 | 约 `815%` |
+| Qdrant 预热基线 / 峰值 | 约 `106 / 113 MiB` |
+| PostgreSQL 预热基线 / 峰值 | 约 `62 / 65 MiB` |
+
+Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时多核峰值，不是长时间平均占用。前两轮稳态内存分别上升，是两个 Worker 分别首次加载 Docling 模型；第三轮没有继续出现同等幅度增长。这可以解释本次短测，但不代替长时稳定性和大文件压测。
+
+### 5.5 混合检索并发
 
 700 个 Hybrid 请求、并发 8：
 
@@ -256,7 +279,7 @@ OGX 的约 1.1 GiB 基线主要来自 Python、Docling、Torch、Transformers �
 
 这轮查询使用远程模型 Stub，因此 OGX 侧 HTTP、序列化和流程调度占比被放大；真实远程 Embedding/Rerank 的网络和模型延迟通常会成为主要部分。
 
-### 5.5 真实远程 Embedding 链路参考
+### 5.6 真实远程 Embedding 链路参考
 
 使用 5 份项目文档的单次评测：
 
@@ -268,7 +291,7 @@ OGX 的约 1.1 GiB 基线主要来自 Python、Docling、Torch、Transformers �
 
 三组模型都完成 8 条真实查询的 8/8 Top1，但样本太小，不能据此确定生产模型。数据同时包含模型服务、网络和知识库调用，不能用于单独比较 OGX 或 Qdrant 性能。
 
-### 5.6 镜像大小
+### 5.7 镜像大小
 
 - 当前 amd64 Knowledge 镜像约 `1.08 GB`。
 - 早期包含未使用 ONNX/Fast TableFormer 变体时约 `4.55 GB`。
@@ -365,9 +388,9 @@ BM25  Top 200 ─┴→ RRF Top 50 → Rerank Top 10
 
 ### 7.6 文档格式与解析质量
 
-- 补 DOCX、PPTX、复杂 PDF、表格和图片型文档 E2E。
+- 当前 DOCX、PPTX、XLSX、CSV 和两页数字 PDF 已完成小型样本 E2E；下一步应补大文件、复杂版式、嵌入对象和异常文件。
 - OCR 不是首期必备；若启用，应把模型资产、镜像大小、CPU/内存和扫描件质量一起评估。
-- 如果 Docling 内存成为真实部署瓶颈，再评估独立解析服务；目前不应仅凭单页 PDF 峰值新增部署组件。
+- 两个 Worker 都加载 Docling 后约 `2.2 GiB` 常驻已是真实部署需要评估的成本；先比较单 Worker 修改的内存/吞吐取舍，不因此直接新增独立解析服务。
 
 ### 7.7 生产运维
 
