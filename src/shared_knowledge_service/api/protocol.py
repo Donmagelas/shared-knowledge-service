@@ -68,13 +68,11 @@ class KnowledgeApi(Protocol):
 
     async def get_ingest_operation(
         self,
-        knowledge_base_id: str,
         operation_id: str,
     ) -> OperationResponse: ...
 
     async def retry_ingest_operation(
         self,
-        knowledge_base_id: str,
         operation_id: str,
     ) -> RetryOperationResponse: ...
 

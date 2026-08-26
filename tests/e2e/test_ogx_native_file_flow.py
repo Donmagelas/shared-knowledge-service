@@ -163,7 +163,6 @@ def _submit_knowledge_ingest(
 
 def _wait_knowledge_ingest(
     client: httpx.Client,
-    vector_store_id: str,
     operation_id: str,
     *,
     timeout: float = 180,
@@ -173,7 +172,7 @@ def _wait_knowledge_ingest(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         response = client.get(
-            f"/knowledge/v1/knowledge-bases/{vector_store_id}/operations/{operation_id}",
+            f"/knowledge/v1/operations/{operation_id}",
         )
         response.raise_for_status()
         body = response.json()
@@ -198,7 +197,7 @@ def _knowledge_ingest(
         filename=filename,
         department_id=department_id,
     )
-    completed = _wait_knowledge_ingest(client, vector_store_id, str(submitted["operation_id"]))
+    completed = _wait_knowledge_ingest(client, str(submitted["operation_id"]))
     assert completed["status"] == "completed", completed
     return str(submitted["file_id"])
 
@@ -350,7 +349,7 @@ def test_minimal_distribution_only_registers_required_api_families() -> None:
         "/v1/vector_stores/{vector_store_id}/search",
         "/v1alpha/file-processors/jobs",
         "/knowledge/v1/ingest",
-        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+        "/knowledge/v1/operations/{operation_id}",
         "/knowledge/v1/search",
     }
     assert required <= paths
@@ -481,7 +480,7 @@ def test_multiple_async_ingests_complete_without_losing_files() -> None:
         assert len({str(item["operation_id"]) for item in submitted}) == len(submitted)
         assert len({str(item["file_id"]) for item in submitted}) == len(submitted)
         for item in submitted:
-            completed = _wait_knowledge_ingest(client, vector_store_id, str(item["operation_id"]))
+            completed = _wait_knowledge_ingest(client, str(item["operation_id"]))
             assert completed["status"] == "completed", completed
 
         listed = client.get(f"/v1/vector_stores/{vector_store_id}/files", params={"limit": 100})
@@ -678,7 +677,7 @@ def test_failed_attachment_can_be_deleted_and_retried() -> None:
             filename="knowledge.md",
             department_id="retry-test",
         )
-        failed = _wait_knowledge_ingest(client, vector_store_id, str(submitted["operation_id"]))
+        failed = _wait_knowledge_ingest(client, str(submitted["operation_id"]))
         assert failed["status"] == "failed", failed
         assert failed["last_error"]
         file_id = str(submitted["file_id"])
@@ -735,7 +734,6 @@ def test_async_ingest_resumes_after_ogx_restart() -> None:
 
         completed = _wait_knowledge_ingest(
             client,
-            vector_store_id,
             operation_id,
             timeout=240,
         )

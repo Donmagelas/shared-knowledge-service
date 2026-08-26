@@ -96,7 +96,7 @@ def _ingest_document(client: httpx.Client, knowledge_base_id: str, document: Cor
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         operation = client.get(
-            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+            f"/knowledge/v1/operations/{operation_id}",
         )
         operation.raise_for_status()
         operation_body = operation.json()

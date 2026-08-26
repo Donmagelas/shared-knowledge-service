@@ -86,7 +86,6 @@ def _submit_ingest(
 
 def _wait_operation(
     client: httpx.Client,
-    knowledge_base_id: str,
     operation_id: str,
     *,
     timeout: float = 90,
@@ -94,7 +93,7 @@ def _wait_operation(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         response = client.get(
-            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+            f"/knowledge/v1/operations/{operation_id}",
             headers=_runtime_headers(),
         )
         response.raise_for_status()
@@ -172,13 +171,15 @@ def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_
             "/knowledge/v1/knowledge-bases",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}",
             "/knowledge/v1/ingest",
-            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
-            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry",
+            "/knowledge/v1/operations/{operation_id}",
+            "/knowledge/v1/operations/{operation_id}/retry",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",
             "/knowledge/v1/search",
         }
         assert expected <= paths
+        assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}" not in paths
+        assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry" not in paths
         assert "/knowledge/v1/internal/auth/validate" not in paths
         assert not any(
             path.startswith(prefix)
@@ -214,7 +215,7 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
         submitted.raise_for_status()
         assert submitted.status_code == 202
         accepted = submitted.json()
-        completed = _wait_operation(client, knowledge_base_id, str(accepted["operation_id"]))
+        completed = _wait_operation(client, str(accepted["operation_id"]))
         assert completed["status"] == "completed", completed
         assert completed["retryable"] is False
 
@@ -397,7 +398,7 @@ def test_same_tenant_multi_knowledge_base_and_cross_tenant_rejection() -> None:
                 attributes={"department_id": department},
             )
             accepted.raise_for_status()
-            terminal = _wait_operation(client, knowledge_base_id, accepted.json()["operation_id"])
+            terminal = _wait_operation(client, accepted.json()["operation_id"])
             assert terminal["status"] == "completed", terminal
 
         same_tenant = client.post(
@@ -447,24 +448,24 @@ def test_failed_operation_can_retry_once_without_reuploading_source() -> None:
                 attributes={"department_id": "retry"},
             )
             accepted.raise_for_status()
-            failed = _wait_operation(client, knowledge_base_id, accepted.json()["operation_id"])
+            failed = _wait_operation(client, accepted.json()["operation_id"])
             assert failed["status"] == "failed", failed
             assert failed["retryable"] is True
 
             _set_embedding_stub_failure(False)
             retried = client.post(
-                f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{accepted.json()['operation_id']}/retry",
+                f"/knowledge/v1/operations/{accepted.json()['operation_id']}/retry",
                 headers=_runtime_headers(),
             )
             retried.raise_for_status()
             assert retried.status_code == 202
             assert retried.json()["file_id"] == accepted.json()["file_id"]
-            completed = _wait_operation(client, knowledge_base_id, retried.json()["operation_id"])
+            completed = _wait_operation(client, retried.json()["operation_id"])
             assert completed["status"] == "completed", completed
             assert completed["retried_from_operation_id"] == accepted.json()["operation_id"]
 
             replayed_retry = client.post(
-                f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{accepted.json()['operation_id']}/retry",
+                f"/knowledge/v1/operations/{accepted.json()['operation_id']}/retry",
                 headers=_runtime_headers(),
             )
             replayed_retry.raise_for_status()

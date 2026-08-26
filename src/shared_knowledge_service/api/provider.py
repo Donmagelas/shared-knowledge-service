@@ -625,7 +625,7 @@ class KnowledgeApiProvider:
         records = await self._state().list_files(knowledge_base_id)
         counts = {"processing": 0, "completed": 0, "failed": 0}
         for record in records:
-            operation = await self.get_ingest_operation(knowledge_base_id, record.latest_operation_id)
+            operation = await self.get_ingest_operation(record.latest_operation_id)
             key = "failed" if operation.status == "cancelled" else operation.status
             counts[key] += 1
         return FileCounts(total=len(records), **counts)
@@ -705,7 +705,7 @@ class KnowledgeApiProvider:
                 if record is not None and record.fingerprint != fingerprint:
                     raise KnowledgeError(409, "idempotency_conflict", "Idempotency-Key 已用于不同文件或参数")
                 if record is not None and record.state == "completed" and record.file_id and record.operation_id:
-                    operation = await self.get_ingest_operation(knowledge_base_id, record.operation_id)
+                    operation = await self.get_ingest_operation(record.operation_id)
                     return IngestResponse(
                         operation_id=record.operation_id,
                         file_id=record.file_id,
@@ -820,14 +820,13 @@ class KnowledgeApiProvider:
 
     async def get_ingest_operation(
         self,
-        knowledge_base_id: str,
         operation_id: str,
     ) -> OperationResponse:
-        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
         operation_id = _normalize_identifier(operation_id, field_name="operation_id")
-        record = await self._state().get_operation(knowledge_base_id, operation_id)
+        record = await self._state().get_operation(operation_id)
         if record is None:
             raise KnowledgeError(404, "operation_not_found", "Operation 不存在")
+        knowledge_base_id = record.knowledge_base_id
         status: OperationStatus
         last_error: IngestLastError | None
         try:
@@ -885,7 +884,7 @@ class KnowledgeApiProvider:
         file_record = await self._state().get_file(knowledge_base_id, file_id)
         if file_record is None:
             return False
-        operation = await self._state().get_operation(knowledge_base_id, file_record.latest_operation_id)
+        operation = await self._state().get_operation(file_record.latest_operation_id)
         if operation is None:
             return False
         if operation.status_snapshot is not None:
@@ -907,10 +906,14 @@ class KnowledgeApiProvider:
 
     async def retry_ingest_operation(
         self,
-        knowledge_base_id: str,
         operation_id: str,
     ) -> RetryOperationResponse:
         state = self._state()
+        operation_id = _normalize_identifier(operation_id, field_name="operation_id")
+        record = await state.get_operation(operation_id)
+        if record is None:
+            raise KnowledgeError(404, "operation_not_found", "Operation 不存在")
+        knowledge_base_id = record.knowledge_base_id
         async with state.locked(f"knowledge-base:{opaque_suffix(knowledge_base_id)}"):
             if await state.get_knowledge_base_lifecycle(knowledge_base_id) is not None:
                 raise KnowledgeError(409, "knowledge_base_deleting", "KnowledgeBase 正在删除")
@@ -926,11 +929,11 @@ class KnowledgeApiProvider:
         state = self._state()
         lock_key = f"retry:{opaque_suffix(knowledge_base_id)}:{operation_id}"
         async with state.locked(lock_key):
-            old = await state.get_operation(knowledge_base_id, operation_id)
+            old = await state.get_operation(operation_id)
             if old is None:
                 raise KnowledgeError(404, "operation_not_found", "Operation 不存在")
             if old.retried_by_operation_id is not None:
-                child = await self.get_ingest_operation(knowledge_base_id, old.retried_by_operation_id)
+                child = await self.get_ingest_operation(old.retried_by_operation_id)
                 file_record = await state.get_file(knowledge_base_id, old.file_id)
                 if file_record is not None and file_record.latest_operation_id != child.operation_id:
                     file_record.latest_operation_id = child.operation_id
@@ -943,7 +946,7 @@ class KnowledgeApiProvider:
                     retried_from_operation_id=operation_id,
                     replayed=True,
                 )
-            current = await self.get_ingest_operation(knowledge_base_id, operation_id)
+            current = await self.get_ingest_operation(operation_id)
             if current.status != "failed":
                 raise KnowledgeError(409, "operation_not_retryable", "只有最终失败的 Operation 可以重试")
             file_record = await state.get_file(knowledge_base_id, old.file_id)
@@ -992,7 +995,7 @@ class KnowledgeApiProvider:
             )
 
     async def _file_item(self, record: FileRecord) -> FileItem:
-        operation = await self.get_ingest_operation(record.knowledge_base_id, record.latest_operation_id)
+        operation = await self.get_ingest_operation(record.latest_operation_id)
         return FileItem(
             file_id=record.file_id,
             filename=record.filename,
@@ -1192,14 +1195,14 @@ class KnowledgeApiProvider:
         cleaned = 0
         for record in await state.list_all_files():
             try:
-                operation = await self.get_ingest_operation(record.knowledge_base_id, record.latest_operation_id)
+                operation = await self.get_ingest_operation(record.latest_operation_id)
             except KnowledgeError as exc:
                 if exc.status_code in {404, 503}:
                     continue
                 raise
             if operation.status not in {"failed", "cancelled"}:
                 continue
-            persisted = await state.get_operation(record.knowledge_base_id, record.latest_operation_id)
+            persisted = await state.get_operation(record.latest_operation_id)
             if persisted is None or persisted.terminal_at is None or persisted.terminal_at > cutoff:
                 continue
             async with state.locked(f"knowledge-base:{opaque_suffix(record.knowledge_base_id)}"):

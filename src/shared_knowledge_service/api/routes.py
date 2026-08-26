@@ -200,32 +200,30 @@ def create_router(
         return result
 
     @router.get(
-        "/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+        "/operations/{operation_id}",
         response_model=OperationResponse,
         summary="查询异步导入状态",
     )
     async def get_ingest_operation(
-        knowledge_base_id: str,
         operation_id: str,
         request: Request,
     ) -> OperationResponse:
         require_runtime(request)
-        return await impl.get_ingest_operation(knowledge_base_id, operation_id)
+        return await impl.get_ingest_operation(operation_id)
 
     @router.post(
-        "/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry",
+        "/operations/{operation_id}/retry",
         response_model=RetryOperationResponse,
         status_code=202,
         summary="重试最终失败的导入",
     )
     async def retry_ingest_operation(
-        knowledge_base_id: str,
         operation_id: str,
         request: Request,
         response: Response,
     ) -> RetryOperationResponse:
         require_runtime(request)
-        result = await impl.retry_ingest_operation(knowledge_base_id, operation_id)
+        result = await impl.retry_ingest_operation(operation_id)
         response.status_code = 200 if result.replayed else 202
         return result
 

@@ -212,8 +212,10 @@ class KnowledgeState:
         return f"idempotency:ingest:{opaque_suffix(knowledge_base_id)}:{opaque_suffix(idempotency_key, length=40)}"
 
     @staticmethod
-    def _operation_key(knowledge_base_id: str, operation_id: str) -> str:
-        return f"operation:{opaque_suffix(knowledge_base_id)}:{operation_id}"
+    def _operation_key(operation_id: str) -> str:
+        """Operation ID 由 OGX 以 UUID 生成，可作为全局控制面主键。"""
+
+        return f"operation:{operation_id}"
 
     @staticmethod
     def _file_key(knowledge_base_id: str, file_id: str) -> str:
@@ -308,13 +310,13 @@ class KnowledgeState:
 
         await self.kvstore.delete(key)
 
-    async def get_operation(self, knowledge_base_id: str, operation_id: str) -> OperationRecord | None:
-        value = await self.kvstore.get(self._operation_key(knowledge_base_id, operation_id))
+    async def get_operation(self, operation_id: str) -> OperationRecord | None:
+        value = await self.kvstore.get(self._operation_key(operation_id))
         return OperationRecord.model_validate_json(value) if value else None
 
     async def save_operation(self, record: OperationRecord) -> None:
         await self.kvstore.set(
-            self._operation_key(record.knowledge_base_id, record.operation_id),
+            self._operation_key(record.operation_id),
             record.model_dump_json(),
         )
 

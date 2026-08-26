@@ -164,8 +164,8 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/knowledge-bases \
 
 ```http
 POST /knowledge/v1/ingest
-GET  /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}
-POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry
+GET  /knowledge/v1/operations/{operation_id}
+POST /knowledge/v1/operations/{operation_id}/retry
 ```
 
 ```bash
@@ -177,7 +177,7 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/ingest \
   -F 'attributes={"department_id":"product-a"}'
 ```
 
-首次可靠接受返回 HTTP `202`；相同幂等请求重放返回 HTTP `200` 和原 Operation。状态统一为 `processing / completed / failed / cancelled`。最终失败且原文件仍存在时，可调用 Retry 接口复用原文件创建唯一的子 Operation。
+首次可靠接受返回 HTTP `202`；相同幂等请求重放返回 HTTP `200` 和原 Operation。`operation_id` 在服务内全局唯一，查询和重试不要求调用方重复传入 KnowledgeBase；响应会回显对应的 `knowledge_base_id` 和 `file_id`。状态统一为 `processing / completed / failed / cancelled`。最终失败且原文件仍存在时，可调用 Retry 接口复用原文件创建唯一的子 Operation。
 
 ### File
 

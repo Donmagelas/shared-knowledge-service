@@ -111,14 +111,13 @@ def _create_knowledge_base(client: httpx.Client, tenant_id: str, run_id: str) ->
 
 def _wait_operation(
     client: httpx.Client,
-    knowledge_base_id: str,
     operation_id: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         response = client.get(
-            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}",
+            f"/knowledge/v1/operations/{operation_id}",
             headers=_headers(RUNTIME_TOKEN),
         )
         response.raise_for_status()
@@ -157,7 +156,6 @@ def _ingest_case(
     accepted = response.json()
     operation = _wait_operation(
         client,
-        knowledge_base_id,
         str(accepted["operation_id"]),
         timeout_seconds,
     )

@@ -372,9 +372,9 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 
 返回固定包含：`operation_id`、`file_id`、`knowledge_base_id` 和统一后的 `status`。`operation_id` 当前映射 OGX `file_batch_id`。批量导入由 Stella 或企业版并发调用本接口，不新增另一套批量上传协议。
 
-#### `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}`
+#### `GET /knowledge/v1/operations/{operation_id}`
 
-查询单文件异步导入状态，返回 `processing / completed / failed / cancelled` 和可选 `last_error`。OGX Batch 即使包含失败文件也可能返回 `completed`，统一接口必须依据 `file_counts` 转换为 `failed`。
+查询单文件异步导入状态，返回 `processing / completed / failed / cancelled` 和可选 `last_error`。`operation_id` 使用 OGX `batch_<UUID>`，在服务内全局唯一；统一服务从 OperationRecord 解析 `knowledge_base_id` 后再调用 OGX，调用方不重复传入 KnowledgeBase。OGX Batch 即使包含失败文件也可能返回 `completed`，统一接口必须依据 `file_counts` 转换为 `failed`。
 
 #### `POST /knowledge/v1/search`
 
@@ -413,7 +413,7 @@ V1 需要补充的辅助接口如下：
 | 查询文件列表 | `POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query` | 使用通用 Filter、状态和 Cursor 分页查询该知识库内的文件 |
 | 查看文件详情 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}` | 返回文件技术元数据、处理状态和可选失败原因，不返回原文件内容 |
 | 删除单个文件 | `DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}` | 删除挂载关系及索引数据，并在没有其他引用时清理原文件 |
-| 重试失败导入 | `POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry` | 复用原 `file_id`，清理失败挂载并创建新的单文件 FileBatch；返回新的 `operation_id`，旧 Operation 保持不可变 |
+| 重试失败导入 | `POST /knowledge/v1/operations/{operation_id}/retry` | 服务从 OperationRecord 解析 KnowledgeBase，复用原 `file_id`，清理失败挂载并创建新的单文件 FileBatch；返回新的 `operation_id`，旧 Operation 保持不可变 |
 
 企业版的“挂载知识库”是产品数据库中的用户或 Assistant 与业务知识库关系。检索时把挂载结果转换成 `knowledge_base_ids` 传给 Search，不调用统一知识库的 Mount API。
 
@@ -484,7 +484,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 ### 7.11 重试失败 Operation
 
-`POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry` 只接受最终 `failed` Operation，不接收请求体，也不允许修改原文件、attributes、Chunking 参数、Embedding 模型或维度。内部锁定 `(knowledge_base_id, file_id)`，删除失败挂载和残留索引但保留原 File，复用原配置创建新的单文件 FileBatch，并返回 HTTP `202`、新 `operation_id`、`retried_from_operation_id`、`knowledge_base_id`、`file_id` 和 `processing`。
+`POST /knowledge/v1/operations/{operation_id}/retry` 只接受最终 `failed` Operation，不接收请求体，也不允许修改原文件、attributes、Chunking 参数、Embedding 模型或维度。服务先根据 OperationRecord 取得 `knowledge_base_id` 和 `file_id`，再锁定对应 KnowledgeBase 与文件，删除失败挂载和残留索引但保留原 File，复用原配置创建新的单文件 FileBatch，并返回 HTTP `202`、新 `operation_id`、`retried_from_operation_id`、`knowledge_base_id`、`file_id` 和 `processing`。
 
 每个失败 Operation 最多产生一个直接子 Operation，服务保存唯一 `retried_from_operation_id -> operation_id` 关系，因此本接口不要求 `Idempotency-Key`。重复请求返回已经创建的子 Operation；首次创建返回 `202`，已存在时返回 `200` 和子 Operation 当前状态。如果子 Operation 再次失败，调用方必须对该子 Operation 重试，形成可追踪链路。
 
@@ -492,7 +492,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 ### 7.12 查询 Operation 状态
 
-`GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}` 返回 `operation_id / knowledge_base_id / file_id / status / created_at / last_error / retryable / retried_from_operation_id / retried_by_operation_id`。Operation 不属于路径 KnowledgeBase 时返回 `404 operation_not_found`，不暴露它是否存在于其他知识库。
+`GET /knowledge/v1/operations/{operation_id}` 返回 `operation_id / knowledge_base_id / file_id / status / created_at / last_error / retryable / retried_from_operation_id / retried_by_operation_id`。Operation ID 是全局任务标识；KnowledgeBase 是响应中的业务上下文和内部 OGX 路由信息，不是调用方查询 Operation 时必须重复提供的路径参数。未知 ID 返回 `404 operation_not_found`。
 
 状态稳定映射为 `processing / completed / failed / cancelled`；OGX Batch 即使为 completed，只要单文件计数包含 failed 仍映射成 failed。`retryable=true` 仅在 Operation 为 failed、原 File 仍存在、没有直接重试子 Operation 且该文件没有其他 processing Operation 时成立。
 
@@ -500,7 +500,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 ### 7.13 异步 Ingest
 
-`POST /knowledge/v1/ingest` 使用 `multipart/form-data`，每次请求只接收一个文件。请求固定包含二进制 `file`、`knowledge_base_id`，并可选包含 JSON 编码的 `attributes`；Header 必须包含 `Idempotency-Key`。单文件接口让一次 Operation、一个 OGX FileBatch 和一个 File 的状态保持一一对应；产品需要批量上传时并发调用该接口，并自行汇总多个 `operation_id`。
+`POST /knowledge/v1/ingest` 使用 `multipart/form-data`，每次请求只接收一个文件。请求固定包含二进制 `file`、`knowledge_base_id`，并可选包含 JSON 编码的 `attributes`；Header 必须包含 `Idempotency-Key`。每次 Ingest 创建一个 File、一个单文件 OGX FileBatch 和一个 Operation；失败重试会为同一个 File 创建新的 Operation，并使用重试关系串联。产品需要批量上传时并发调用本接口，并自行汇总多个 `operation_id`。
 
 `attributes` 只允许最多 16 个产品过滤字段，字段名最长 64 个字符，值只允许字符串、数字、布尔值或上述标量的一维数组，不接收任意嵌套业务对象。`tenant_id / vector_store_id / file_id / chunk_id / embedding_model / embedding_dimension` 是服务保留字段，调用方不能写入或覆盖。Stella 在这里写四级范围属性；企业版可写来源、分类等不属于知识库业务对象本身的检索属性。
 

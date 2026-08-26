@@ -351,9 +351,11 @@ attributes 限制：
 
 ### 5.2 查询导入状态
 
-**GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}**
+**GET /knowledge/v1/operations/{operation_id}**
 
 权限：Runtime 或 Admin Token。
+
+`operation_id` 在服务内全局唯一。统一知识库通过 OperationRecord 解析对应的 `knowledge_base_id` 和 `file_id`，调用方不需要在路径中重复提供 KnowledgeBase。
 
 ~~~json
 {
@@ -382,7 +384,7 @@ status 取值：
 
 ### 5.3 重试失败导入
 
-**POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry**
+**POST /knowledge/v1/operations/{operation_id}/retry**
 
 权限：Runtime 或 Admin Token。无请求正文。
 
@@ -648,8 +650,8 @@ score 只用于本次响应内排序。产品不应跨不同请求、不同 mode
 | GET | /knowledge-bases/{id} | Runtime | 查询技术状态和文件计数 |
 | DELETE | /knowledge-bases/{id} | Runtime | 删除技术 KnowledgeBase |
 | POST | /ingest | Runtime | 异步上传并导入一个文件 |
-| GET | /knowledge-bases/{id}/operations/{operation_id} | Runtime | 查询导入状态 |
-| POST | /knowledge-bases/{id}/operations/{operation_id}/retry | Runtime | 重试最终失败的导入 |
+| GET | /operations/{operation_id} | Runtime | 查询导入状态 |
+| POST | /operations/{operation_id}/retry | Runtime | 重试最终失败的导入 |
 | POST | /knowledge-bases/{id}/files/query | Runtime | 分页查询文件 |
 | GET | /knowledge-bases/{id}/files/{file_id} | Runtime | 查询文件详情 |
 | DELETE | /knowledge-bases/{id}/files/{file_id} | Runtime | 删除文件 |

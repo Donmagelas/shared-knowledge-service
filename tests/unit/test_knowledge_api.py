@@ -290,6 +290,18 @@ def test_internal_auth_only_accepts_admin_and_marks_knowledge_routes_public_to_o
     )
 
 
+def test_operation_routes_use_global_operation_id() -> None:
+    """Operation 是全局任务资源，不要求调用方重复传 KnowledgeBase。"""
+
+    impl = SimpleNamespace(security=ApiSecurity("runtime-token-1234", "admin-token-123456"))
+    paths = {route.path for route in create_router(impl).routes}  # type: ignore[arg-type]
+
+    assert "/knowledge/v1/operations/{operation_id}" in paths
+    assert "/knowledge/v1/operations/{operation_id}/retry" in paths
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}" not in paths
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry" not in paths
+
+
 @pytest.mark.asyncio
 async def test_ingest_creates_single_file_batch_and_returns_without_waiting() -> None:
     files = FakeFiles()
@@ -396,7 +408,7 @@ async def test_ingest_operation_maps_failed_file_count_and_error() -> None:
     upload = UploadFile(file=BytesIO(b"knowledge"), filename="knowledge.md")
     await provider.ingest(upload, "vs-a", {}, "ingest-1")
 
-    response = await provider.get_ingest_operation("vs-a", "batch-1")
+    response = await provider.get_ingest_operation("batch-1")
 
     assert response.status == "failed"
     assert response.last_error is not None
@@ -404,7 +416,7 @@ async def test_ingest_operation_maps_failed_file_count_and_error() -> None:
 
     # OGX FileBatch 到期或暂时不可读后，统一接口仍返回已持久化的终态快照。
     vector_io.batch_available = False
-    persisted = await provider.get_ingest_operation("vs-a", "batch-1")
+    persisted = await provider.get_ingest_operation("batch-1")
     assert persisted.status == "failed"
     assert persisted.last_error is not None
     assert persisted.last_error.message == "embedding unavailable"
@@ -616,12 +628,12 @@ async def test_cleanup_removes_expired_failed_source_but_keeps_operation_history
     assert files.deleted == ["file-failed"]
     assert vector_io.deleted_vector_store_files == [("vs-a", "file-failed")]
     assert await provider._state().get_file("vs-a", "file-failed") is None
-    assert await provider._state().get_operation("vs-a", "batch-failed") is not None
-    operation = await provider.get_ingest_operation("vs-a", "batch-failed")
+    assert await provider._state().get_operation("batch-failed") is not None
+    operation = await provider.get_ingest_operation("batch-failed")
     assert operation.status == "failed"
     assert operation.retryable is False
     with pytest.raises(KnowledgeError) as captured:
-        await provider.retry_ingest_operation("vs-a", "batch-failed")
+        await provider.retry_ingest_operation("batch-failed")
     assert captured.value.status_code == 409
     assert captured.value.code == "retry_source_missing"
 
