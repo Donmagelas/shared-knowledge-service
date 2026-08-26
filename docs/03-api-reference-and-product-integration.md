@@ -299,17 +299,31 @@ Rerank 配置不决定持久化向量空间，因此可以按租户修改、轮�
 | knowledge_base_id | 是 | 已存在的技术 ID | 文件归属的逻辑 KnowledgeBase，不是 Qdrant Collection ID |
 | attributes | 否 | JSON 对象字符串 | 产品生成的过滤属性 |
 
-示例：
+两端的差异只在 `attributes`：Stella 用它表达四级范围；企业版的公司/部门/产品归属已由业务 KnowledgeBase 表达，没有额外文件分类需求时不用传 `attributes`。
+
+Stella 示例：
 
 ~~~bash
 # curl 会自动生成 multipart boundary，不要手工设置 Content-Type。
 curl -X POST "http://localhost:8321/knowledge/v1/ingest" \
   -H "Authorization: Bearer <runtime-token>" \
-  -H "Idempotency-Key: ingest-business-file-123-v1" \
-  -F "knowledge_base_id=vs_7e62f5a0-8f4d-4fa0-ae2f-6ff81fc41068" \
+  -H "Idempotency-Key: stella-upload-123-v1" \
+  -F "knowledge_base_id=vs_stella_hidden" \
   -F 'attributes={"scope":"user_agent","user_id":"user-1","agent_id":"agent-1"}' \
   -F "file=@./example.pdf"
 ~~~
+
+企业版示例：
+
+~~~bash
+curl -X POST "http://localhost:8321/knowledge/v1/ingest" \
+  -H "Authorization: Bearer <runtime-token>" \
+  -H "Idempotency-Key: enterprise-upload-123-v1" \
+  -F "knowledge_base_id=vs_product_a" \
+  -F "file=@./example.pdf"
+~~~
+
+企业版只在同一业务知识库内还需要按文件来源、分类等字段检索时，才把少量可信字段写入 `attributes`。用户、组织、挂载和权限仍只由企业版数据库管理。
 
 成功：
 
@@ -397,7 +411,9 @@ status 取值：
 
 权限：Runtime 或 Admin Token。
 
-请求：
+路径中的 `knowledge_base_id` 已把查询限制在一个技术 KnowledgeBase 内。`filters`、`statuses`、`cursor` 和 `limit` 都不是权限参数；产品必须先自行完成用户权限检查。
+
+Stella 示例：只查询 User 范围中已完成或失败的文件。
 
 ~~~json
 {
@@ -412,6 +428,16 @@ status 取值：
 }
 ~~~
 
+企业版示例：用户通过权限检查后，查询当前业务知识库的第一页文件。
+
+~~~json
+{
+  "limit": 20
+}
+~~~
+
+企业版如果只展示失败文件，可以传 `"statuses":["failed"]`；只有 Ingest 时确实写入了文件级 `attributes`，才需要在这里生成 `filters`。
+
 字段：
 
 | 字段 | 必填 | 默认值 | 含义 |
@@ -421,7 +447,7 @@ status 取值：
 | cursor | 否 | null | 上一页返回的 next_cursor |
 | limit | 否 | 20 | 1～100 |
 
-响应：
+响应结构两端相同；以下仍以 Stella 的 `scope=user` 文件为例：
 
 ~~~json
 {
@@ -470,22 +496,57 @@ status 取值：
 
 权限：Runtime 或 Admin Token。
 
+Stella 示例：只传一个隐藏技术 KnowledgeBase，由 Stella 后端根据当前用户和 Agent 生成四级累加 Filter。
+
 ~~~json
 {
-  "query": "如何申请产品 A 的发布权限？",
-  "knowledge_base_ids": [
-    "vs_company",
-    "vs_product_a"
-  ],
+  "query": "如何执行发布流程？",
+  "knowledge_base_ids": ["vs_stella_hidden"],
   "filters": {
-    "type": "eq",
-    "key": "status",
-    "value": "published"
+    "type": "or",
+    "filters": [
+      {"type": "eq", "key": "scope", "value": "system"},
+      {
+        "type": "and",
+        "filters": [
+          {"type": "eq", "key": "scope", "value": "system_agent"},
+          {"type": "eq", "key": "agent_id", "value": "agent-1"}
+        ]
+      },
+      {
+        "type": "and",
+        "filters": [
+          {"type": "eq", "key": "scope", "value": "user"},
+          {"type": "eq", "key": "user_id", "value": "user-1"}
+        ]
+      },
+      {
+        "type": "and",
+        "filters": [
+          {"type": "eq", "key": "scope", "value": "user_agent"},
+          {"type": "eq", "key": "user_id", "value": "user-1"},
+          {"type": "eq", "key": "agent_id", "value": "agent-1"}
+        ]
+      }
+    ]
   },
   "mode": "hybrid",
   "limit": 10
 }
 ~~~
+
+企业版示例：企业版先计算当前用户有权且已挂载的业务知识库，再把它们映射成技术 ID。当前的知识库级挂载模型不需要再传权限 Filter。
+
+~~~json
+{
+  "query": "如何申请产品 A 的发布权限？",
+  "knowledge_base_ids": ["vs_company", "vs_product_a"],
+  "mode": "hybrid",
+  "limit": 10
+}
+~~~
+
+只有当企业版未来在同一业务 KnowledgeBase 内增加文件级可见范围或状态约束时，才需要在 Ingest `attributes` 与 Search `filters` 之间建立对应规则。
 
 | 字段 | 必填 | 默认值 | 约束与含义 |
 | --- | --- | --- | --- |
