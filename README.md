@@ -8,7 +8,7 @@
 - Docling `2.121.0` + Docling `HybridChunker`
 - Qdrant Server `1.18.2` / Client `1.18.0`
 - PostgreSQL `17.10`
-- Python `3.12`、FastAPI、租户感知 Inference Provider
+- Python `3.12`、FastAPI、KnowledgeBase 感知 Inference Provider
 
 ## 源码构建快速启动
 
@@ -27,7 +27,7 @@ docker compose up -d
 ./scripts/doctor.sh
 ```
 
-服务启动后可运行 `./scripts/configure-tenant.sh --help` 查看租户 Embedding/Rerank 配置方式；模型 Key 默认通过终端隐藏输入。
+服务启动后可运行 `./scripts/create-knowledge-base.sh --help` 查看 KnowledgeBase 创建与 Embedding/Rerank 配置方式；模型 Key 默认通过终端隐藏输入。
 
 首次构建会在 Docker 中还原锁定的 Python 依赖，并下载固定 revision 的 Docling tokenizer、layout 和 TableFormer 模型；耗时和网络要求高于拉取成品镜像。后续只修改 Provider/API 源码时，Docker 会复用依赖和模型缓存层。
 
@@ -47,9 +47,9 @@ PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像；Knowledge 镜像
 
 | 服务 | 作用 |
 | --- | --- |
-| `knowledge-ogx` | Knowledge API、OGX Files/FileBatch、Docling Worker、HybridChunker、自定义 Qdrant Provider、租户 Embedding/Rerank Provider |
-| `postgres` | OGX 对象、任务、幂等记录、文件技术状态和加密后的租户模型凭证 |
-| `qdrant` | 每租户一个物理 Collection；租户内多个逻辑 KnowledgeBase 通过 Payload 隔离 |
+| `knowledge-ogx` | Knowledge API、OGX Files/FileBatch、Docling Worker、HybridChunker、自定义 Qdrant Provider、KnowledgeBase 感知 Embedding/Rerank Provider |
+| `postgres` | OGX 对象、任务、幂等记录、文件技术状态和加密后的 KnowledgeBase 模型凭证 |
+| `qdrant` | 每租户一个物理 Collection；每个 Embedding 模型与维度组合对应一个动态 Named Vector，逻辑 KnowledgeBase 通过 Payload 隔离 |
 
 原文件可选择 `inline::localfs` 本地持久卷或 `remote::s3` S3-compatible 后端，外部 API 不变。S3 是连接已有对象存储的部署选项，本仓库不会额外启动对象存储服务。
 
@@ -61,8 +61,8 @@ POST /knowledge/v1/ingest
   → 单文件 FileBatch
   → Docling 解析
   → Docling HybridChunker
-  → 租户远程 Embedding
-  → Qdrant Dense + 原生 multilingual BM25
+  → 当前 KnowledgeBase 的远程 Embedding
+  → Qdrant 对应 Named Vector + 共享 multilingual BM25
 ```
 
 检索链路：
@@ -70,8 +70,9 @@ POST /knowledge/v1/ingest
 ```text
 POST /knowledge/v1/search
   → knowledge_base_ids + 产品 Filter
-  → Qdrant Dense / BM25 / Hybrid RRF
-  → 可选租户远程 Rerank
+  → 每个 KnowledgeBase 独立执行 Dense / BM25 / Hybrid RRF
+  → 每个 KnowledgeBase 可选独立远程 Rerank
+  → 多 KnowledgeBase 等权外层 RRF（单库不做外层融合）
   → 稳定 SearchHit[]
 ```
 
@@ -95,11 +96,11 @@ POST /knowledge/v1/search
 
 ## 配置原则
 
-- Stella 使用一个部署级租户配置；企业版按租户分别配置。
+- Embedding 和 Rerank 都属于 KnowledgeBase；同一租户的不同 KnowledgeBase 可以使用不同模型、维度、URL 和 Key。
 - 服务不发现、列举或推荐模型，只接受调用方提交的 `base_url / api_key / model_id / dimension`。
-- Embedding URL、模型和维度在该租户第一次 Ingest 成功初始化 Collection 后锁定；API Key 仍可轮换。
-- Rerank 使用独立 URL、Key、模型和开关，可以按租户随时修改；只增强 `hybrid`，失败时降级为 Qdrant RRF。
-- 一个 Search 可以包含同一租户的多个 KnowledgeBase；跨租户请求直接拒绝，不做跨 Collection 融合。
+- 空 KnowledgeBase 可以修改 Embedding 模型和维度；首次 Ingest 后模型和维度锁定，URL 与 Key 仍可轮换。当前不提供全量重新向量化。
+- Rerank 使用独立 URL、Key、模型和开关，可按 KnowledgeBase 随时修改；只增强 `hybrid`，单个知识库的 Rerank 失败时退回该库的 Qdrant RRF 排名。
+- 一个 Search 可以包含同一租户的多个 KnowledgeBase；每个库先独立检索/重排，再做等权外层 RRF。跨租户请求直接拒绝，不做跨 Collection 融合。
 - 需要高性能过滤的业务属性由部署方在 `config/ogx.yaml` 的 `payload_indexes` 中声明类型。
 
 ## 服务间认证
@@ -109,42 +110,20 @@ Knowledge API 使用两个静态 Bearer Token：
 | Token | 权限 |
 | --- | --- |
 | Runtime Token | KnowledgeBase、Ingest、Operation、File 和 Search 接口 |
-| Admin Token | Runtime 全部能力，以及租户 Embedding/Rerank 配置 |
+| Admin Token | Runtime 全部能力，以及 KnowledgeBase Embedding/Rerank 配置 |
 
 OGX 原生接口只接受 Admin Token，用于运维诊断，产品正常接入只调用 `/knowledge/v1/*`。Token 和凭证必须由部署 Secret 注入，不得提交到仓库。
 
 ## API 概览
-
-### 租户模型配置
-
-```http
-PUT /knowledge/v1/tenants/{tenant_id}/embedding-config
-GET /knowledge/v1/tenants/{tenant_id}/embedding-config
-PUT /knowledge/v1/tenants/{tenant_id}/rerank-config
-GET /knowledge/v1/tenants/{tenant_id}/rerank-config
-```
-
-配置 Embedding：
-
-```bash
-curl -X PUT http://127.0.0.1:8321/knowledge/v1/tenants/tenant-a/embedding-config \
-  -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "base_url": "https://model.example/v1",
-    "api_key": "replace-with-secret",
-    "model_id": "embedding-model-id",
-    "dimension": 1024
-  }'
-```
-
-查询配置不会返回 API Key。
 
 ### KnowledgeBase
 
 ```http
 POST   /knowledge/v1/knowledge-bases
 GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}
+GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config
+PUT    /knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config
+PUT    /knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config
 DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}
 ```
 
@@ -155,10 +134,25 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/knowledge-bases \
   -H "Authorization: Bearer $KNOWLEDGE_RUNTIME_TOKEN" \
   -H 'Idempotency-Key: create-company-kb-1' \
   -H 'Content-Type: application/json' \
-  -d '{"tenant_id":"tenant-a"}'
+  -d '{
+    "tenant_id": "tenant-a",
+    "embedding": {
+      "base_url": "https://model.example/v1",
+      "api_key": "replace-with-embedding-secret",
+      "model_id": "embedding-model-id",
+      "dimension": 1024
+    },
+    "rerank": {
+      "base_url": "https://model.example/v1",
+      "api_key": "replace-with-rerank-secret",
+      "model_id": "rerank-model-id"
+    }
+  }'
 ```
 
-业务名称、公司/部门/产品归属和挂载关系不进入该请求；企业版在自己的数据库中保存业务对象与返回 `knowledge_base_id` 的映射。Stella 通常只在部署初始化时创建一个隐藏 KnowledgeBase。
+`dimension` 可省略，由服务通过 Embedding 探针确定；`rerank` 整段可省略。创建完成后，查询配置的响应不会返回 API Key。业务名称、公司/部门/产品归属和挂载关系不进入该请求；企业版在自己的数据库中保存业务对象与返回 `knowledge_base_id` 的映射。Stella 通常只在部署初始化时创建一个隐藏 KnowledgeBase。
+
+空库可以通过两个 `PUT` 接口更换 Embedding；一旦导入文件，只允许保持模型 ID 与维度不变并轮换 URL/Key。Rerank 配置不影响持久索引，可随时启用、修改或关闭。
 
 ### 异步 Ingest 与 Operation
 
@@ -204,7 +198,7 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/search \
   }'
 ```
 
-`mode` 支持 `hybrid / dense / bm25`。服务始终在 Qdrant 查询阶段强制加入 `vector_store_id IN knowledge_base_ids`；调用方不能通过 Filter 覆盖保留字段。每个命中固定返回 `knowledge_base_id / file_id / filename / chunk_id / content / locator / score / attributes`。
+`mode` 支持 `hybrid / dense / bm25`。服务会为每个 `knowledge_base_id` 分别执行一次带精确 `vector_store_id` 条件的查询，并与产品 Filter 做 AND；调用方不能通过 Filter 覆盖保留字段。多库查询在各库完成本地 RRF 与可选 Rerank 后做等权外层 RRF。每个命中固定返回 `knowledge_base_id / file_id / filename / chunk_id / content / locator / score / attributes`。
 
 ## 修改与重新构建
 

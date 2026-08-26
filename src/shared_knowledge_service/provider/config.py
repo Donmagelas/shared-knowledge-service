@@ -33,6 +33,19 @@ def tenant_collection_name(base_collection_name: str, tenant_id: str | None) -> 
     return f"{base_collection_name}__tenant_{digest}"
 
 
+def dense_vector_name(model_id: str, dimension: int) -> str:
+    """把外部模型 ID 与维度稳定映射为不泄露业务配置的 Qdrant 名称。"""
+
+    normalized_model_id = model_id.strip()
+    if not normalized_model_id:
+        raise ValueError("Embedding model_id 不能为空")
+    if dimension < 1:
+        raise ValueError("Embedding dimension 必须大于 0")
+    identity = f"{len(normalized_model_id)}:{normalized_model_id}:{dimension}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return f"dense_{digest}"
+
+
 class SharedQdrantVectorIOConfig(BaseModel):
     """固定 OGX v1.3.0 所需连接和元数据配置。
 
@@ -60,7 +73,6 @@ class SharedQdrantVectorIOConfig(BaseModel):
         max_length=220,
         description="单租户默认 Collection 名，同时作为多租户 Collection 名前缀",
     )
-    dense_vector_name: str = Field(default="dense", min_length=1)
     sparse_vector_name: str = Field(default="bm25", min_length=1)
     payload_indexes: dict[str, PayloadIndexType] = Field(
         default_factory=dict,
@@ -85,7 +97,6 @@ class SharedQdrantVectorIOConfig(BaseModel):
             exclude_none=True,
             exclude={
                 "collection_name",
-                "dense_vector_name",
                 "metadata_store",
                 "payload_indexes",
                 "persistence",

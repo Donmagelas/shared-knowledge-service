@@ -16,6 +16,7 @@ from .models import (
     FileQueryResponse,
     IngestResponse,
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseInferenceConfigResponse,
     KnowledgeBaseResponse,
     OperationResponse,
     RerankConfigPutRequest,
@@ -32,22 +33,6 @@ class KnowledgeApi(Protocol):
 
     security: ApiSecurity
 
-    async def put_embedding_config(
-        self,
-        tenant_id: str,
-        request: EmbeddingConfigPutRequest,
-    ) -> EmbeddingConfigResponse: ...
-
-    async def get_embedding_config(self, tenant_id: str) -> EmbeddingConfigResponse: ...
-
-    async def put_rerank_config(
-        self,
-        tenant_id: str,
-        request: RerankConfigPutRequest,
-    ) -> RerankConfigResponse: ...
-
-    async def get_rerank_config(self, tenant_id: str) -> RerankConfigResponse: ...
-
     async def create_knowledge_base(
         self,
         request: KnowledgeBaseCreateRequest,
@@ -55,6 +40,23 @@ class KnowledgeApi(Protocol):
     ) -> KnowledgeBaseResponse: ...
 
     async def get_knowledge_base(self, knowledge_base_id: str) -> KnowledgeBaseResponse: ...
+
+    async def get_inference_config(
+        self,
+        knowledge_base_id: str,
+    ) -> KnowledgeBaseInferenceConfigResponse: ...
+
+    async def put_embedding_config(
+        self,
+        knowledge_base_id: str,
+        request: EmbeddingConfigPutRequest,
+    ) -> EmbeddingConfigResponse: ...
+
+    async def put_rerank_config(
+        self,
+        knowledge_base_id: str,
+        request: RerankConfigPutRequest,
+    ) -> RerankConfigResponse: ...
 
     async def delete_knowledge_base(self, knowledge_base_id: str) -> None: ...
 

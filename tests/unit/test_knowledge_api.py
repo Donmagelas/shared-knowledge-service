@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from ogx_api import (
     ChunkMetadata,
     EmbeddedChunk,
     ListOpenAIFileResponse,
+    OpenAIEmbeddingsRequestWithExtraBody,
     OpenAIFileObject,
     OpenAIFilePurpose,
     QueryChunksResponse,
@@ -25,11 +27,18 @@ from ogx_api import (
     VectorStoreFileObject,
     VectorStoreFilesListInBatchResponse,
 )
+from ogx_api.inference import RerankRequest
 from ogx_api.router_utils import PUBLIC_ROUTE_KEY
 
 from shared_knowledge_service.api.errors import ApiSecurity, KnowledgeError
-from shared_knowledge_service.api.models import FileQueryRequest, IngestLastError, SearchRequest
-from shared_knowledge_service.api.provider import KnowledgeApiProvider
+from shared_knowledge_service.api.models import (
+    FileQueryRequest,
+    IngestLastError,
+    KnowledgeBaseCreateRequest,
+    RerankConfigPutRequest,
+    SearchRequest,
+)
+from shared_knowledge_service.api.provider import KnowledgeApiProvider, outer_rrf
 from shared_knowledge_service.api.routes import create_router, parse_attributes
 from shared_knowledge_service.api.state import (
     CredentialCipher,
@@ -38,7 +47,11 @@ from shared_knowledge_service.api.state import (
     IngestIdempotencyRecord,
     KnowledgeState,
     OperationRecord,
+    RerankProfileRecord,
+    opaque_suffix,
 )
+from shared_knowledge_service.api.upstream import InferenceUrlPolicy, probe_embedding
+from shared_knowledge_service.knowledge_base_inference.adapter import KnowledgeBaseInferenceAdapter
 from shared_knowledge_service.provider.adapter import SharedQdrantVectorIOAdapter
 
 
@@ -92,7 +105,7 @@ class FakeSharedAdapter(SharedQdrantVectorIOAdapter):
         self.ensured: list[str] = []
         self.openai_file_batches: dict[str, dict[str, Any]] = {}
 
-    async def query_multiple_vector_stores(self, **kwargs: Any) -> QueryChunksResponse:
+    async def query_vector_store(self, **kwargs: Any) -> QueryChunksResponse:
         self.search_calls.append(kwargs)
         return self.result
 
@@ -208,6 +221,24 @@ def _query_result() -> QueryChunksResponse:
     return QueryChunksResponse(chunks=[chunk], scores=[0.75])
 
 
+def _ranked_result(knowledge_base_id: str, *chunk_ids: str) -> QueryChunksResponse:
+    """构造可区分 KB 和本地名次的最终排名，原始分数故意不可比较。"""
+
+    chunks = [
+        EmbeddedChunk(
+            content=f"{knowledge_base_id}/{chunk_id}",
+            chunk_id=chunk_id,
+            metadata={"file_id": f"file-{chunk_id}", "vector_store_id": knowledge_base_id},
+            chunk_metadata=ChunkMetadata(document_id=f"file-{chunk_id}"),
+            embedding=[1.0, 0.0, 0.0],
+            embedding_model="embedding/test",
+            embedding_dimension=3,
+        )
+        for chunk_id in chunk_ids
+    ]
+    return QueryChunksResponse(chunks=chunks, scores=[1000.0 - index * 100.0 for index in range(len(chunks))])
+
+
 class MemoryKV:
     """单元测试使用的最小异步 KVStore。"""
 
@@ -232,17 +263,19 @@ class MemoryKV:
 
 async def _provider(files: FakeFiles, vector_io: FakeVectorIO) -> KnowledgeApiProvider:
     state = KnowledgeState(MemoryKV(), CredentialCipher("test-master-key-at-least-sixteen"))
-    profile_id = state.embedding_profile_id("tenant-a")
-    await state.save_embedding(
-        EmbeddingProfileRecord(
-            tenant_id="tenant-a",
-            profile_id=profile_id,
-            base_url="https://embedding.example/v1",
-            model_id="embedding/test",
-            dimension=3,
-            credential=state.encrypt_api_key("test-key", profile_id=profile_id),
+    for knowledge_base_id in ("vs-a", "vs-b", "vs-company", "vs-product-a", "vs-retry"):
+        profile_id = state.embedding_profile_id(knowledge_base_id)
+        await state.save_embedding(
+            EmbeddingProfileRecord(
+                knowledge_base_id=knowledge_base_id,
+                tenant_id="tenant-a",
+                profile_id=profile_id,
+                base_url="https://embedding.example/v1",
+                model_id="embedding/test",
+                dimension=3,
+                credential=state.encrypt_api_key("test-key", profile_id=profile_id),
+            )
         )
-    )
     return KnowledgeApiProvider(files_api=files, vector_io=vector_io, state=state)  # type: ignore[arg-type]
 
 
@@ -251,6 +284,89 @@ def test_search_request_deduplicates_ids_without_changing_order() -> None:
 
     assert request.query == "退款"
     assert request.knowledge_base_ids == ["vs-a", "vs-b"]
+
+
+def test_knowledge_base_create_requires_full_embedding_and_accepts_automatic_dimension() -> None:
+    request = KnowledgeBaseCreateRequest.model_validate(
+        {
+            "tenant_id": "tenant-a",
+            "embedding": {
+                "base_url": "https://models.example/v1",
+                "api_key": "embedding-key",
+                "model_id": "embedding/model-a",
+            },
+        }
+    )
+
+    assert request.embedding.dimension is None
+    with pytest.raises(ValueError, match="api_key"):
+        KnowledgeBaseCreateRequest.model_validate(
+            {
+                "tenant_id": "tenant-a",
+                "embedding": {
+                    "base_url": "https://models.example/v1",
+                    "model_id": "embedding/model-a",
+                },
+            }
+        )
+
+
+def test_rerank_update_requires_complete_enabled_or_empty_disabled_config() -> None:
+    assert RerankConfigPutRequest(enabled=False).model_dump() == {
+        "enabled": False,
+        "base_url": None,
+        "api_key": None,
+        "model_id": None,
+    }
+    with pytest.raises(ValueError, match="完整"):
+        RerankConfigPutRequest(enabled=True, model_id="rerank/model-a")
+    with pytest.raises(ValueError, match="关闭"):
+        RerankConfigPutRequest(enabled=False, model_id="rerank/model-a")
+
+
+@pytest.mark.asyncio
+async def test_embedding_probe_infers_dimension_when_request_omits_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_post_model_request(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"data": [{"embedding": [0.1, 0.2, 0.3, 0.4]}]}
+
+    monkeypatch.setattr("shared_knowledge_service.api.upstream.post_model_request", fake_post_model_request)
+    actual = await probe_embedding(
+        policy=InferenceUrlPolicy.from_csv(),
+        base_url="https://models.example/v1",
+        api_key="secret",
+        model_id="embedding/model-a",
+        dimension=None,
+        timeout_seconds=10,
+    )
+
+    assert actual == 4
+    assert captured["payload"] == {
+        "model": "embedding/model-a",
+        "input": ["knowledge service probe"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_embedding_probe_rejects_explicit_dimension_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_post_model_request(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    monkeypatch.setattr("shared_knowledge_service.api.upstream.post_model_request", fake_post_model_request)
+    with pytest.raises(KnowledgeError) as captured:
+        await probe_embedding(
+            policy=InferenceUrlPolicy.from_csv(),
+            base_url="https://models.example/v1",
+            api_key="secret",
+            model_id="embedding/model-a",
+            dimension=4,
+            timeout_seconds=10,
+        )
+
+    assert captured.value.code == "embedding_dimension_mismatch"
 
 
 def test_parse_attributes_requires_json_object() -> None:
@@ -300,6 +416,196 @@ def test_operation_routes_use_global_operation_id() -> None:
     assert "/knowledge/v1/operations/{operation_id}/retry" in paths
     assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}" not in paths
     assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry" not in paths
+    assert not any(path.startswith("/knowledge/v1/tenants/") for path in paths)
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config" in paths
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config" in paths
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config" in paths
+
+
+def test_outer_rrf_is_equal_weight_stable_and_ignores_local_score_scale() -> None:
+    first = _ranked_result("vs-company", "company-first", "company-second")
+    second = _ranked_result("vs-product", "product-first", "product-second")
+    # 第二个 KB 使用完全不同的原始分数空间，外层仍只按名次等权融合。
+    second.scores = [-10.0, -100.0]
+
+    fused = outer_rrf([first, second], limit=3, rrf_k=60)
+
+    assert [(chunk.metadata["vector_store_id"], chunk.chunk_id) for chunk in fused.chunks] == [
+        ("vs-company", "company-first"),
+        ("vs-product", "product-first"),
+        ("vs-company", "company-second"),
+    ]
+    assert fused.scores == pytest.approx([1 / 61, 1 / 61, 1 / 62])
+
+
+@pytest.mark.asyncio
+async def test_knowledge_base_profiles_are_independent_and_delete_reverse_indexes() -> None:
+    state = KnowledgeState(MemoryKV(), CredentialCipher("test-master-key-at-least-sixteen"))
+    for knowledge_base_id, key in (("vs-a", "secret-a"), ("vs-b", "secret-b")):
+        embedding_profile_id = state.embedding_profile_id(knowledge_base_id)
+        rerank_profile_id = state.rerank_profile_id(knowledge_base_id)
+        await state.save_embedding(
+            EmbeddingProfileRecord(
+                knowledge_base_id=knowledge_base_id,
+                tenant_id="tenant-a",
+                profile_id=embedding_profile_id,
+                base_url="https://embedding.example/v1",
+                model_id=f"embedding/{knowledge_base_id}",
+                dimension=3,
+                credential=state.encrypt_api_key(key, profile_id=embedding_profile_id),
+            )
+        )
+        await state.save_rerank(
+            RerankProfileRecord(
+                knowledge_base_id=knowledge_base_id,
+                tenant_id="tenant-a",
+                profile_id=rerank_profile_id,
+                enabled=True,
+                base_url="https://rerank.example/v1",
+                model_id=f"rerank/{knowledge_base_id}",
+                credential=state.encrypt_api_key(f"rerank-{key}", profile_id=rerank_profile_id),
+            )
+        )
+
+    profile_a = await state.get_embedding("vs-a")
+    profile_b = await state.get_embedding("vs-b")
+    assert profile_a is not None and profile_b is not None
+    assert state.decrypt_api_key(profile_a.credential, profile_id=profile_a.profile_id) == "secret-a"
+    assert state.decrypt_api_key(profile_b.credential, profile_id=profile_b.profile_id) == "secret-b"
+
+    await state.delete_inference_profiles("vs-a")
+
+    assert await state.get_embedding("vs-a") is None
+    assert await state.get_rerank("vs-a") is None
+    assert await state.get_embedding_by_profile(profile_a.profile_id) is None
+    assert await state.get_rerank_by_profile(state.rerank_profile_id("vs-a")) is None
+    assert await state.get_embedding("vs-b") is not None
+    assert await state.get_rerank("vs-b") is not None
+
+
+@pytest.mark.asyncio
+async def test_inference_adapter_resolves_each_kb_profile_and_independent_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = KnowledgeState(MemoryKV(), CredentialCipher("test-master-key-at-least-sixteen"))
+    embedding_calls: list[dict[str, Any]] = []
+    rerank_calls: list[dict[str, Any]] = []
+
+    for knowledge_base_id, dimension, key in (("vs-a", 3, "key-a"), ("vs-b", 5, "key-b")):
+        profile_id = state.embedding_profile_id(knowledge_base_id)
+        await state.save_embedding(
+            EmbeddingProfileRecord(
+                knowledge_base_id=knowledge_base_id,
+                tenant_id="tenant-a",
+                profile_id=profile_id,
+                base_url=f"https://{knowledge_base_id}.example/v1",
+                model_id=f"embedding/{knowledge_base_id}",
+                dimension=dimension,
+                credential=state.encrypt_api_key(key, profile_id=profile_id),
+            )
+        )
+    rerank_profile_id = state.rerank_profile_id("vs-b")
+    await state.save_rerank(
+        RerankProfileRecord(
+            knowledge_base_id="vs-b",
+            tenant_id="tenant-a",
+            profile_id=rerank_profile_id,
+            enabled=True,
+            base_url="https://rerank-b.example/v1",
+            model_id="rerank/vs-b",
+            credential=state.encrypt_api_key("rerank-key-b", profile_id=rerank_profile_id),
+        )
+    )
+
+    async def fake_post_model_request(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["operation"] == "embeddings":
+            embedding_calls.append(kwargs)
+            dimension = int(kwargs["payload"]["dimensions"])
+            return {"data": [{"index": 0, "embedding": [1.0] + [0.0] * (dimension - 1)}]}
+        rerank_calls.append(kwargs)
+        return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    monkeypatch.setattr(
+        "shared_knowledge_service.knowledge_base_inference.adapter.post_model_request",
+        fake_post_model_request,
+    )
+    adapter = KnowledgeBaseInferenceAdapter(
+        state=state,
+        url_policy=InferenceUrlPolicy.from_csv(),
+        timeout_seconds=10,
+    )
+
+    for knowledge_base_id, dimension in (("vs-a", 3), ("vs-b", 5)):
+        response = await adapter.openai_embeddings(
+            OpenAIEmbeddingsRequestWithExtraBody(
+                model=state.embedding_profile_id(knowledge_base_id),
+                input=["退款"],
+                dimensions=dimension,
+            )
+        )
+        assert len(response.data[0].embedding) == dimension
+    await adapter.rerank(
+        RerankRequest(
+            model=rerank_profile_id,
+            query="退款",
+            items=["退款材料"],
+            max_num_results=1,
+        )
+    )
+
+    assert [(call["base_url"], call["api_key"], call["payload"]["model"]) for call in embedding_calls] == [
+        ("https://vs-a.example/v1", "key-a", "embedding/vs-a"),
+        ("https://vs-b.example/v1", "key-b", "embedding/vs-b"),
+    ]
+    assert [(call["base_url"], call["api_key"], call["payload"]["model"]) for call in rerank_calls] == [
+        ("https://rerank-b.example/v1", "rerank-key-b", "rerank/vs-b")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inference_adapter_rejects_negative_rerank_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """上游返回负索引时不能让 Python 将其解释为末尾候选。"""
+
+    state = KnowledgeState(MemoryKV(), CredentialCipher("test-master-key-at-least-sixteen"))
+    profile_id = state.rerank_profile_id("vs-a")
+    await state.save_rerank(
+        RerankProfileRecord(
+            knowledge_base_id="vs-a",
+            tenant_id="tenant-a",
+            profile_id=profile_id,
+            enabled=True,
+            base_url="https://rerank-a.example/v1",
+            model_id="rerank/vs-a",
+            credential=state.encrypt_api_key("rerank-key-a", profile_id=profile_id),
+        )
+    )
+
+    async def fake_post_model_request(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"results": [{"index": -1, "relevance_score": 0.9}]}
+
+    monkeypatch.setattr(
+        "shared_knowledge_service.knowledge_base_inference.adapter.post_model_request",
+        fake_post_model_request,
+    )
+    adapter = KnowledgeBaseInferenceAdapter(
+        state=state,
+        url_policy=InferenceUrlPolicy.from_csv(),
+        timeout_seconds=10,
+    )
+
+    with pytest.raises(KnowledgeError) as captured:
+        await adapter.rerank(
+            RerankRequest(
+                model=profile_id,
+                query="退款",
+                items=["退款材料"],
+                max_num_results=1,
+            )
+        )
+
+    assert captured.value.status_code == 502
+    assert captured.value.code == "invalid_rerank_response"
 
 
 @pytest.mark.asyncio
@@ -435,7 +741,7 @@ async def test_ingest_rejects_reserved_attributes_before_upload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_uses_one_provider_call_for_multiple_knowledge_bases() -> None:
+async def test_cross_kb_search_uses_one_local_branch_per_knowledge_base() -> None:
     adapter = FakeSharedAdapter(_query_result())
     vector_io = FakeVectorIO(adapter)
     provider = await _provider(FakeFiles(), vector_io)
@@ -445,12 +751,13 @@ async def test_search_uses_one_provider_call_for_multiple_knowledge_bases() -> N
             query="退款材料",
             knowledge_base_ids=["vs-company", "vs-product-a"],
             filters={"type": "eq", "key": "department_id", "value": "product-a"},
+            mode="bm25",
         )
     )
 
     assert vector_io.retrieved == ["vs-company", "vs-product-a"]
-    assert len(adapter.search_calls) == 1
-    assert adapter.search_calls[0]["vector_store_ids"] == ["vs-company", "vs-product-a"]
+    assert len(adapter.search_calls) == 2
+    assert [call["vector_store_id"] for call in adapter.search_calls] == ["vs-company", "vs-product-a"]
     assert response.hits[0].knowledge_base_id == "vs-company"
     assert response.hits[0].filename == "knowledge.md"
     assert response.hits[0].file_id == "file-1"
@@ -460,6 +767,72 @@ async def test_search_uses_one_provider_call_for_multiple_knowledge_bases() -> N
         "headings": ["退款"],
     }
     assert response.hits[0].attributes == {"department_id": "product-a"}
+
+
+@pytest.mark.asyncio
+async def test_search_holds_kb_lifecycle_lock_until_local_branch_finishes() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingAdapter(FakeSharedAdapter):
+        async def query_vector_store(self, **kwargs: Any) -> QueryChunksResponse:
+            self.search_calls.append(kwargs)
+            started.set()
+            await release.wait()
+            return self.result
+
+    adapter = BlockingAdapter(_query_result())
+    provider = await _provider(FakeFiles(), FakeVectorIO(adapter))
+    search_task = asyncio.create_task(
+        provider.search(SearchRequest(query="退款", knowledge_base_ids=["vs-company"], mode="bm25"))
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    update_entered = asyncio.Event()
+
+    async def simulate_config_update() -> None:
+        async with provider._state().locked(f"knowledge-base:{opaque_suffix('vs-company')}"):
+            update_entered.set()
+
+    update_task = asyncio.create_task(simulate_config_update())
+    await asyncio.sleep(0)
+    assert not update_entered.is_set()
+
+    release.set()
+    await search_task
+    await asyncio.wait_for(update_task, timeout=1)
+    assert update_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cross_kb_search_respects_server_branch_concurrency_limit() -> None:
+    class CountingAdapter(FakeSharedAdapter):
+        def __init__(self, result: QueryChunksResponse) -> None:
+            super().__init__(result)
+            self.active = 0
+            self.max_active = 0
+
+        async def query_vector_store(self, **kwargs: Any) -> QueryChunksResponse:
+            self.search_calls.append(kwargs)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return self.result
+
+    adapter = CountingAdapter(_query_result())
+    provider = await _provider(FakeFiles(), FakeVectorIO(adapter))
+    provider.search_branch_concurrency = 2
+
+    await provider.search(
+        SearchRequest(
+            query="退款",
+            knowledge_base_ids=["vs-a", "vs-b", "vs-company", "vs-product-a"],
+            mode="bm25",
+        )
+    )
+
+    assert len(adapter.search_calls) == 4
+    assert adapter.max_active == 2
 
 
 @pytest.mark.asyncio

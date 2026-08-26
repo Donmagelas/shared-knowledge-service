@@ -68,6 +68,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         config: SharedQdrantVectorIOConfig,
         collection_lock: asyncio.Lock,
         collection_name: str | None = None,
+        dense_vector_name: str | None = None,
     ) -> None:
         self.client = client
         self.vector_store_id = vector_store.identifier
@@ -75,10 +76,11 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         self.config = config
         self.collection_lock = collection_lock
         self.collection_name = collection_name
+        self.dense_vector_name = dense_vector_name
         self._initialized = False
 
-    def bind_collection(self, collection_name: str) -> None:
-        """把逻辑 VectorStore 绑定到租户 Collection。
+    def bind_storage(self, collection_name: str, dense_vector_name: str) -> None:
+        """把逻辑 VectorStore 绑定到租户 Collection 和自己的向量空间。
 
         OGX 注册路由时可能先用缺少租户 metadata 的占位路由构造索引。
         只要物理 Collection 尚未初始化，就允许 Knowledge API 补齐真实租户路由；
@@ -87,14 +89,35 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
 
         if not collection_name:
             raise ValueError("Qdrant Collection 名不能为空")
-        if self.collection_name is not None and self.collection_name != collection_name and self._initialized:
-            raise ValueError("VectorStore 初始化后不能迁移到另一个租户 Collection")
+        if not dense_vector_name:
+            raise ValueError("Qdrant Dense Named Vector 不能为空")
+        if self._initialized and (
+            (self.collection_name is not None and self.collection_name != collection_name)
+            or (self.dense_vector_name is not None and self.dense_vector_name != dense_vector_name)
+        ):
+            raise ValueError("VectorStore 初始化后不能迁移 Collection 或 Dense Named Vector")
         self.collection_name = collection_name
+        self.dense_vector_name = dense_vector_name
+
+    def reconfigure_empty_vector_space(self, dense_vector_name: str, dimension: int) -> None:
+        """切换空 KB 的目标向量空间；旧 Named Vector Schema 保留供其他 KB 使用。"""
+
+        if not dense_vector_name or dimension < 1:
+            raise ValueError("Dense Named Vector 和维度必须有效")
+        self.dense_vector_name = dense_vector_name
+        self.dimension = dimension
+        # 即使空 KB 曾被 Search 初始化，也要重新校验或创建新的 Named Vector。
+        self._initialized = False
 
     def _require_collection_name(self) -> str:
         if self.collection_name is None:
             raise RuntimeError("VectorStore 尚未绑定租户 Collection")
         return self.collection_name
+
+    def _require_dense_vector_name(self) -> str:
+        if self.dense_vector_name is None:
+            raise RuntimeError("VectorStore 尚未绑定 Dense Named Vector")
+        return self.dense_vector_name
 
     @property
     def bound_collection_name(self) -> str:
@@ -103,11 +126,12 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         return self._require_collection_name()
 
     async def initialize(self) -> None:
-        """按租户首个 VectorStore 的维度创建 Collection，后续注册只校验并复用。"""
+        """创建租户 Collection，或为已有 Collection 幂等追加当前 Dense Named Vector。"""
 
         if self._initialized:
             return
         collection_name = self._require_collection_name()
+        dense_name = self._require_dense_vector_name()
 
         async with self.collection_lock:
             if self._initialized:
@@ -116,7 +140,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                 await self.client.create_collection(
                     collection_name=collection_name,
                     vectors_config={
-                        self.config.dense_vector_name: models.VectorParams(
+                        dense_name: models.VectorParams(
                             size=self.dimension,
                             distance=models.Distance.COSINE,
                         )
@@ -125,6 +149,24 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                         self.config.sparse_vector_name: models.SparseVectorParams(modifier=models.Modifier.IDF)
                     },
                 )
+            else:
+                info = await self.client.get_collection(collection_name)
+                vectors = info.config.params.vectors
+                if not isinstance(vectors, dict):
+                    raise RuntimeError("Qdrant Collection 不是 Named Vector Schema")
+                if dense_name not in vectors:
+                    # Qdrant 1.18 允许在不重建 Collection/旧 Point 的情况下追加向量空间。
+                    await self.client.create_vector_name(
+                        collection_name=collection_name,
+                        vector_name=dense_name,
+                        vector_name_config=models.DenseVectorNameConfig(
+                            dense=models.DenseVectorConfig(
+                                size=self.dimension,
+                                distance=models.Distance.COSINE,
+                            )
+                        ),
+                        wait=True,
+                    )
             await self._validate_collection_schema()
             await self._ensure_payload_indexes()
             self._initialized = True
@@ -134,12 +176,12 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         info = await self.client.get_collection(collection_name)
         vectors = info.config.params.vectors
         sparse_vectors = info.config.params.sparse_vectors
-        if not isinstance(vectors, dict) or self.config.dense_vector_name not in vectors:
-            raise RuntimeError(f"Qdrant Collection 缺少 Dense Vector：{self.config.dense_vector_name}")
-        if vectors[self.config.dense_vector_name].size != self.dimension:
+        dense_name = self._require_dense_vector_name()
+        if not isinstance(vectors, dict) or dense_name not in vectors:
+            raise RuntimeError(f"Qdrant Collection 缺少 Dense Vector：{dense_name}")
+        if vectors[dense_name].size != self.dimension:
             raise RuntimeError(
-                f"Qdrant Collection Dense 维度为 {vectors[self.config.dense_vector_name].size}，"
-                f"但 VectorStore 请求 {self.dimension}"
+                f"Qdrant Collection Dense 维度为 {vectors[dense_name].size}，但 VectorStore 请求 {self.dimension}"
             )
         if not isinstance(sparse_vectors, dict) or self.config.sparse_vector_name not in sparse_vectors:
             raise RuntimeError(f"Qdrant Collection 缺少 Sparse Vector：{self.config.sparse_vector_name}")
@@ -204,7 +246,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         points: list[models.PointStruct] = []
         for chunk in embedded_chunks:
             payload = self._payload_for_chunk(chunk)
-            vectors: dict[str, models.Vector] = {self.config.dense_vector_name: chunk.embedding}
+            vectors: dict[str, models.Vector] = {self._require_dense_vector_name(): chunk.embedding}
             sparse_vector = native_bm25_document(payload["content_text"])
             if sparse_vector is not None:
                 vectors[self.config.sparse_vector_name] = sparse_vector
@@ -237,23 +279,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         score_threshold: float,
         filters: ComparisonFilter | CompoundFilter | None = None,
     ) -> QueryChunksResponse:
-        return await self.query_vector_scoped(
-            [self.vector_store_id],
-            embedding,
-            k,
-            score_threshold,
-            filters,
-        )
-
-    async def query_vector_scoped(
-        self,
-        vector_store_ids: list[str],
-        embedding: NDArray[Any],
-        k: int,
-        score_threshold: float,
-        filters: ComparisonFilter | CompoundFilter | None = None,
-    ) -> QueryChunksResponse:
-        """在一次 Qdrant 查询中检索一个或多个逻辑 VectorStore。"""
+        """只在当前逻辑 KnowledgeBase 的 Dense Named Vector 中检索。"""
 
         await self.initialize()
         collection_name = self._require_collection_name()
@@ -261,8 +287,8 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
             await self.client.query_points(
                 collection_name=collection_name,
                 query=embedding.tolist(),
-                using=self.config.dense_vector_name,
-                query_filter=scoped_filter(vector_store_ids, filters, self.config.payload_indexes),
+                using=self._require_dense_vector_name(),
+                query_filter=scoped_filter(self.vector_store_id, filters, self.config.payload_indexes),
                 limit=k,
                 with_payload=True,
                 score_threshold=score_threshold,
@@ -277,23 +303,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         score_threshold: float,
         filters: ComparisonFilter | CompoundFilter | None = None,
     ) -> QueryChunksResponse:
-        return await self.query_keyword_scoped(
-            [self.vector_store_id],
-            query_string,
-            k,
-            score_threshold,
-            filters,
-        )
-
-    async def query_keyword_scoped(
-        self,
-        vector_store_ids: list[str],
-        query_string: str,
-        k: int,
-        score_threshold: float,
-        filters: ComparisonFilter | CompoundFilter | None = None,
-    ) -> QueryChunksResponse:
-        """在一次 Qdrant 查询中执行跨逻辑 VectorStore 的 BM25。"""
+        """只在当前逻辑 KnowledgeBase 的共享 BM25 空间中检索。"""
 
         await self.initialize()
         collection_name = self._require_collection_name()
@@ -305,7 +315,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                 collection_name=collection_name,
                 query=sparse_query,
                 using=self.config.sparse_vector_name,
-                query_filter=scoped_filter(vector_store_ids, filters, self.config.payload_indexes),
+                query_filter=scoped_filter(self.vector_store_id, filters, self.config.payload_indexes),
                 limit=k,
                 with_payload=True,
                 score_threshold=score_threshold,
@@ -323,29 +333,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         reranker_params: dict[str, Any] | None = None,
         filters: ComparisonFilter | CompoundFilter | None = None,
     ) -> QueryChunksResponse:
-        return await self.query_hybrid_scoped(
-            [self.vector_store_id],
-            embedding,
-            query_string,
-            k,
-            score_threshold,
-            reranker_type,
-            reranker_params,
-            filters,
-        )
-
-    async def query_hybrid_scoped(
-        self,
-        vector_store_ids: list[str],
-        embedding: NDArray[Any],
-        query_string: str,
-        k: int,
-        score_threshold: float,
-        reranker_type: str,
-        reranker_params: dict[str, Any] | None = None,
-        filters: ComparisonFilter | CompoundFilter | None = None,
-    ) -> QueryChunksResponse:
-        """在一次 Qdrant Query API 调用中完成跨逻辑库 Dense + BM25 + RRF。"""
+        """在当前逻辑 KnowledgeBase 内完成 Dense + BM25 + RRF。"""
 
         if reranker_type != "rrf":
             raise NotImplementedError(f"MVP 混合检索只支持 RRF，不支持 {reranker_type}")
@@ -354,9 +342,9 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
         collection_name = self._require_collection_name()
         sparse_query = native_bm25_document(query_string)
         if sparse_query is None:
-            return await self.query_vector_scoped(vector_store_ids, embedding, k, score_threshold, filters)
+            return await self.query_vector(embedding, k, score_threshold, filters)
 
-        query_filter = scoped_filter(vector_store_ids, filters, self.config.payload_indexes)
+        query_filter = scoped_filter(self.vector_store_id, filters, self.config.payload_indexes)
         candidate_limit = max(k * 4, 20)
         results = (
             await self.client.query_points(
@@ -364,7 +352,7 @@ class SharedQdrantIndex(EmbeddingIndex):  # type: ignore[misc]
                 prefetch=[
                     models.Prefetch(
                         query=embedding.tolist(),
-                        using=self.config.dense_vector_name,
+                        using=self._require_dense_vector_name(),
                         filter=query_filter,
                         limit=candidate_limit,
                     ),

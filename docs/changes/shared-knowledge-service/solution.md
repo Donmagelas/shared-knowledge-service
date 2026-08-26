@@ -1,6 +1,6 @@
 # Stella × Cherry Studio 企业版统一知识库服务方案
 
-> 状态：OGX 原生 MVP 与目标产品接口已实现并通过本地端到端验证
+> 状态：现有 OGX MVP 与当前产品接口已通过本地端到端验证；KnowledgeBase 级模型配置和跨 KB 融合方案已收敛，尚未实现
 >
 > 当前实施基线：OGX `v1.3.0` 最小 Distribution + 自定义 Qdrant Provider
 >
@@ -21,7 +21,7 @@ Stella 与 Cherry Studio 企业版都需要文档上传、原文保存、解析�
 2. 让 Stella 与企业版使用一致的 Docling 解析、HybridChunker 切块、Dense + 真 BM25 混合检索和结果结构。
 3. 在 Qdrant 中正确执行逻辑知识库隔离和产品权限过滤，避免先召回再过滤造成漏召回或越权。
 4. 以一个 Docker Compose 在本地完成可验证 MVP，并能演进到每个客户环境独立部署。
-5. 把长期自维护范围收敛到最小 OGX Distribution、统一 Knowledge API、外置 Qdrant Provider、租户感知 Inference Provider、部署配置和兼容性测试。
+5. 把长期自维护范围收敛到最小 OGX Distribution、统一 Knowledge API、外置 Qdrant Provider、KnowledgeBase 感知 Inference Provider、部署配置和兼容性测试。
 
 ## 2. 范围与非目标
 
@@ -30,9 +30,9 @@ Stella 与 Cherry Studio 企业版都需要文档上传、原文保存、解析�
 - OGX Files、VectorStore、VectorStoreFile 和文件处理任务能力。
 - 原文存储支持本地持久卷和 S3-compatible 两种部署选项，对外使用同一套 File/Ingest 接口。
 - Docling 文档解析和 Docling `HybridChunker` 切块。
-- 外部 OpenAI-compatible Embedding 服务。
+- 每个 KnowledgeBase 独立配置的外部 OpenAI-compatible Embedding 服务。
 - Qdrant Dense 向量、BM25 Sparse 向量、Payload Filter 和 RRF。
-- 每租户独立 URL、凭证、模型选择和开关的远程神经 Reranker；部署只限定候选上限、超时和网络安全策略。
+- 每个 KnowledgeBase 独立 URL、凭证、模型选择和开关的远程神经 Reranker；部署只限定候选上限、超时和网络安全策略。
 - PostgreSQL 中的 OGX 文件元数据、VectorStore 元数据和内部任务数据。
 - Stella 四级范围与企业版显式知识库到统一对象和 Qdrant Payload 的映射。
 - MVP 原生接口、后续统一产品接口，以及文件和逻辑知识库的管理接口。
@@ -70,7 +70,7 @@ Stella / Cherry Studio 企业版判断本次请求可以访问什么
 - 知识库服务必须忠实执行过滤条件，但不解释字段的业务含义。
 - 产品数据库保存组织关系、挂载关系和权限；知识库 PostgreSQL 保存 OGX 自己的资源与任务状态。
 - 两个 PostgreSQL 连接可以指向同一实例中的不同逻辑数据库，也可以指向独立实例。MVP 为隔离变量使用独立 PostgreSQL 容器。
-- Embedding URL、API Key、模型 ID 和维度均由租户直接配置；Stella 只配置其唯一租户，企业版按租户分别配置。知识库服务不负责发现或推荐可用模型。Embedding URL、模型与维度在首次 Ingest 被接受后锁定；API Key 可以在其他配置不变时轮换。当前范围不设计已有数据的模型切换流程。
+- Embedding URL、API Key、模型 ID 和可选维度由调用方在创建每个技术 KnowledgeBase 时提交；知识库服务不负责发现或推荐可用模型。该 KnowledgeBase 首次 Ingest 被接受后锁定模型与维度；URL 和 API Key 可以在模型与维度不变且重新验证通过时更新。Rerank 配置属于 KnowledgeBase，但不参与持久索引，可随时修改或关闭。当前范围不实现已有数据的 Embedding 模型迁移。
 
 ### 3.2 Stella 当前四级范围
 
@@ -100,7 +100,7 @@ Stella / Cherry Studio 企业版判断本次请求可以访问什么
 | 路线 | 能直接复用什么 | 我们必须维护什么 | 初次成本 | 长期成本 | 结论 |
 | --- | --- | --- | --- | --- | --- |
 | 原样使用 OGX 官方 Qdrant Provider | OGX 全部管理和处理能力 | 很少 | 最低 | 低 | 不满足过滤、真 BM25、共享 Collection 和正确混合检索，淘汰 |
-| OGX 最小 Distribution + 外置 Provider | Files、VectorStore、VectorStoreFile、Docling、HybridChunker、Inference Router、文件处理任务和管理 API | 统一 Knowledge API、Qdrant 数据映射/过滤/BM25/RRF，以及租户感知 Embedding/Rerank Provider | 中 | 中；核心风险集中在少量外置 Provider 和稳定产品契约 | 选定 |
+| OGX 最小 Distribution + 外置 Provider | Files、VectorStore、VectorStoreFile、Docling、HybridChunker、Inference Router、文件处理任务和管理 API | 统一 Knowledge API、Qdrant 数据映射/过滤/BM25/RRF，以及 KnowledgeBase 感知 Embedding/Rerank Provider | 中 | 中；核心风险集中在少量外置 Provider 和稳定产品契约 | 选定 |
 | Haystack + 自建知识库服务 | Pipeline、DocumentStore 接口和检索组件 | API、对象模型、Files、任务状态、生命周期、恢复、删除、部署和大量胶水代码 | 高 | 逻辑更自由，但长期维护面更大 | 当 OGX 对象或任务语义不再可接受时再切换 |
 
 选择 OGX 的前提不是认为它无需开发，而是接受以下取舍：
@@ -124,7 +124,7 @@ flowchart LR
 
     subgraph KS[统一知识库服务]
         OGX[Python 容器\nOGX API + 统一 Knowledge API\nDocling Worker + 外置 Provider]
-        PG[(PostgreSQL\nOGX 元数据、任务\n租户模型配置与加密凭证)]
+        PG[(PostgreSQL\nOGX 元数据、任务\nKnowledgeBase 模型配置与加密凭证)]
         RAW[(原始文件存储\nMVP: 本地持久卷\n生产可选: S3)]
         QD[(Qdrant\nDense + BM25 Sparse + Payload)]
 
@@ -133,21 +133,21 @@ flowchart LR
         OGX <--> QD
     end
 
-    OGX --> EMB[租户配置的外部 Embedding 服务\nOpenAI-compatible /v1/embeddings]
-    OGX --> RR[租户配置的外部 Rerank 服务\nJina-compatible /v1/rerank]
+    OGX --> EMB[KnowledgeBase 配置的外部 Embedding 服务\nOpenAI-compatible /v1/embeddings]
+    OGX --> RR[KnowledgeBase 配置的外部 Rerank 服务\nJina-compatible /v1/rerank]
 ```
 
 MVP Docker Compose 只部署三个服务：
 
 | 服务 | 运行时 | 职责 | 是否必需 |
 | --- | --- | --- | --- |
-| `knowledge-ogx` | Python | OGX API、统一 Knowledge API、Files、Docling Worker、HybridChunker、自定义 Qdrant 与租户感知 Inference Provider | 是 |
-| `postgres` | PostgreSQL | OGX 文件与 VectorStore 元数据、内部文件处理任务 | 是 |
+| `knowledge-ogx` | Python | OGX API、统一 Knowledge API、Files、Docling Worker、HybridChunker、自定义 Qdrant 与 KnowledgeBase 感知 Inference Provider | 是 |
+| `postgres` | PostgreSQL | OGX 文件与 VectorStore 元数据、内部文件处理任务、KnowledgeBase 模型配置与加密凭证 | 是 |
 | `qdrant` | Rust | Dense、BM25 Sparse、Payload Index、过滤检索和 RRF | 是 |
 
 原始文件使用挂载到 `knowledge-ogx` 的持久卷时不是第四个服务；选择 S3-compatible 后端时则通过部署配置连接外部对象存储。两种方式都由 OGX Files API 屏蔽差异，Stella 和企业版不更换接口，也不接触存储路径或 Bucket。每套部署开始使用前选择一种后端；已有原文件在两种后端之间迁移不属于在线 API 行为。
 
-租户配置的 Embedding 与 Rerank URL 指向外部依赖，不进入本次 Compose。Qdrant 和 PostgreSQL 不直接暴露给 Stella 或企业版。
+KnowledgeBase 配置的 Embedding 与 Rerank URL 指向外部依赖，不进入本次 Compose。Qdrant 和 PostgreSQL 不直接暴露给 Stella 或企业版。
 
 ### 5.2 最小 OGX Distribution
 
@@ -157,9 +157,9 @@ MVP Docker Compose 只部署三个服务：
 | --- | --- | --- |
 | `files` | `inline::localfs` 或 S3-compatible Files Provider | 按部署选择保存原始文件；Knowledge API、File ID 和生命周期语义保持一致 |
 | `file_processors` | `inline::docling` | 解析文档并使用 Docling HybridChunker 切块 |
-| `inference` | 本项目租户感知 Embedding/Rerank Provider | 继续复用 OGX Inference Router，并按内部模型资源解析租户凭证与真实模型 |
+| `inference` | 本项目 KnowledgeBase 感知 Embedding/Rerank Provider | 继续复用 OGX Inference Router，并按内部模型资源解析各 KnowledgeBase 的凭证与真实模型 |
 | `vector_io` | 本项目外置 Qdrant Provider | 保存和检索 Dense、BM25 与 Payload |
-| `knowledge` | 本项目统一 Knowledge API | 向 Stella 和企业版提供稳定的 Ingest、Search、对象、任务与租户模型配置接口 |
+| `knowledge` | 本项目统一 Knowledge API | 向 Stella 和企业版提供稳定的 Ingest、Search、对象、任务与 KnowledgeBase 模型配置接口 |
 
 MVP 将 Docling 配置为 `do_ocr=false`、不配置 VLM，并使用已确认的 HybridChunker 默认目标 `800` tokens、overlap `400` tokens。OGX v1.3.0 的持久任务池固定启动两个 Worker；`ServerConfig` 没有暴露 `job_workers` 字段，因此本项目不修改 Core 只为减少一个 Worker。这些参数在格式与资源测试后可以调整。
 
@@ -177,8 +177,8 @@ flowchart LR
     A --> J[(PostgreSQL 文件处理任务)]
     J --> D[Docling Worker 解析]
     D --> H[Docling HybridChunker 切块]
-    H --> I[OGX Inference Router\n内部租户模型资源]
-    I --> E[租户感知 Embedding Provider\n读取模型、维度与独立 Key]
+    H --> I[OGX Inference Router\n内部 KnowledgeBase 模型资源]
+    I --> E[KnowledgeBase 感知 Embedding Provider\n读取模型、维度与独立 Key]
     E --> V[自定义 Qdrant Provider\n生成 BM25 Sparse\n补齐 Payload]
     V --> Q[(Qdrant Upsert)]
     Q --> S[VectorStoreFile completed / failed]
@@ -190,24 +190,22 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    P[产品调用方\nquery + knowledge_base_ids + filters] --> S[统一 Search 包装层\nMVP: 单个 OGX Search]
-    S --> I[OGX Inference Router\n租户 Embedding 资源]
-    I --> E[租户感知 Embedding Provider\n生成 Dense Query Vector]
-    E --> V[自定义 Qdrant Provider]
-    V --> B[中文 BM25 Query Sparse Vector]
-    V --> F[逻辑知识库范围 + metadata filter]
-    B --> Q[(Qdrant Dense / Sparse Prefetch)]
-    F --> Q
-    Q --> R[Qdrant 原生 RRF]
-    R --> T[统一 Search 层读取租户 Rerank 配置]
-    T -->|关闭| H[SearchHit 列表]
-    T -->|开启| N[OGX Inference.rerank\n租户感知 Rerank Provider]
-    N --> H
+    P[产品调用方\nquery + knowledge_base_ids + filters] --> S[统一 Search 包装层\n解析各 KB 模型配置]
+    S --> K[为每个 KB 建立独立分支]
+    K --> Q[Qdrant\nDense + BM25 + 内层 RRF]
+    Q --> T{当前 KB 启用 Rerank?}
+    T -->|否| L[当前 KB 最终排名]
+    T -->|是| N[OGX Inference.rerank\n当前 KB 凭证与模型]
+    N --> L
+    L --> C{本次是否跨多个 KB?}
+    C -->|否| H[直接返回 SearchHit 列表]
+    C -->|是| O[统一 Search 层\n等权外层 RRF]
+    O --> H
 ```
 
-MVP 默认检索模式为 `hybrid`：Dense 与 BM25 使用完全相同的 Payload Filter，再由 Qdrant Query API 执行 RRF。过滤不是检索后的二次裁剪。
+默认检索模式为 `hybrid`：每个 KnowledgeBase 分支中的 Dense 与 BM25 使用完全相同的 Payload Filter，再由 Qdrant Query API 执行该 KB 的内层 RRF。该 KB 配置 Rerank 时，只重排自己的候选。请求只有一个 KB 时直接返回该 KB 的最终排名；请求跨多个 KB 时，才由统一 Search 层执行等权外层 RRF。`dense` 与 `bm25` 保持单路召回，不执行 Rerank。过滤不是检索后的二次裁剪。
 
-图中 `knowledge_base_ids` 是目标产品接口。MVP 调用 OGX 原生接口时一次只有一个 `vector_store_id`；原生链路通过后，同一 Python 服务内增加薄包装层，把多个 ID 转成 `vector_store_id IN [...]` 并进入一次 Provider/Qdrant 查询，不增加新的部署组件。
+图中 `knowledge_base_ids` 是目标产品接口。统一 Search 层按请求顺序为每个 ID 建立独立分支；分支可以并行执行，不增加部署组件。只有跨 KB 时，外层 RRF 才等权处理各 KB 排名，同名次按请求中的 `knowledge_base_ids` 顺序保持稳定。因为不同 KB 的候选通常不重合，这一层语义接近按 KB 平衡交错，而不是比较不同模型的原始分数。Stella 固定隐藏 KB 和企业版仅挂载一个 KB 的查询都绕过外层 RRF。
 
 ### 5.5 OGX 对象与物理存储映射
 
@@ -219,7 +217,7 @@ MVP 默认检索模式为 `hybrid`：Dense 与 BM25 使用完全相同的 Payloa
 | Chunk Point | 某次 File 挂载产生的可检索切块 | Qdrant |
 | Collection | 一个客户环境或租户的物理索引边界 | Qdrant |
 
-`VectorStore` 不对应独立 Qdrant Collection。物理边界是租户：每个租户一个 Collection，租户内多个逻辑 VectorStore 通过 `vector_store_id` Payload 区分。没有 `tenant_id` 的单租户部署使用默认 Collection。租户内新增部门知识库只是新增一个 VectorStore 和新的 `vector_store_id` 值，不创建 Payload Index，也不重建 HNSW。
+`VectorStore` 不对应独立 Qdrant Collection。物理边界仍是租户：每个租户一个 Collection，租户内多个逻辑 VectorStore 通过 `vector_store_id` Payload 区分。没有 `tenant_id` 的单租户部署使用默认 Collection。Collection 从创建时就使用 Named Vector Schema，并为每个不同的 `embedding_model_id + dimension` 维护一个 Dense Named Vector；模型和维度相同的 KB 共用该 Named Vector/HNSW，URL 和 Key 不参与向量空间划分。Qdrant 1.18 支持在已有 Collection 中追加 Named Vector，因此新增部门知识库仍不创建 Collection 或 Payload Index；只有首次使用新的模型或维度时才追加 Dense Named Vector Schema，已有 Point 不需要补该向量。
 
 ### 5.6 Qdrant Point 结构
 
@@ -227,7 +225,7 @@ MVP 默认检索模式为 `hybrid`：Dense 与 BM25 使用完全相同的 Payloa
 Point
 ├── id = hash(vector_store_id + chunk_id)
 ├── vectors
-│   ├── dense = 外部 Embedding
+│   ├── dense_<space_hash> = 对应 model_id + dimension 的外部 Embedding
 │   └── bm25  = 中文 BM25 Sparse Vector
 └── payload
     ├── vector_store_id          # 保留字段，逻辑知识库隔离
@@ -251,11 +249,13 @@ Provider 支持 OGX 的 `eq / ne / gt / gte / lt / lte / in / nin / and / or` �
 
 ### 5.7 Dense + 中文 BM25 + RRF
 
-- Dense 文档向量和查询向量都通过 OGX Inference API 和同一个租户内部模型资源生成；租户感知 Provider 再把该资源解析成锁定的真实模型、维度和当前有效 Key。
+- Dense 文档向量和查询向量都通过 OGX Inference API 和所属 KnowledgeBase 的内部模型资源生成；KnowledgeBase 感知 Provider 再把资源解析成该 KB 锁定的真实模型、维度、URL 和当前有效 Key。
+- Dense Named Vector 只由 `model_id + dimension` 决定。不同 URL/Key 下的相同模型 ID 必须由 NewAPI 侧保证实际指向兼容向量空间，统一知识库不额外探测模型版本兼容性。
 - Provider 为文档和查询传入完全相同的 Qdrant 原生 multilingual BM25 配置。
 - Qdrant 保存 BM25 Sparse Vector，并使用动态 IDF 能力参与评分。
-- Dense 与 Sparse 在同一 Collection、同一过滤条件下分别 Prefetch。
-- 最终融合由 Qdrant 原生 RRF 完成；Haystack 不参与，OGX Server 不再做第二次跨库融合。
+- 单个 KB 的 Dense 与 Sparse 在同一 Collection、同一过滤条件下分别 Prefetch，并由 Qdrant 原生 RRF 完成内层融合。
+- `hybrid` 中启用 Rerank 的 KB 在内层 RRF 后使用自己的 Rerank URL、Key 和模型；失败时仅该 KB 回退到内层 RRF。
+- 只有多 KB 查询才由统一知识库 Python Search 层执行等权外层 RRF；单 KB 直接返回本地最终排名，Haystack 不参与。
 
 MVP 已比较两条做法：
 
@@ -303,7 +303,7 @@ Stella 通常不需要面向用户展示 VectorStore 创建、命名和列表功
 
 ### 6.2 Cherry Studio 企业版
 
-公司、部门、产品等知识库是显式业务对象，需要创建、展示、修改、挂载和删除。每个业务知识库一对一映射一个 OGX VectorStore；创建时写入可信 `tenant_id`。同租户 VectorStore 写入同一个 Qdrant Collection，不同租户使用不同 Collection。
+公司、部门、产品等知识库是显式业务对象，需要创建、展示、修改、挂载和删除。每个业务知识库一对一映射一个 OGX VectorStore；创建时写入可信 `tenant_id`，并提交当前账号为该 KB 选择的 Embedding 与可选 Rerank 完整连接配置。同租户 VectorStore 写入同一个 Qdrant Collection，不同租户使用不同 Collection。
 
 企业版产品数据库保存：
 
@@ -312,15 +312,9 @@ Stella 通常不需要面向用户展示 VectorStore 创建、命名和列表功
 - 业务展示所需的扩展字段。
 - 业务知识库 ID 与 OGX `vector_store_id` 的映射。
 
-创建知识库时，企业版创建业务对象并调用统一知识库的 VectorStore 创建接口，然后保存返回的 `vector_store_id`。检索时，企业版先算出当前请求挂载的知识库列表，再把这些 ID 作为 `knowledge_base_ids` 传给统一检索接口。
+创建知识库时，企业版在自己的数据库保存名称、描述、组织归属等业务字段，同时调用统一知识库的技术 KnowledgeBase 创建接口并提交模型连接配置，然后保存返回的 `vector_store_id`。检索时，企业版先算出当前请求挂载的知识库列表，再把这些 ID 按稳定顺序作为 `knowledge_base_ids` 传给统一检索接口。
 
-多个企业版知识库在目标接口中会转换为：
-
-```text
-vector_store_id IN [公司知识库, 部门A知识库, 产品B知识库]
-```
-
-因为同租户数据位于同一个 Collection，这是一条带过滤的 Dense + BM25 + RRF 查询，不需要分别搜索多个物理库后再次融合。一次请求如果混入不同租户的 VectorStore，服务直接拒绝，不做跨 Collection 融合。
+多个企业版知识库仍位于同一个租户 Collection，但跨 KB 检索时按 KB 分支分别执行对应 Dense Named Vector、BM25、内层 RRF 和可选 Rerank，再由统一 Search 层做等权外层 RRF。仅挂载一个 KB 时直接返回该 KB 的最终排名。一次请求如果混入不同租户的 VectorStore，服务直接拒绝，不做跨 Collection 融合。
 
 ### 6.3 统一知识库服务
 
@@ -330,7 +324,7 @@ vector_store_id IN [公司知识库, 部门A知识库, 产品B知识库]
 - 原文件保存、Docling 解析、HybridChunker 切块。
 - Embedding 调用、中文 BM25 编码、Qdrant 写入与删除。
 - 通用 Filter 校验、翻译和完整执行。
-- Dense + BM25 + RRF 及稳定的 SearchHit 输出。
+- 每 KB 的 Dense + BM25、内层 RRF、可选 Rerank，以及只在跨 KB 查询时执行的等权外层 RRF 和稳定的 SearchHit 输出。
 - PostgreSQL、Qdrant 和原始文件之间的生命周期一致性与恢复工具。
 - 部署配置、版本固定、迁移、备份恢复说明和可观测性。
 
@@ -407,7 +401,7 @@ V1 需要补充的辅助接口如下：
 
 | 行为 | 目标接口 | 说明 |
 | --- | --- | --- |
-| 创建技术知识库 | `POST /knowledge/v1/knowledge-bases` | Stella 部署初始化时调用一次；企业版创建业务知识库时调用并保存返回的 `knowledge_base_id` |
+| 创建技术知识库 | `POST /knowledge/v1/knowledge-bases` | Stella 部署初始化时调用一次；企业版创建业务知识库时提交该 KB 的 Embedding 与可选 Rerank 配置，并保存返回的 `knowledge_base_id` |
 | 查询技术知识库 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}` | 只用于检查对象是否存在及读取技术状态，不承担业务知识库展示 |
 | 删除技术知识库 | `DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}` | 供企业版删除业务知识库时清理索引和技术对象；Stella 不删除隐藏知识库 |
 | 查询文件列表 | `POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query` | 使用通用 Filter、状态和 Cursor 分页查询该知识库内的文件 |
@@ -417,40 +411,52 @@ V1 需要补充的辅助接口如下：
 
 企业版的“挂载知识库”是产品数据库中的用户或 Assistant 与业务知识库关系。检索时把挂载结果转换成 `knowledge_base_ids` 传给 Search，不调用统一知识库的 Mount API。
 
-### 7.4 Embedding 连接与租户配置
+### 7.4 KnowledgeBase 级模型连接与凭证
 
-每个租户直接提交自己的 OpenAI-compatible `base_url`、API Key、模型 ID 和维度。统一知识库不调用或包装上游 `/v1/models`，不返回可选模型列表，也不维护模型白名单或推荐模型；模型选择由 Stella 或企业版完成。
+每个逻辑 KnowledgeBase 独立保存一套必填 Embedding 配置和一套可选 Rerank 配置。两套配置都使用完整的 `base_url + api_key + model_id`；Embedding 额外包含可选 `dimension`。Embedding 与 Rerank 使用相同连接时，由企业版重复提交相同 URL 和 Key，不增加连接引用、复用标识或模型连接业务对象。统一知识库不调用或包装上游 `/v1/models`，不返回可选模型列表，也不维护模型白名单或推荐模型。
 
-| 行为 | 目标接口 | 说明 |
-| --- | --- | --- |
-| 配置租户 Embedding | `PUT /knowledge/v1/tenants/{tenant_id}/embedding-config` | 一次提交 `base_url + api_key + model_id + dimension`；首次配置必须含 Key，后续省略 Key 表示保留现有密文 |
-| 查询租户配置 | `GET /knowledge/v1/tenants/{tenant_id}/embedding-config` | 返回规范化 `base_url`、`model_id`、`dimension`、`credential_configured`、`locked` 和更新时间，不返回 Key |
+Embedding `dimension` 已提交时，服务调用确切模型并验证实际向量长度；未提交时，不向上游发送 `dimensions`，而是用固定探针文本调用一次模型并把返回向量长度保存为该 KB 的实际维度。探针失败、返回空向量或维度不一致时，技术 KnowledgeBase 创建失败，不保留半成品配置。
 
-模型与维度属于租户 Collection，而不是单个 KnowledgeBase，因此不放入 KnowledgeBase 创建、Ingest 或 Search 请求。KnowledgeBase 只通过 `tenant_id` 继承配置。同租户的公司、部门和产品知识库必须使用同一套配置。
+空 KB 允许修改 Embedding URL、Key、模型和维度。首个 Ingest 被可靠接受后，模型与维度锁定；即使新模型维度相同也不能直接切换。已有文件后仍允许更新 URL 和 Key，但服务必须使用新连接验证锁定的模型与维度后再替换旧凭证。全量重新向量化与模型迁移本期不实现。Rerank 不参与持久索引，其 URL、Key、模型和开关随时可改，修改只影响之后开始的 Search。
 
-租户配置在第一次 `POST /knowledge/v1/ingest` 被接受前可以修改。完整配置具备连接信息后，服务只针对调用方提交的确切 `base_url + model_id + dimension` 执行一次 `/v1/embeddings` 探针并校验返回维度，不进行模型发现。服务接受首个 Ingest 时立即把 URL、模型和维度锁定，避免异步任务执行期间切换向量空间。锁定后重复写入相同配置仍然幂等成功，修改 URL、模型或维度返回 `409 embedding_config_locked`。即使新旧模型维度相同，也不能直接切换，因为它们的向量空间并不兼容；未来若需要更换，必须单独设计全量重新向量化和 Collection 切换，本期不实现。
+Embedding 与 Rerank Key 分别使用同一加密模块保存到 PostgreSQL 的 OGX KV namespace。两者值相同时仍按两套完整配置独立保存。数据库只保存 AES-GCM 密文、nonce 和密钥版本；部署级 Master Key 通过环境变量或 Secret 注入，不进入 PostgreSQL。Provider 只在实际调用上游前于内存中解密，查询接口、错误、指标和日志均不得包含明文或可逆片段。
 
-API Key 与 URL/模型配置采用不同生命周期：Key 加密后保存，不进入 VectorStore metadata、Qdrant Payload、FileBatch 参数或日志；查询接口永不回传密钥。已有数据后仍允许轮换 Key，但服务必须用新 Key 验证锁定的 URL、模型和维度后再替换旧 Key。Ingest 和 Search 不接收模型连接参数，而是通过 `knowledge_base_id -> tenant_id` 解析当前有效配置，保证异步任务重启后仍可继续执行。
+允许产品提交远程 URL 会引入 SSRF 风险。模型连接只接受绝对 HTTP(S) Base URL，拒绝 URL userinfo、query 和 fragment；默认要求 HTTPS，并拒绝 loopback、link-local、云元数据地址和私网解析结果。确需连接 Docker 内网或企业内部模型服务时，由部署配置显式允许对应 scheme 与 host，不能由请求自行放宽策略。重定向后的目标也必须重新执行同样校验。
 
-租户 Embedding 与 Rerank 凭证使用同一加密存储模块，保存到 PostgreSQL 的独立 OGX KV namespace。数据库只保存 AES-GCM 密文、nonce 和密钥版本；部署级 Master Key 通过环境变量或 Secret 注入，不进入 PostgreSQL。Provider 只在实际调用上游前于内存中解密，且错误、指标和日志均不得包含明文或可逆片段。
-
-允许租户提交远程 URL 会引入 SSRF 风险。两个 Credential 接口只接受绝对 HTTP(S) Base URL，拒绝 URL userinfo、query 和 fragment；默认要求 HTTPS，并拒绝 loopback、link-local、云元数据地址和私网解析结果。确需连接 Docker 内网或企业内部模型服务时，由部署配置显式允许对应 scheme 与 host，不能由租户请求自行放宽策略。重定向后的目标也必须重新执行同样校验。
-
-为继续复用 OGX FileBatch 与 Inference Router，每个租户的 Embedding 配置会对应一个不对产品暴露的 OGX 内部模型资源，而不是为每个租户创建 Provider。内部资源使用不含真实 Key、URL 和上游模型名的稳定 opaque ID，并把 `provider_resource_id` 指向租户 Embedding Profile ID；VectorStore 保存该内部模型 ID。统一的租户感知 Embedding Provider 收到调用后根据 Profile ID 读取锁定的真实 URL、模型、维度和当前凭证，再调用远程服务。一个租户只有一个有效 Embedding Profile，同租户所有 KnowledgeBase 复用它。
+为继续复用 OGX FileBatch 与 Inference Router，每个 KnowledgeBase 分别对应不对产品暴露的 Embedding 和可选 Rerank 内部模型资源，而不是为每个 KB 创建 Provider。内部资源只引用 opaque KB Profile ID；KnowledgeBase 感知 Provider 根据该 ID 读取真实 URL、模型、维度和当前凭证。Qdrant Dense Named Vector 只由 `model_id + dimension` 的稳定哈希决定，URL 和 Key 不参与划分；NewAPI 侧必须保证不同 URL/Key 下相同模型 ID 实际指向兼容向量空间。
 
 ### 7.5 创建技术 KnowledgeBase
 
-`POST /knowledge/v1/knowledge-bases` 创建 OGX VectorStore 技术对象，不接收名称、部门、产品、权限、模型、维度或 API Key。请求体只包含必填的可信 `tenant_id`，并要求调用方提供必填的 `Idempotency-Key` Header。幂等关系按 `(tenant_id, Idempotency-Key)` 隔离：相同租户和 Key 重试返回原 `knowledge_base_id`；相同租户和 Key 对应不同请求时返回 `409 idempotency_conflict`；不同租户可以使用相同 Key。
+`POST /knowledge/v1/knowledge-bases` 创建 OGX VectorStore 技术对象，不接收名称、描述、部门、产品、权限或挂载关系。请求体包含必填 `tenant_id`、完整 Embedding 配置和可选完整 Rerank 配置，并要求调用方提供必填 `Idempotency-Key` Header。幂等关系按 `(tenant_id, Idempotency-Key)` 隔离；指纹覆盖除 API Key 明文之外的完整配置，并使用不可逆凭证摘要识别不同 Key。
 
-创建前要求该租户已经提交并验证完整的 `base_url + api_key + model_id + dimension`，缺失或不完整时返回 `409 embedding_config_required`。接口同步返回 HTTP `201`，响应包含 `knowledge_base_id`、`tenant_id`、当前继承的 Embedding 配置、`locked=false` 和 `created_at`，但不暴露 Qdrant Collection 名、Provider ID、内部模型资源 ID 或 API Key。
+请求结构为：
 
-创建空 KnowledgeBase 时只持久化逻辑对象，不创建 Qdrant Collection。租户第一次 Ingest 被接受时，服务必须在同一个租户级临界区内锁定 Embedding 配置、创建或确认物理 Collection，再持久化 FileBatch。这样同一租户可以在首次 Ingest 前创建多个空 KnowledgeBase 并修改模型配置，也能防止两个并发首次 Ingest 使用不同配置初始化 Collection。当前 Provider 在创建 VectorStore 时立即初始化 Collection，落地该接口时需要改为延迟初始化。
+```json
+{
+  "tenant_id": "tenant-a",
+  "embedding": {
+    "base_url": "https://newapi.example.com/v1",
+    "api_key": "sk-embedding",
+    "model_id": "embedding-model",
+    "dimension": null
+  },
+  "rerank": {
+    "base_url": "https://newapi.example.com/v1",
+    "api_key": "sk-rerank",
+    "model_id": "rerank-model"
+  }
+}
+```
+
+不使用 Rerank 时 `rerank=null`。服务先验证 Embedding 并推断或校验维度，再验证可选 Rerank；全部成功后才持久化配置、注册 OGX 内部模型资源并创建 VectorStore。接口同步返回 HTTP `201`，响应包含 `knowledge_base_id`、`tenant_id`、不含凭证的 Embedding/Rerank 配置、`embedding.locked=false` 和 `created_at`，但不暴露 Qdrant Collection 名、Provider ID、内部模型资源 ID 或 API Key。
+
+创建空 KnowledgeBase 时只持久化逻辑对象和模型配置，不提前写入 Point。首个 Ingest 被接受时，服务在 KB 生命周期锁与租户 Collection Schema 锁内锁定该 KB 的模型和维度，创建或确认物理 Collection、共享 BM25 Sparse Vector 及对应 Dense Named Vector，再持久化 FileBatch。并发创建或首次使用相同 `model_id + dimension` 的 KB 必须幂等复用同一个 Named Vector Schema。
 
 ### 7.6 查询技术 KnowledgeBase
 
-`GET /knowledge/v1/knowledge-bases/{knowledge_base_id}` 只用于检查统一知识库中的技术对象及对账，不承担企业版业务知识库展示。对象存在时返回 `knowledge_base_id`、`tenant_id`、继承的 `model_id + dimension + locked`、`file_counts` 和 `created_at`；不存在返回 `404 knowledge_base_not_found`。
+`GET /knowledge/v1/knowledge-bases/{knowledge_base_id}` 只用于检查统一知识库中的技术对象及对账，不承担企业版业务知识库展示。对象存在时返回 `knowledge_base_id`、`tenant_id`、不含凭证的 Embedding 配置、可选 Rerank 配置、`file_counts` 和 `created_at`；不存在返回 `404 knowledge_base_not_found`。
 
-`file_counts` 固定包含 `total / processing / completed / failed`。接口不返回业务名称、部门、产品、Assistant、权限、挂载关系、API Key、物理 Collection 名、原文件地址或文件明细。Stella 只在部署启动或诊断时使用；企业版正常页面仍查询自己的业务数据库，只在创建确认和数据对账时调用该接口。
+`file_counts` 固定包含 `total / processing / completed / failed`。接口不返回业务名称、描述、部门、产品、Assistant、权限、挂载关系、API Key、物理 Collection 名、原文件地址或文件明细。Stella 只在部署启动或诊断时使用；企业版正常页面仍查询自己的业务数据库，只在创建确认和数据对账时调用该接口。
 
 ### 7.7 删除逻辑 KnowledgeBase
 
@@ -458,7 +464,7 @@ API Key 与 URL/模型配置采用不同生命周期：Key 加密后保存，不
 
 V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不要求 `Idempotency-Key`。如果仍有 `processing` FileBatch，返回 `409 knowledge_base_busy` 和 `active_operation_ids`，不提供强制删除。服务持久化 `deleting` 状态后拒绝新的 Ingest 和 Search，再依次删除 scoped Qdrant Points、VectorStoreFile 挂载、无其他引用的原 File、VectorStore 元数据和创建幂等映射；中途崩溃后相同 DELETE 可以继续剩余清理。
 
-删除租户最后一个逻辑 KnowledgeBase 时仍保留空 Collection、租户 Embedding Credential 和 Embedding Config。租户整体注销与物理 Collection 清理是独立能力，不隐含在本接口中。
+删除 KnowledgeBase 时一并删除它自己的 Embedding/Rerank 配置、加密凭证和内部模型资源映射。V1 不在删除 KB 时移除 Collection 级 Dense Named Vector Schema：它可能仍被同模型、同维度的其他 KB 使用，立即删除会引入 Collection 级竞态；无人使用的空 Schema 只占用结构和空索引开销，后续如有证据再增加独立清理。即使删除的是租户最后一个逻辑 KnowledgeBase，仍保留空 Qdrant Collection；租户整体注销与物理 Collection 清理是独立能力，不隐含在本接口中。
 
 ### 7.8 查询 KnowledgeBase 文件列表
 
@@ -506,7 +512,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 幂等关系按 `(knowledge_base_id, Idempotency-Key)` 隔离。服务对 `file bytes + filename + knowledge_base_id + canonical attributes` 计算 SHA-256 请求指纹：同一 Key 和相同指纹重放时不重复上传、不重复创建 FileBatch，返回 HTTP `200` 以及原 `operation_id / file_id` 的当前状态；同一 Key 对应不同指纹时返回 `409 idempotency_conflict`。首次可靠接受请求返回 HTTP `202`。
 
-租户第一次 Ingest 需要在同一个租户级临界区内完成 Embedding 配置锁定、Qdrant Collection 创建或确认，并建立可恢复的幂等记录，再创建原 File 与单文件 FileBatch。Qdrant 是外部系统，不能与 PostgreSQL 做单个物理事务，因此这里的“原子”指接口对外只产生一个可恢复结果：进程在任一步崩溃后，相同 Idempotency-Key 必须继续或返回原 Operation，不能再次创建任务，也不能遗留无法追踪的原 File。
+每个 KnowledgeBase 的第一次 Ingest 需要在 KB 生命周期锁与租户 Collection Schema 锁内完成模型和维度锁定、Qdrant Collection 及对应 Dense Named Vector 的创建或确认，并建立可恢复的幂等记录，再创建原 File 与单文件 FileBatch。Qdrant 是外部系统，不能与 PostgreSQL 做单个物理事务，因此这里的“原子”指接口对外只产生一个可恢复结果：进程在任一步崩溃后，相同 Idempotency-Key 必须继续或返回原 Operation，不能再次创建任务，也不能遗留无法追踪的原 File。
 
 ### 7.14 Search
 
@@ -520,9 +526,11 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 | `mode` | 否 | `hybrid / dense / bm25`，默认 `hybrid` | 本次使用的基础召回方式 |
 | `limit` | 否 | 默认 10，最小 1、最大 50 | 最终返回的 Chunk 数量，不是每路召回候选数 |
 
-所有 `knowledge_base_ids` 必须存在、属于同一个租户 Collection，并使用同一套 Embedding 模型与维度；否则拒绝整个请求，不做部分检索。服务把范围强制组合成 `vector_store_id IN knowledge_base_ids AND caller_filters`，调用方不能在 `filters` 中访问或覆盖 `vector_store_id` 及其他保留字段。`tenant_id`、Embedding Key、模型和维度均由 KnowledgeBase 反查，不进入 Search 请求。
+所有 `knowledge_base_ids` 必须存在并属于同一个租户 Collection；不同 KB 可以使用不同 Embedding/Rerank 模型、维度、URL 和 Key。统一 Search 层按请求顺序稳定地为每个 KB 建立分支，并把调用方 Filter 与该分支的 `vector_store_id = knowledge_base_id` 强制组合。调用方不能在 `filters` 中访问或覆盖 `vector_store_id` 及其他保留字段；`tenant_id`、模型连接和维度均由 KnowledgeBase 反查，不进入 Search 请求。
 
-`hybrid` 固定执行 Dense 与中文 BM25 两路召回，并在 Qdrant 中使用 RRF 融合。Rerank 是租户级可选能力，但不是 Search 请求参数：统一 Search 层根据本次唯一 `tenant_id` 读取该租户的开关、模型和独立凭证，启用时扩大内部候选集并在 RRF 后执行远程 Rerank；远程调用失败时记录错误并降级返回 RRF 结果。`dense` 与 `bm25` 模式不执行 Rerank。调用方不能在单次请求中控制内部候选数量、RRF 参数或 Rerank 模型。
+`hybrid` 的每个 KB 分支分别执行 Dense 与中文 BM25 两路召回，并由 Qdrant 完成该 KB 的内层 RRF；该 KB 配置 Rerank 时，再使用自己的 URL、Key 和模型重排本地候选。`dense` 与 `bm25` 保持单路召回，不执行 Rerank。只有一个 `knowledge_base_id` 时直接返回该 KB 的最终排名；两个及以上 KB 时，才由统一知识库 Python Search 层执行等权外层 RRF，同名次按请求中的 `knowledge_base_ids` 顺序稳定排列。调用方不能在单次请求中控制内部候选数量、RRF 参数、Rerank 开关或模型。
+
+各 KB 分支可以并行执行。相同 `model_id + dimension` 的 KB 共用物理 Named Vector，但仍使用各自 URL/Key 完成 Ingest 和 Query Embedding 调用。任一 KB 的 Embedding、Qdrant 查询、对象解析或必需配置失败时，整个 Search 失败，不返回会被误解为完整结果的部分命中。单个 KB 没有命中只贡献空列表；Rerank 失败仅使该 KB 回退到内层 RRF，其他分支继续执行。
 
 响应固定为 `{ "hits": SearchHit[] }`，命中按相关性从高到低排列；没有命中时返回 HTTP `200` 和空数组，不使用分页或总数统计。每个 `SearchHit` 包含：
 
@@ -537,7 +545,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 | `score` | 本次响应中的排序分数，只允许同一响应内部比较 |
 | `attributes` | Ingest 时写入的非保留属性，完整保留允许的标量和标量数组 |
 
-Dense 相似度、BM25、RRF 和神经 Rerank 的分数空间不同，因此 V1 不接收统一 `score_threshold`，也不承诺 `score` 可跨请求、跨模式或跨 Rerank 状态比较。当前实现已稳定返回 `knowledge_base_id`、`filename` 和数组 attributes。
+Dense 相似度、BM25、内层 RRF、神经 Rerank 和外层 RRF 的分数空间不同，因此 V1 不接收统一 `score_threshold`，也不承诺 `score` 可跨请求、跨模式或跨 Rerank 状态比较。单 KB 响应保留该 KB 最终阶段的分数；多 KB 响应使用外层 RRF 分数，等权且同名次的不同 KB 命中可以同分。
 
 ### 7.15 服务间认证
 
@@ -546,7 +554,7 @@ Knowledge API 只面向 Stella 和 Cherry Studio 企业版后端，不直接接�
 | Token | 允许能力 |
 | --- | --- |
 | Runtime Token | Search、Ingest、Operation、文件接口，以及技术 KnowledgeBase 的创建、查询和删除 |
-| Admin Token | Runtime Token 的全部能力，以及租户 Embedding/Rerank URL、API Key、模型、Embedding 维度和 Rerank 开关配置 |
+| Admin Token | Runtime Token 的全部能力，以及 KnowledgeBase Embedding/Rerank URL、API Key、模型、Embedding 维度和 Rerank 开关配置 |
 
 Admin Token 是 Runtime 权限的超集。两个 Token 通过环境变量或部署 Secret 注入，不建立统一知识库用户、角色或服务账号表，不写入日志、错误响应、Operation 参数或 Qdrant Payload。缺少或无效 Token 返回 `401`；Runtime Token 调用 Admin 接口返回 `403`。
 
@@ -583,24 +591,19 @@ Admin Token 是 Runtime 权限的超集。两个 Token 通过环境变量或部�
 | `503` | PostgreSQL、Qdrant 或必要的模型服务暂时不可用 |
 | `500` | 未归类的内部错误 |
 
-Ingest 已返回 `202` 后发生的解析、切块、Embedding 或索引失败属于 Operation 结果，不是状态查询接口的 HTTP 失败。此时查询 Operation 返回 HTTP `200`、`status=failed` 和稳定的 `last_error={code,message}`；只有状态接口本身无法执行时才返回错误信封。Rerank 失败继续按既定策略降级到 RRF，只记录可追踪日志，不把 Search 转换成 `502/503`。
+Ingest 已返回 `202` 后发生的解析、切块、Embedding 或索引失败属于 Operation 结果，不是状态查询接口的 HTTP 失败。此时查询 Operation 返回 HTTP `200`、`status=failed` 和稳定的 `last_error={code,message}`；只有状态接口本身无法执行时才返回错误信封。Search 中必需的 Embedding 或 Qdrant 分支失败会使整个请求失败；某个 KB 的可选 Rerank 失败继续按既定策略降级到该 KB 的内层 RRF，只记录可追踪日志。
 
-### 7.17 租户级 Rerank 配置
+### 7.17 KnowledgeBase 模型配置更新
 
-每个租户分别提交并保存 Rerank `base_url`、独立 Key、模型和开关；Rerank 连接与该租户的 Embedding 连接完全独立。知识库服务不发现、列举或推荐 Rerank 模型。部署只提供候选数量上限、请求超时、设施级总开关和远程 URL 安全策略。
+模型配置属于技术 KnowledgeBase，不再提供租户级 Embedding/Rerank 配置接口。创建后的管理接口为：
 
 | 行为 | 目标接口 | 说明 |
 | --- | --- | --- |
-| 配置租户 Rerank | `PUT /knowledge/v1/tenants/{tenant_id}/rerank-config` | 一次提交 `enabled + base_url + api_key + model_id`；首次启用必须含 Key，后续省略 Key 表示保留现有密文；只探测确切模型，不做模型发现 |
-| 查询租户配置 | `GET /knowledge/v1/tenants/{tenant_id}/rerank-config` | 返回 `enabled`、规范化 `base_url`、`model_id`、`credential_configured` 和更新时间，不返回 Key |
+| 查询 KB 模型配置 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config` | 返回不含 Key 的 Embedding/Rerank 配置、实际维度、锁定状态和更新时间 |
+| 更新 KB Embedding | `PUT /knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config` | 空 KB 可提交完整配置；已有文件后只允许模型与维度不变的 URL/Key 更新，并重新探测验证 |
+| 更新 KB Rerank | `PUT /knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config` | 提交完整 `base_url + api_key + model_id`，或显式 `null/disabled` 关闭；随时可改 |
 
-仅关闭 Rerank 时允许只提交 `enabled=false` 并保留已有连接配置；从未配置过的租户也可以保持关闭而不提交 URL、Key 或模型。启用时必须已经具备完整且通过安全校验的连接配置。
-
-Rerank 不参与持久化索引，因此其 URL、Key、模型和开关不随首次 Ingest 锁定，可以随时修改；修改只影响配置提交后开始的新 Search，请求执行过程中使用开始时取得的配置快照。关闭时 Hybrid 直接返回 Qdrant RRF；开启时 RRF 候选进入租户指定 URL 和模型；Key 失效、超时或返回非法结果时降级到 RRF，并通过日志和指标暴露故障。
-
-当前实现只保留租户感知 Inference Provider，并为每个已配置租户注册一个不对产品暴露的内部 Rerank 模型资源；该资源的 `provider_resource_id` 指向租户 Rerank Profile ID，而不是直接保存上游 URL、模型名或 Key。早期全局固定连接的 `remote::shared-rerank` 已移除，避免出现两套并行 Rerank 路线。
-
-统一 Search 层在 Qdrant RRF 后读取该租户当前 Rerank 配置：关闭时直接返回 RRF；开启时把内部模型 ID 交给 OGX `Inference.rerank`。Inference Router 仍负责模型路由，租户感知 Provider 根据 Profile ID 读取本次配置快照、真实 URL、模型和独立 Key，再调用远程服务。这样不为每个租户创建 Provider，也不把连接参数放入 Search 请求，同时保留 OGX 的 Rerank 协议、路由和已验证的 Jina-compatible 适配逻辑。
+更新接口使用 Admin Token，API Key 必须在每次更换连接时完整提交，不使用“字段缺失表示保留旧 Key”的隐式语义。请求执行期间使用开始时取得的配置快照。Rerank 更新不修改 Qdrant；空 KB 修改 Embedding 模型或维度时同步更新 OGX VectorStore 的内部模型资源映射，首个 Ingest 后拒绝这两项变化。全量重新向量化和已有数据模型迁移不在本期范围。
 
 ## 8. 生命周期与失败恢复
 
@@ -654,17 +657,19 @@ FILE_CLEANUP_INTERVAL_HOURS=24
 | --- | --- | --- |
 | 最小 Distribution | 只启用 Files、File Processors、Inference、VectorIO 和统一 Knowledge API | 无关 OGX API 不注册或不可用 |
 | 外置 Provider | 不修改 OGX Core 即可加载 | Provider 通过外部入口完成注册和初始化 |
-| 租户 Embedding | 两个租户配置不同 URL、Key 和模型 | Ingest 与 Search 分别使用正确连接；Qdrant Collection、模型资源和结果不串租户 |
-| 租户 Rerank | 两个租户独立 URL、开关、Key 和模型 | 只对启用租户调用其连接；切换配置无需重建索引；失败仅降级该租户到 RRF |
+| KB 独立 Embedding | 同租户多个 KB 配置相同/不同 URL、Key、模型和维度 | 每个 KB 使用正确连接；相同模型与维度复用 Named Vector，不同模型或维度严格分离 |
+| KB 独立 Rerank | 同租户多个 KB 分别关闭或配置不同 URL、Key 和模型 | 只重排启用 KB 的本地候选；切换配置无需重建索引；失败仅降级该 KB 到内层 RRF |
 | 原文 | 上传后重启 OGX 仍可读取 | 文件字节与元数据一致 |
 | 原文后端 | 分别用本地持久卷与 S3-compatible 配置执行同一 Ingest/File 生命周期 | 两种部署返回相同公开对象与状态，不向产品暴露路径、Bucket 或后端差异 |
 | 解析与切块 | Docling + HybridChunker 处理目标格式 | Chunk 有稳定内容、顺序和定位信息 |
 | Dense | 语义查询可召回相关 Chunk | 结果、分数和来源可解析 |
 | BM25 | 中文关键词和标识符可按相关性排序 | 不是固定分数或文本 Filter 冒充 BM25 |
-| Hybrid | Dense + BM25 使用相同 Filter 并由 Qdrant RRF 融合 | 结果顺序可复现，无越权候选 |
+| Hybrid | 每 KB 的 Dense + BM25 使用相同 Filter 并由 Qdrant 内层 RRF 融合 | 本地结果顺序可复现，无越权候选 |
+| 单 KB Search | Stella 隐藏 KB 或企业版只挂载一个 KB | 绕过外层 RRF，排名和分数等于该 KB 的最终阶段输出 |
+| 跨 KB 融合 | 各 KB 可使用不同 Embedding/Rerank 配置 | Python 等权外层 RRF 稳定；同名次按请求 KB 顺序；不比较不同模型原始分数 |
 | Stella 四级范围 | 覆盖四级正向和反向矩阵 | 不漏掉合法范围，不返回非法范围 |
-| 企业版多知识库 | 同一查询过滤多个 `vector_store_id` | 一次 Qdrant 查询得到融合结果 |
-| 新增知识库 | 已有 Collection 中创建新 VectorStore | 不新增 Collection，不重建 Payload Index |
+| 企业版多知识库 | 同一查询挂载多个 `vector_store_id` | 每 KB 分支并行完成基础检索与可选 Rerank，最后外层 RRF；任一必需分支失败不返回部分结果 |
+| 新增知识库 | 已有 Collection 中创建新 VectorStore | 不新增 Collection；新模型/维度幂等增加 Named Vector，相同模型/维度不重复创建 HNSW |
 | 多重挂载 | 同一 File 挂载两个 VectorStore | Point 不互相覆盖，删除一侧不影响另一侧 |
 | 删除 | 删除挂载、File 和 VectorStore | Qdrant、PostgreSQL、原文符合预期生命周期 |
 | 无效文件回收 | 覆盖未完成提交、最终失败、孤儿 File、多重挂载和清理中重启 | 未到保留期不误删；到期对象最终清理；仍有引用的原文保留；清理重复执行结果一致 |
@@ -694,19 +699,22 @@ FILE_CLEANUP_INTERVAL_HOURS=24
 | 产品生成错误 Filter | 可能漏数据或越权 | 产品只从可信身份生成；服务校验语法和保留字段；为 Stella 与企业版权限矩阵建立契约测试 |
 | 租户提交恶意或错误的模型 URL | 可能产生 SSRF、访问云元数据或把请求发往非预期内网服务 | Admin Token 保护配置接口；规范化 URL；默认 HTTPS；阻断 loopback/link-local/私网和重定向绕过；内部服务必须由部署 allowlist 显式放行 |
 | 新增高频过滤字段 | 已有 Collection 可能需要索引迁移和 HNSW 优化 | 常用字段在建 Collection 前声明；字段变更走显式迁移，不与“新增知识库值”混淆 |
-| 已有数据直接更换 Embedding 模型 | 即使维度相同，新旧向量空间通常也不兼容；OGX VectorStore 还会保存原模型 ID | 当前不支持，也不纳入本期；若未来提出该需求，再单独设计 |
-| OGX 模型注册信息与配置漂移 | 原地修改模型后可能因自动发现记录类型冲突而启动失败 | 模型迁移同时处理 PostgreSQL Registry 与 Qdrant 全量重建；不把修改环境变量当成完整迁移 |
-| 租户模型资源映射或凭证解析错误 | 可能使用错误租户的 Key、产生账单归属错误或串用向量空间 | 内部模型资源只引用 opaque Profile ID；Provider 强制校验资源类型和 tenant_id；建立双租户正反向契约测试，日志永不输出凭证 |
-| 租户 Rerank Key 失效、模型不可用或请求超时 | 该租户 Hybrid 排序效果暂时退化 | 每次 Search 读取租户配置快照；失败时保留 Qdrant RRF Top K，并记录不含凭证的租户级错误和指标 |
+| 已有数据直接更换 Embedding 模型 | 即使维度相同，新旧向量空间通常也不兼容；OGX VectorStore 还会保存原模型 ID | 当前不支持，也不纳入本期；已有文件后拒绝修改模型或维度，不实现全量重新向量化 |
+| OGX 内部模型资源与 KB 配置漂移 | 可能在导入或检索时解析到错误模型，或因资源记录冲突而失败 | 把 KB 配置作为权威来源并校验内部资源映射；不允许通过修改环境变量绕过 KnowledgeBase 配置更新接口 |
+| KB 模型资源映射或凭证解析错误 | 可能使用错误 KB 的 Key、产生账单归属错误或串用向量空间 | 内部模型资源只引用 opaque KB Profile ID；Provider 强制校验资源类型、knowledge_base_id 和 tenant_id；建立同租户多 KB 正反向契约测试，日志永不输出凭证 |
+| 相同模型 ID 在不同 NewAPI 中实际指向不同模型 | 相同维度但向量空间不兼容，混入共享 HNSW 后检索质量失真 | 把模型 ID 语义一致性作为 NewAPI 部署契约；Named Vector 只按模型 ID 与维度划分，本期不增加兼容性探测 |
+| 同一租户使用过多不同 Embedding 模型或维度 | 每种向量空间都有独立 HNSW，增加 Collection Schema、内存、磁盘和运维复杂度 | V1 不猜测硬上限；压测不同向量空间数量并记录资源曲线，生产部署再据证据配置租户级上限 |
+| 单个 KB Rerank Key 失效、模型不可用或请求超时 | 该 KB 的 Hybrid 排序效果暂时退化 | 每次 Search 读取 KB 配置快照；失败时保留该 KB 内层 RRF 排名并记录不含凭证的错误和指标 |
+| 跨 KB 并行分支过多 | 模型调用数量、Qdrant 请求和候选总量随挂载 KB 数增加 | 使用部署级并发与候选上限；保持公开 `limit` 语义不变；通过多 KB 压测确定默认值 |
 | OGX 上游变化 | 升级可能破坏 Provider 契约 | 固定 v1.3.0；升级必须通过兼容性测试，允许选择不跟进 |
 | 单实例限制 | 无法独立横向扩展 API 和导入吞吐 | 当前客户部署和规模接受；多副本成为需求时重新设计 |
-| 公开仓库或日志泄露凭证，或遗漏第三方许可声明 | 安全与合规风险 | Runtime/Admin Token 和 Master Key 只从环境/Secret 注入；租户 Key 只以密文保存；不提交真实 Endpoint Token；项目采用 MIT License，复用第三方代码时保留其许可声明 |
+| 公开仓库或日志泄露凭证，或遗漏第三方许可声明 | 安全与合规风险 | Runtime/Admin Token 和 Master Key 只从环境/Secret 注入；KnowledgeBase Key 只以密文保存；不提交真实 Endpoint Token；项目采用 MIT License，复用第三方代码时保留其许可声明 |
 
 ## 11. 方案收敛状态
 
-当前没有会改变 OGX + Qdrant 架构或公开接口的未决项。本地持久卷与 S3-compatible 原文存储都作为正式部署选项提供，不再作为二选一的方案问题；具体客户环境只需在首次使用前选择对应 Files Provider 配置。
+新的企业版需求已经实现为：每个逻辑 KnowledgeBase 独立配置 Embedding 与可选 Rerank；同租户仍共用一个 Qdrant Collection；Dense Named Vector 只按 `model_id + dimension` 划分；单 KB Search 直接返回本地最终排名，只有跨 KB Search 才分别执行本地召回和可选 Rerank，再由 Python Search 层做等权外层 RRF。本地持久卷与 S3-compatible 原文存储继续作为正式部署选项，不受本次变化影响。
 
-MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。这一轮用于验证模型服务兼容性、维度配置和检索链路，不用于在架构阶段固定具体模型。目标产品接口已把 Rerank 固定在 Qdrant RRF 之后，并实现每租户独立 URL、Key、模型和开关，不设全局唯一模型；远程 Rerank 失败时降级返回 RRF 结果。
+MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。增量实现又使用同租户 3/5/7 维独立 KB、不同 Embedding/Rerank 凭证和可选 Rerank 完成接口、动态 Named Vector、单 KB 排名与跨 KB 外层 RRF 验收；真实多模型的跨库效果评测仍属于后续调优，不阻塞当前功能完整性。
 
 Qdrant Server 已固定为 `1.18.2`，qdrant-client 已固定为 `1.18.0`；真实探针已覆盖 IDF Sparse、Payload Filter、Query API 和原生 RRF，因此版本能力不再是未决项。
 
@@ -730,9 +738,9 @@ Qdrant Server 已固定为 `1.18.2`，qdrant-client 已固定为 `1.18.0`；真�
 - `src/`、`config/`、`pyproject.toml` 和 `uv.lock`：全部业务实现、OGX 配置和锁定依赖。
 - `Dockerfile` 与 `compose.yaml`：从当前源码构建 Knowledge，并启动固定版本的 PostgreSQL/Qdrant。
 - `.env.example`：部署参数、模型地址白名单、本地/S3 原文后端和保留期默认值。
-- `scripts/init-env.sh`、`build-production-image.sh`、`doctor.sh` 与 `configure-tenant.sh`：初始化 Secret、构建、诊断和租户模型配置。
+- `scripts/init-env.sh`、`build-production-image.sh` 与 `doctor.sh`：初始化 Secret、构建和诊断。KnowledgeBase 创建及模型配置通过 Admin API 和对应请求示例完成，不再以租户级模型配置脚本作为正式入口。
 
-仓库根目录 `README.md` 是交接和启动的首要入口，必须直接说明系统要求、源码构建命令、端口与持久卷、首次租户模型配置、健康检查和故障排查入口。使用方不需要在宿主机安装 Python 或 uv；这些工具只在 Docker 构建阶段使用。
+仓库根目录 `README.md` 是交接和启动的首要入口，必须直接说明系统要求、源码构建命令、端口与持久卷、KnowledgeBase 模型配置、健康检查和故障排查入口。使用方不需要在宿主机安装 Python 或 uv；这些工具只在 Docker 构建阶段使用。
 
 PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像。交付脚本避免依赖 GNU 专属命令，并兼容 macOS 自带 Bash 3.2；首个正式发布平台仍以已验证的 Linux amd64 为准，只有在对应真机上完成相同构建、启动和全链路测试后才声明正式支持 macOS arm64。
 
@@ -753,7 +761,7 @@ docker compose up -d
 
 `build-production-image.sh` 先验证固定 revision 的 Docling 模型资产端点，再构建当前源码。Dockerfile 把第三方依赖与 Docling 模型放在业务源码之前的缓存层；普通 Provider/API 修改重新构建时不会重复下载这些大体积资产。
 
-`doctor.sh` 检查三个容器健康状态、统一 Knowledge API、PostgreSQL、Qdrant 以及必要配置，不输出 Secret。模型 URL、Key、模型 ID 和维度仍通过租户 Admin API 提交；`configure-tenant.sh` 只辅助提交明确配置，不发现或推荐模型。
+`doctor.sh` 检查三个容器健康状态、统一 Knowledge API、PostgreSQL、Qdrant 以及必要配置，不输出 Secret。模型 URL、Key、模型 ID 和可选维度在创建或更新技术 KnowledgeBase 时通过 Admin API 提交；服务不发现、推荐或代替产品选择模型。
 
 默认 Compose 只对调用方暴露 Knowledge API。PostgreSQL 和 Qdrant 不暴露到公网；跨主机调用时由部署方接入已有反向代理和 HTTPS，不为快速启动额外引入第四个代理容器。
 
@@ -763,7 +771,7 @@ docker compose up -d
 
 交接时应记录经过验证的 Git commit。普通升级流程为备份、切换到目标 commit、重新构建 Knowledge 镜像、`docker compose up -d` 和 `doctor.sh`；涉及 PostgreSQL 状态格式、Qdrant Collection 或模型资产变化时必须提供显式迁移说明，不允许只更新源码后静默修改数据。
 
-交付前至少验证：从全新源码副本完成 Secret 初始化、镜像构建、三服务启动、首次租户配置、KnowledgeBase 创建、Ingest、Operation 轮询、Search、删除、重启恢复和无效文件回收；同时验证已有数据环境切换目标 commit 并重建后仍可检索。
+交付前至少验证：从全新源码副本完成 Secret 初始化、镜像构建、三服务启动、带独立模型配置的 KnowledgeBase 创建、Ingest、Operation 轮询、单 KB 与跨 KB Search、删除、重启恢复和无效文件回收；同时验证已有数据环境切换目标 commit 并重建后仍可检索。
 
 ## 13. 参考事实来源
 
@@ -774,6 +782,7 @@ docker compose up -d
 - [OGX Docling Provider](https://github.com/ogx-ai/ogx/tree/v1.3.0/src/ogx/providers/inline/file_processor/docling)
 - [Qdrant Filtering](https://qdrant.tech/documentation/search/filtering/)
 - [Qdrant Payload Indexing](https://qdrant.tech/documentation/manage-data/indexing/)
+- [Qdrant Named Vectors 与动态 Schema](https://qdrant.tech/documentation/manage-data/vectors/)
 - [Qdrant Hybrid Queries 与 RRF](https://qdrant.tech/documentation/search/hybrid-queries/)
 - [Qdrant Text Search](https://qdrant.tech/documentation/search/text-search/)
 - [Docling HybridChunker](https://docling-project.github.io/docling/_generated/examples/hybrid_chunking/)

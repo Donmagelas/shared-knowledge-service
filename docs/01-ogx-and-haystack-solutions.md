@@ -13,7 +13,7 @@
 ```text
 Stella / Cherry Studio 企业版
         ↓ 统一 Knowledge API
-KnowledgeBase、File、任务状态与租户模型配置
+KnowledgeBase、File、任务状态与每库模型配置
         ↓
 原文件存储 → 文档解析 → 切块 → Embedding → 索引
         ↓
@@ -47,7 +47,7 @@ OGX `1.3.0` 可直接提供：
 | 文件与索引关系 | `VectorStoreFile` | 记录某个 File 是否已进入某个逻辑索引 |
 | 批量处理对象 | `FileBatch` | 表达异步处理状态和文件级失败 |
 | 文件处理 | File Processor Provider | 可接入内置 Docling Provider |
-| 模型调用 | Inference Router / Provider | 可把租户模型配置隐藏在内部模型资源后面 |
+| 模型调用 | Inference Router / Provider | 可把每个 KnowledgeBase 的模型配置隐藏在内部模型资源后面 |
 | 向量存储 | VectorIO Provider | 可接 Qdrant、Weaviate、pgvector 等后端 |
 | 后台解析任务 | PostgreSQL 持久任务池 | 文件解析不阻塞 HTTP 请求，可在单实例重启后恢复 |
 | 服务与配置 | Distribution YAML、FastAPI Server | 能裁剪出只启用知识库相关能力的 Distribution |
@@ -67,7 +67,7 @@ OGX Files 保存原文件
         ↓
 OGX 持久任务：Docling 解析 + HybridChunker
         ↓
-OGX Inference Router → 租户 Embedding Provider
+OGX Inference Router → KnowledgeBase Embedding Provider
         ↓
 自定义 Qdrant VectorIO Provider
         ↓
@@ -83,11 +83,13 @@ POST /knowledge/v1/search
         ↓
 根据 KnowledgeBase 反查租户和向量空间
         ↓
-强制组合：vector_store_id IN (...) AND 产品 filters
+每个 KnowledgeBase 强制组合：vector_store_id = 当前库 AND 产品 filters
         ↓
-同一 Qdrant Collection 内执行 Dense / BM25 / Hybrid RRF
+每个库使用自己的 Named Vector 执行 Dense / BM25 / Hybrid 内层 RRF
         ↓
-可选租户远程 Rerank；失败时降级为 RRF
+每库可选远程 Rerank；失败时局部降级为内层 RRF
+        ↓
+多库结果在 Python Search 层做等权外层 RRF
         ↓
 转换成稳定 SearchHit[]
 ```
@@ -97,8 +99,9 @@ POST /knowledge/v1/search
 | 需要维护的部分 | 原因 |
 | --- | --- |
 | 统一 Knowledge API | OGX 原生 API 暴露 File、VectorStore、FileBatch 细节，不是两侧稳定产品契约 |
-| 自定义 Qdrant Provider | OGX 原生 Provider 不直接满足每租户 Collection、逻辑库 Payload 隔离、通用 Filter、原生 BM25 和一次跨逻辑库查询 |
-| 租户感知 Inference Provider | 两个产品需要每租户独立 Embedding/Rerank URL、Key 和模型 |
+| 自定义 Qdrant Provider | OGX 原生 Provider 不直接满足每租户 Collection、逻辑库 Payload 隔离、动态 Named Vector、通用 Filter 和原生 BM25 |
+| KnowledgeBase 感知 Inference Provider | 企业版要求每个逻辑知识库独立选择 Embedding/Rerank URL、Key、模型和维度 |
+| 跨库 Search 编排 | 各库模型和局部排名可能不同，需要独立检索/可选 Rerank 后做等权外层 RRF |
 | 产品对象映射 | OGX 不理解 Stella 四级范围或企业版业务知识库挂载 |
 | 补充幂等、重试和删除语义 | 原生 FileBatch 不足以形成稳定的产品 Operation 契约 |
 | 凭证、认证和错误协议 | 需要对产品提供不泄露内部实现的稳定边界 |
@@ -195,7 +198,7 @@ Sparse/BM25 Query Component ─┼→ Qdrant Hybrid Retriever / 自定义融合
 | 原文件本地/S3 存储及引用生命周期 | 不提供统一产品层实现 |
 | 异步任务、重试、租约、取消和崩溃恢复 | Pipeline 本身不提供持久任务语义 |
 | FastAPI 产品契约、认证、幂等与错误码 | 不提供；Hayhooks 只能减少暴露 Pipeline 的样板代码 |
-| 租户模型配置、凭证加密和向量空间锁定 | 不提供 |
+| KnowledgeBase 模型配置、凭证加密和向量空间锁定 | 不提供 |
 | 租户 Collection 路由和业务 KnowledgeBase 映射 | 需要自行设计 |
 | Qdrant Payload 结构和强制权限范围 | 需要配置集成或自定义组件 |
 | 文件清理、整库删除和状态对账 | 需要自行实现 |
@@ -222,9 +225,9 @@ Sparse/BM25 Query Component ─┼→ Qdrant Hybrid Retriever / 自定义融合
 | 原文件本地/S3 | Files Provider 可选 | 自建适配或直接调用对象存储 SDK |
 | Docling | 内置 Provider | 官方 Docling 集成组件 |
 | 切块自由度 | 受 OGX Docling Provider 接口约束 | Pipeline 中可完全显式替换 |
-| Embedding 路由 | Inference Router；租户化需自定义 Provider | 选择 Embedder 或自定义组件 |
+| Embedding 路由 | Inference Router；每库配置需自定义 Provider | 选择 Embedder 或自定义组件 |
 | Qdrant | 需要自定义 Provider 才满足当前数据组织 | 官方 QdrantDocumentStore/Retriever 可作为基础，特殊组织仍可能扩展 |
-| Dense + Sparse + RRF | 自定义 Provider 中使用一次 Qdrant Query | QdrantHybridRetriever 已提供；也可自行编排两路检索 |
+| Dense + Sparse + RRF | 单库由 Qdrant 内层 RRF，多库由 Python 外层 RRF | QdrantHybridRetriever 已提供；跨库融合仍需自行编排 |
 | 产品稳定 API | 包装 OGX 原生对象 | 自建或用 Hayhooks 辅助暴露 Pipeline |
 | 权限业务模型 | 产品负责 | 产品负责 |
 | 初次成本 | 较低到中等 | 较高 |

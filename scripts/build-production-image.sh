@@ -34,7 +34,9 @@ resolved_value() {
     printf '%s' "${compose_value:-${default_value}}"
 }
 
-preferred_endpoint="$(resolved_value HF_ENDPOINT https://huggingface.co)"
+# 默认与 Compose/.env.example 保持一致，直接使用当前部署网络验证过的兼容镜像。
+# 只有部署方显式设置 HF_ENDPOINT 时才改用官方站点或内部制品库。
+preferred_endpoint="$(resolved_value HF_ENDPOINT https://hf-mirror.com)"
 fallback_endpoint="$(resolved_value HF_FALLBACK_ENDPOINT https://hf-mirror.com)"
 tokenizer_model="$(resolved_value DOCLING_TOKENIZER_MODEL sentence-transformers/all-MiniLM-L6-v2)"
 tokenizer_revision="$(resolved_value DOCLING_TOKENIZER_REVISION 1110a243fdf4706b3f48f1d95db1a4f5529b4d41)"
@@ -84,7 +86,7 @@ fallback_endpoint="$(normalize_endpoint "${fallback_endpoint}")"
 
 if probe_endpoint "${preferred_endpoint}"; then
     selected_endpoint="${preferred_endpoint}"
-    echo "官方或显式配置的 Hugging Face 端点可用。"
+    echo "默认或显式配置的 Hugging Face 端点可用。"
 elif [[ "${fallback_endpoint}" != "${preferred_endpoint}" ]]; then
     echo "首选 Hugging Face 端点不可达，尝试兼容镜像：${fallback_endpoint}" >&2
     if probe_endpoint "${fallback_endpoint}"; then

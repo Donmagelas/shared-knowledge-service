@@ -85,35 +85,37 @@ def _minimal_text_pdf() -> bytes:
 
 
 def _create_vector_store(client: httpx.Client, *, tenant_id: str = "e2e-default") -> str:
-    configure = client.put(
-        f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
-        json={
-            "base_url": "http://embedding-stub:18080/v1",
-            "api_key": "native-e2e-secret",
-            "model_id": "deterministic-test",
-            "dimension": 3,
-        },
-    )
-    configure.raise_for_status()
+    rerank: dict[str, str] | None = None
     if os.environ.get("E2E_EXPECT_RERANK", "1") == "1":
-        # 只有显式配置租户 Rerank 后，hybrid 检索才应调用远程重排服务。
-        rerank_configure = client.put(
-            f"/knowledge/v1/tenants/{tenant_id}/rerank-config",
-            json={
-                "enabled": True,
-                "base_url": "http://embedding-stub:18080/v1",
-                "api_key": "native-e2e-rerank-secret",
-                "model_id": "deterministic-rerank",
-            },
-        )
-        rerank_configure.raise_for_status()
+        # 只有在创建目标 KB 时显式提交 Rerank，hybrid 检索才调用远程重排服务。
+        rerank = {
+            "base_url": "http://embedding-stub:18080/v1",
+            "api_key": "native-e2e-rerank-secret",
+            "model_id": "deterministic-rerank",
+        }
     response = client.post(
         "/knowledge/v1/knowledge-bases",
         headers={"Idempotency-Key": f"native-create-{uuid.uuid4()}"},
-        json={"tenant_id": tenant_id},
+        json={
+            "tenant_id": tenant_id,
+            "embedding": {
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "native-e2e-secret",
+                "model_id": "deterministic-test",
+                "dimension": 3,
+            },
+            "rerank": rerank,
+        },
     )
     response.raise_for_status()
     return str(response.json()["knowledge_base_id"])
+
+
+def _delete_vector_store(client: httpx.Client, vector_store_id: str) -> None:
+    """通过统一生命周期删除 KB，避免原生接口绕过 Profile 与幂等映射清理。"""
+
+    response = client.delete(f"/knowledge/v1/knowledge-bases/{vector_store_id}")
+    assert response.status_code == 204, response.text
 
 
 def _attach_file(
@@ -327,8 +329,7 @@ def test_native_file_ingestion_and_hybrid_search() -> None:
         assert all(item["attributes"]["department_id"] == "product-a" for item in response["data"])
     finally:
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -412,10 +413,21 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
             for hit in hits
         )
         if os.environ.get("E2E_EXPECT_RERANK", "1") == "1":
-            # 测试 Reranker 返回 1000 起始的特殊分数，避免把 Qdrant RRF 分数误判为已完成远程重排。
-            assert hits[0]["score"] == 1000.0
+            # 跨 KB 响应必须是外层 RRF 分数；单 KB 才保留远程 Rerank 的本地最终分数。
+            assert all(0 < hit["score"] < 1 for hit in hits)
+            local_reranked = client.post(
+                "/knowledge/v1/search",
+                json={
+                    "query": "退款申请需要什么材料",
+                    "knowledge_base_ids": [company_store],
+                    "mode": "hybrid",
+                    "limit": 10,
+                },
+            )
+            local_reranked.raise_for_status()
+            assert local_reranked.json()["hits"][0]["score"] == 1000.0
         else:
-            assert hits[0]["score"] != 1000.0
+            assert all(hit["score"] != 1000.0 for hit in hits)
 
         # Stub 只是文本哈希，不具备语义相似性；用已命中原文验证 Dense 协议，避免把随机余弦当效果评测。
         exact_chunk_text = hits[0]["content"]
@@ -447,8 +459,7 @@ def test_unified_api_ingests_and_searches_multiple_knowledge_bases_once() -> Non
         assert all(hit["attributes"]["department_id"] == "product-a" for hit in filtered_hits)
     finally:
         for vector_store_id in vector_store_ids:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         for file_id in file_ids:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -488,8 +499,7 @@ def test_multiple_async_ingests_complete_without_losing_files() -> None:
         assert {item["file_id"] for item in submitted} <= {item["id"] for item in listed.json()["data"]}
     finally:
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         for item in submitted:
             delete_file = client.delete(f"/v1/files/{item['file_id']}")
             assert delete_file.status_code in {200, 404}
@@ -536,8 +546,7 @@ def test_unified_api_allows_same_tenant_and_rejects_cross_tenant_search() -> Non
         assert "不能跨租户 Collection" in cross_tenant.text
     finally:
         for vector_store_id in vector_store_ids:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         client.close()
 
 
@@ -568,8 +577,7 @@ def test_digital_pdf_is_parsed_and_searchable() -> None:
         assert any("order number" in item["content"][0]["text"].lower() for item in response["data"])
     finally:
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -602,14 +610,12 @@ def test_one_file_can_be_attached_to_two_vector_stores_and_deleted_by_scope() ->
         assert not _search(client, first_store, department_id="product-a")["data"]
         assert _search(client, second_store, department_id="product-b")["data"]
 
-        delete_first = client.delete(f"/v1/vector_stores/{first_store}")
-        delete_first.raise_for_status()
+        _delete_vector_store(client, first_store)
         vector_store_ids.remove(first_store)
         assert _search(client, second_store, department_id="product-b")["data"]
     finally:
         for vector_store_id in vector_store_ids:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -647,8 +653,7 @@ def test_completed_data_survives_each_service_restart() -> None:
             assert after["data"], f"{service} 重启后检索结果丢失"
     finally:
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -691,8 +696,7 @@ def test_failed_attachment_can_be_deleted_and_retried() -> None:
     finally:
         _set_embedding_stub_failure(False)
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}
@@ -747,8 +751,7 @@ def test_async_ingest_resumes_after_ogx_restart() -> None:
         assert result["data"]
     finally:
         if vector_store_id is not None:
-            delete_vector_store = client.delete(f"/v1/vector_stores/{vector_store_id}")
-            assert delete_vector_store.status_code in {200, 404}
+            _delete_vector_store(client, vector_store_id)
         if file_id is not None:
             delete_file = client.delete(f"/v1/files/{file_id}")
             assert delete_file.status_code in {200, 404}

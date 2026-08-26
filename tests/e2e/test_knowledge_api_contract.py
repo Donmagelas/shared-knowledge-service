@@ -38,30 +38,35 @@ def _fixture_bytes() -> bytes:
     return (Path(__file__).parents[1] / "fixtures" / "knowledge.md").read_bytes()
 
 
-def _configure_embedding(client: httpx.Client, tenant_id: str, *, api_key: str = "embedding-secret") -> None:
-    response = client.put(
-        f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
-        headers=_admin_headers(),
-        json={
-            "base_url": "http://embedding-stub:18080/v1",
-            "api_key": api_key,
-            "model_id": "deterministic-test",
-            "dimension": 3,
-        },
-    )
-    response.raise_for_status()
-    assert response.json()["credential_configured"] is True
-    assert api_key not in response.text
+def _create_knowledge_base(
+    client: httpx.Client,
+    tenant_id: str,
+    *,
+    key: str | None = None,
+    embedding_key: str = "embedding-secret",
+    embedding_model: str = "deterministic-test",
+    dimension: int | None = 3,
+    rerank: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """按正式契约一次创建 KB 及其独立 Embedding/可选 Rerank 配置。"""
 
-
-def _create_knowledge_base(client: httpx.Client, tenant_id: str, *, key: str | None = None) -> dict[str, Any]:
+    embedding: dict[str, Any] = {
+        "base_url": "http://embedding-stub:18080/v1",
+        "api_key": embedding_key,
+        "model_id": embedding_model,
+    }
+    if dimension is not None:
+        embedding["dimension"] = dimension
     response = client.post(
         "/knowledge/v1/knowledge-bases",
         headers=_runtime_headers(**{"Idempotency-Key": key or f"create-{uuid.uuid4()}"}),
-        json={"tenant_id": tenant_id},
+        json={"tenant_id": tenant_id, "embedding": embedding, "rerank": rerank},
     )
     response.raise_for_status()
     assert response.status_code in {200, 201}
+    assert embedding_key not in response.text
+    if rerank is not None:
+        assert rerank["api_key"] not in response.text
     return response.json()
 
 
@@ -131,10 +136,21 @@ def _set_embedding_stub_failure(enabled: bool) -> None:
 
 def test_authentication_and_credential_endpoints_do_not_leak_keys() -> None:
     tenant_id = f"auth-{uuid.uuid4().hex[:10]}"
+    knowledge_base_id: str | None = None
     with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as client:
-        unauthenticated = client.get(f"/knowledge/v1/tenants/{tenant_id}/embedding-config")
+        created = _create_knowledge_base(
+            client,
+            tenant_id,
+            embedding_key="tenant-embedding-private",
+            dimension=None,
+        )
+        knowledge_base_id = str(created["knowledge_base_id"])
+        assert created["embedding"]["dimension"] == 3
+
+        path = f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config"
+        unauthenticated = client.get(path)
         runtime_only = client.get(
-            f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
+            path,
             headers=_runtime_headers(),
         )
 
@@ -143,14 +159,14 @@ def test_authentication_and_credential_endpoints_do_not_leak_keys() -> None:
         assert runtime_only.status_code == 403
         assert runtime_only.json()["error"]["code"] == "admin_token_required"
 
-        _configure_embedding(client, tenant_id, api_key="tenant-embedding-private")
         configured = client.get(
-            f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
+            path,
             headers=_admin_headers(),
         )
         configured.raise_for_status()
         assert "tenant-embedding-private" not in configured.text
-        assert set(configured.json()) == {
+        assert configured.json()["knowledge_base_id"] == knowledge_base_id
+        assert set(configured.json()["embedding"]) == {
             "base_url",
             "model_id",
             "dimension",
@@ -158,6 +174,11 @@ def test_authentication_and_credential_endpoints_do_not_leak_keys() -> None:
             "locked",
             "updated_at",
         }
+        _delete_knowledge_base(client, knowledge_base_id)
+        knowledge_base_id = None
+    if knowledge_base_id is not None:
+        with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as cleanup_client:
+            _delete_knowledge_base(cleanup_client, knowledge_base_id)
 
 
 def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_is_admin_only() -> None:
@@ -166,10 +187,11 @@ def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_
         schema.raise_for_status()
         paths = set(schema.json()["paths"])
         expected = {
-            "/knowledge/v1/tenants/{tenant_id}/embedding-config",
-            "/knowledge/v1/tenants/{tenant_id}/rerank-config",
             "/knowledge/v1/knowledge-bases",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}",
+            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config",
+            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
+            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
             "/knowledge/v1/ingest",
             "/knowledge/v1/operations/{operation_id}",
             "/knowledge/v1/operations/{operation_id}/retry",
@@ -181,6 +203,7 @@ def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_
         assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}" not in paths
         assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/operations/{operation_id}/retry" not in paths
         assert "/knowledge/v1/internal/auth/validate" not in paths
+        assert not any(path.startswith("/knowledge/v1/tenants/") for path in paths)
         assert not any(
             path.startswith(prefix)
             for prefix in ("/v1/agents", "/v1/responses", "/v1/messages", "/v1/tools", "/v1/evals")
@@ -199,7 +222,6 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
     ingest_key = f"ingest-{uuid.uuid4()}"
     knowledge_base_id: str | None = None
     with httpx.Client(base_url=_base_url(), timeout=120, trust_env=False) as client:
-        _configure_embedding(client, tenant_id)
         created = _create_knowledge_base(client, tenant_id, key=create_key)
         knowledge_base_id = str(created["knowledge_base_id"])
         replayed_create = _create_knowledge_base(client, tenant_id, key=create_key)
@@ -300,7 +322,7 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
         assert detail.json()["knowledge_base_id"] == knowledge_base_id
 
         rerank_config = client.put(
-            f"/knowledge/v1/tenants/{tenant_id}/rerank-config",
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
             headers=_admin_headers(),
             json={
                 "enabled": True,
@@ -320,7 +342,7 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
         assert reranked.json()["hits"][0]["score"] == 1000.0
 
         rotated = client.put(
-            f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
             headers=_admin_headers(),
             json={
                 "base_url": "http://embedding-stub:18080/v1",
@@ -332,7 +354,7 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
         rotated.raise_for_status()
         assert rotated.json()["locked"] is True
         forbidden_model_change = client.put(
-            f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
             headers=_admin_headers(),
             json={
                 "base_url": "http://embedding-stub:18080/v1",
@@ -382,11 +404,35 @@ def test_same_tenant_multi_knowledge_base_and_cross_tenant_rejection() -> None:
     tenant_b = f"tenant-b-{uuid.uuid4().hex[:8]}"
     knowledge_base_ids: list[str] = []
     with httpx.Client(base_url=_base_url(), timeout=120, trust_env=False) as client:
-        _configure_embedding(client, tenant_a, api_key="tenant-a-key")
-        _configure_embedding(client, tenant_b, api_key="tenant-b-key")
-        first = str(_create_knowledge_base(client, tenant_a)["knowledge_base_id"])
-        second = str(_create_knowledge_base(client, tenant_a)["knowledge_base_id"])
-        other = str(_create_knowledge_base(client, tenant_b)["knowledge_base_id"])
+        first = str(
+            _create_knowledge_base(
+                client,
+                tenant_a,
+                embedding_key="embedding-key-a",
+                embedding_model="keyed-embedding-a",
+                dimension=3,
+                rerank={
+                    "base_url": "http://embedding-stub:18080/v1",
+                    "api_key": "rerank-key-a",
+                    "model_id": "keyed-rerank-a",
+                },
+            )["knowledge_base_id"]
+        )
+        second = str(
+            _create_knowledge_base(
+                client,
+                tenant_a,
+                embedding_key="embedding-key-b",
+                embedding_model="keyed-embedding-b",
+                dimension=5,
+                rerank={
+                    "base_url": "http://embedding-stub:18080/v1",
+                    "api_key": "rerank-key-b",
+                    "model_id": "keyed-rerank-b",
+                },
+            )["knowledge_base_id"]
+        )
+        other = str(_create_knowledge_base(client, tenant_b, embedding_key="tenant-b-key")["knowledge_base_id"])
         knowledge_base_ids.extend([first, second, other])
 
         for knowledge_base_id, department in ((first, "company"), (second, "product-a"), (other, "other")):
@@ -401,6 +447,16 @@ def test_same_tenant_multi_knowledge_base_and_cross_tenant_rejection() -> None:
             terminal = _wait_operation(client, accepted.json()["operation_id"])
             assert terminal["status"] == "completed", terminal
 
+        # 两个单 KB 请求分别经过自己的 Embedding 与 Rerank 凭证；测试桩会拒绝串用 Key。
+        for knowledge_base_id in (first, second):
+            local = client.post(
+                "/knowledge/v1/search",
+                headers=_runtime_headers(),
+                json={"query": "退款", "knowledge_base_ids": [knowledge_base_id], "mode": "hybrid"},
+            )
+            local.raise_for_status()
+            assert local.json()["hits"][0]["score"] == 1000.0
+
         same_tenant = client.post(
             "/knowledge/v1/search",
             headers=_runtime_headers(),
@@ -408,6 +464,7 @@ def test_same_tenant_multi_knowledge_base_and_cross_tenant_rejection() -> None:
         )
         same_tenant.raise_for_status()
         assert {hit["knowledge_base_id"] for hit in same_tenant.json()["hits"]} == {first, second}
+        assert all(0 < hit["score"] < 1 for hit in same_tenant.json()["hits"])
 
         cross_tenant = client.post(
             "/knowledge/v1/search",
@@ -426,6 +483,155 @@ def test_same_tenant_multi_knowledge_base_and_cross_tenant_rejection() -> None:
                 _delete_knowledge_base(cleanup_client, knowledge_base_id)
 
 
+def test_empty_kb_model_updates_lock_after_ingest_and_rerank_can_be_disabled() -> None:
+    tenant_id = f"lifecycle-{uuid.uuid4().hex[:10]}"
+    knowledge_base_id: str | None = None
+    with httpx.Client(base_url=_base_url(), timeout=120, trust_env=False) as client:
+        created = _create_knowledge_base(client, tenant_id, dimension=3)
+        knowledge_base_id = str(created["knowledge_base_id"])
+
+        changed = client.put(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
+            headers=_admin_headers(),
+            json={
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "embedding-v2-secret",
+                "model_id": "deterministic-v2",
+                "dimension": 5,
+            },
+        )
+        changed.raise_for_status()
+        assert changed.json()["model_id"] == "deterministic-v2"
+        assert changed.json()["dimension"] == 5
+        assert changed.json()["locked"] is False
+        assert "embedding-v2-secret" not in changed.text
+
+        enabled = client.put(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
+            headers=_admin_headers(),
+            json={
+                "enabled": True,
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "rerank-v2-secret",
+                "model_id": "deterministic-rerank-v2",
+            },
+        )
+        enabled.raise_for_status()
+        assert enabled.json()["enabled"] is True
+        assert "rerank-v2-secret" not in enabled.text
+
+        accepted = _submit_ingest(
+            client,
+            knowledge_base_id,
+            key=f"ingest-{uuid.uuid4()}",
+            attributes={"department_id": "lifecycle"},
+        )
+        accepted.raise_for_status()
+        completed = _wait_operation(client, accepted.json()["operation_id"])
+        assert completed["status"] == "completed", completed
+        reranked = client.post(
+            "/knowledge/v1/search",
+            headers=_runtime_headers(),
+            json={"query": "退款", "knowledge_base_ids": [knowledge_base_id], "mode": "hybrid"},
+        )
+        reranked.raise_for_status()
+        assert reranked.json()["hits"][0]["score"] == 1000.0
+
+        rotated = client.put(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
+            headers=_admin_headers(),
+            json={
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "embedding-v2-rotated",
+                "model_id": "deterministic-v2",
+                "dimension": 5,
+            },
+        )
+        rotated.raise_for_status()
+        assert rotated.json()["locked"] is True
+
+        rejected = client.put(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
+            headers=_admin_headers(),
+            json={
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "embedding-v3-secret",
+                "model_id": "deterministic-v3",
+                "dimension": 4,
+            },
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["error"]["code"] == "embedding_config_locked"
+
+        disabled = client.put(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
+            headers=_admin_headers(),
+            json={"enabled": False},
+        )
+        disabled.raise_for_status()
+        assert disabled.json()["enabled"] is False
+        assert disabled.json()["credential_configured"] is False
+        without_rerank = client.post(
+            "/knowledge/v1/search",
+            headers=_runtime_headers(),
+            json={"query": "退款", "knowledge_base_ids": [knowledge_base_id], "mode": "hybrid"},
+        )
+        without_rerank.raise_for_status()
+        assert without_rerank.json()["hits"][0]["score"] != 1000.0
+
+        config = client.get(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config",
+            headers=_admin_headers(),
+        )
+        config.raise_for_status()
+        assert config.json()["embedding"]["model_id"] == "deterministic-v2"
+        assert config.json()["rerank"]["enabled"] is False
+
+        _delete_knowledge_base(client, knowledge_base_id)
+        assert (
+            client.get(
+                f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config",
+                headers=_admin_headers(),
+            ).status_code
+            == 404
+        )
+        knowledge_base_id = None
+    if knowledge_base_id is not None:
+        with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as cleanup_client:
+            _delete_knowledge_base(cleanup_client, knowledge_base_id)
+
+
+def test_failed_create_can_retry_same_idempotency_key_without_orphaned_profile() -> None:
+    tenant_id = f"create-failure-{uuid.uuid4().hex[:10]}"
+    idempotency_key = f"create-{uuid.uuid4()}"
+    with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as client:
+        failed = client.post(
+            "/knowledge/v1/knowledge-bases",
+            headers=_runtime_headers(**{"Idempotency-Key": idempotency_key}),
+            json={
+                "tenant_id": tenant_id,
+                "embedding": {
+                    "base_url": "http://embedding-stub:18080/v1",
+                    "api_key": "wrong-key",
+                    "model_id": "keyed-embedding-a",
+                    "dimension": 3,
+                },
+            },
+        )
+        assert failed.status_code == 502
+        assert failed.json()["error"]["code"] == "inference_rejected"
+
+        created = _create_knowledge_base(
+            client,
+            tenant_id,
+            key=idempotency_key,
+            embedding_key="embedding-key-a",
+            embedding_model="keyed-embedding-a",
+            dimension=3,
+        )
+        _delete_knowledge_base(client, str(created["knowledge_base_id"]))
+
+
 @pytest.mark.recovery
 def test_failed_operation_can_retry_once_without_reuploading_source() -> None:
     """产品只提交 Retry；服务复用原 File，并保留旧 Operation 的不可变关系。"""
@@ -437,7 +643,6 @@ def test_failed_operation_can_retry_once_without_reuploading_source() -> None:
     _set_embedding_stub_failure(False)
     try:
         with httpx.Client(base_url=_base_url(), timeout=120, trust_env=False) as client:
-            _configure_embedding(client, tenant_id)
             knowledge_base_id = str(_create_knowledge_base(client, tenant_id)["knowledge_base_id"])
 
             _set_embedding_stub_failure(True)

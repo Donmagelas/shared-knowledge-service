@@ -218,10 +218,11 @@ class DockerStatsSampler:
 class ProductSimulation:
     """建立两侧对象、执行检索矩阵并负责清理。"""
 
-    def __init__(self, base_url: str, qdrant_url: str, collection_prefix: str) -> None:
+    def __init__(self, base_url: str, qdrant_url: str, collection_prefix: str, runtime_token: str) -> None:
         self.run_id = uuid.uuid4().hex[:10]
         self.client = httpx.Client(
             base_url=base_url,
+            headers={"Authorization": f"Bearer {runtime_token}"},
             timeout=300,
             trust_env=False,
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
@@ -230,30 +231,51 @@ class ProductSimulation:
         self.collection_prefix = collection_prefix
         self.tenant_ids: set[str] = set()
         self.knowledge_base_ids: list[str] = []
-        self.file_ids: list[str] = []
         self.results: list[ScenarioResult] = []
 
-    def _create_knowledge_base(self, product: str, business_key: str, tenant_id: str) -> str:
+    def _create_knowledge_base(
+        self,
+        product: str,
+        business_key: str,
+        tenant_id: str,
+        *,
+        embedding_model: str = "deterministic-test",
+        embedding_key: str = "simulation-embedding-key",
+        dimension: int = 3,
+        rerank_model: str | None = None,
+        rerank_key: str | None = None,
+    ) -> str:
         started_at = time.perf_counter()
+        rerank = None
+        if rerank_model is not None:
+            if rerank_key is None:
+                raise ValueError("启用 Rerank 模拟时必须提供独立 Key")
+            rerank = {
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": rerank_key,
+                "model_id": rerank_model,
+            }
         response = self.client.post(
-            "/v1/vector_stores",
+            "/knowledge/v1/knowledge-bases",
+            headers={"Idempotency-Key": f"simulation-create-{self.run_id}-{product}-{business_key}"},
             json={
-                "name": f"simulation-{product}-{business_key}-{self.run_id}",
-                "metadata": {
-                    "simulation_run": self.run_id,
-                    "product": product,
-                    "business_key": business_key,
-                    "tenant_id": tenant_id,
+                "tenant_id": tenant_id,
+                "embedding": {
+                    "base_url": "http://embedding-stub:18080/v1",
+                    "api_key": embedding_key,
+                    "model_id": embedding_model,
+                    "dimension": dimension,
                 },
+                "rerank": rerank,
             },
         )
         response.raise_for_status()
-        knowledge_base_id = str(response.json()["id"])
+        knowledge_base_id = str(response.json()["knowledge_base_id"])
         self.tenant_ids.add(tenant_id)
         self.knowledge_base_ids.append(knowledge_base_id)
 
         # 企业版和 Stella 都需要持久化该映射，因此创建后立即验证可读取。
-        read_response = self.client.get(f"/v1/vector_stores/{knowledge_base_id}")
+        read_response = self.client.get(f"/knowledge/v1/knowledge-bases/{knowledge_base_id}")
         read_response.raise_for_status()
         self.results.append(
             ScenarioResult(
@@ -292,6 +314,7 @@ class ProductSimulation:
         started_at = time.perf_counter()
         response = self.client.post(
             "/knowledge/v1/ingest",
+            headers={"Idempotency-Key": f"simulation-ingest-{self.run_id}-{document_key}"},
             files={"file": (f"{document_key.replace(':', '-')}.md", content, "text/markdown")},
             data={
                 "knowledge_base_id": knowledge_base_id,
@@ -320,7 +343,6 @@ class ProductSimulation:
         else:
             raise TimeoutError(f"异步导入 {document_key} 在 300 秒内未完成")
 
-        self.file_ids.append(file_id)
         self.results.append(
             ScenarioResult(
                 product=product,
@@ -438,11 +460,35 @@ class ProductSimulation:
             tenant_id = f"enterprise-{tenant_name}-{self.run_id}"
             knowledge_bases: dict[str, str] = {}
             documents: dict[str, str] = {}
-            for business_key in ("company", "product-a", "product-b"):
+            model_configs: dict[str, dict[str, Any]] = {
+                "company": {
+                    "embedding_model": "keyed-embedding-a",
+                    "embedding_key": "embedding-key-a",
+                    "dimension": 3,
+                    "rerank_model": "keyed-rerank-a",
+                    "rerank_key": "rerank-key-a",
+                },
+                "product-a": {
+                    "embedding_model": "keyed-embedding-b",
+                    "embedding_key": "embedding-key-b",
+                    "dimension": 5,
+                    "rerank_model": "keyed-rerank-b",
+                    "rerank_key": "rerank-key-b",
+                },
+                "product-b": {
+                    "embedding_model": "deterministic-test",
+                    "embedding_key": "simulation-embedding-key",
+                    "dimension": 7,
+                    "rerank_model": None,
+                    "rerank_key": None,
+                },
+            }
+            for business_key, model_config in model_configs.items():
                 knowledge_base_id = self._create_knowledge_base(
                     "enterprise",
                     f"{tenant_name}:{business_key}",
                     tenant_id,
+                    **model_config,
                 )
                 document_key = f"enterprise:{tenant_name}:{business_key}"
                 self._ingest_document(
@@ -623,17 +669,13 @@ class ProductSimulation:
         }
 
     def cleanup(self) -> list[str]:
-        """清理本次 VectorStore、原文件和已空的测试租户 Collection。"""
+        """通过统一生命周期清理 KnowledgeBase，再删除已空的测试 Collection。"""
 
         errors: list[str] = []
         for knowledge_base_id in self.knowledge_base_ids:
-            response = self.client.delete(f"/v1/vector_stores/{knowledge_base_id}")
-            if response.status_code not in {200, 404}:
-                errors.append(f"delete vector store {knowledge_base_id}: HTTP {response.status_code}")
-        for file_id in self.file_ids:
-            response = self.client.delete(f"/v1/files/{file_id}")
-            if response.status_code not in {200, 404}:
-                errors.append(f"delete file {file_id}: HTTP {response.status_code}")
+            response = self.client.delete(f"/knowledge/v1/knowledge-bases/{knowledge_base_id}")
+            if response.status_code not in {204, 404}:
+                errors.append(f"delete knowledge base {knowledge_base_id}: HTTP {response.status_code}")
         for tenant_id in self.tenant_ids:
             collection_name = tenant_collection_name(self.collection_prefix, tenant_id)
             count_response = self.qdrant_client.post(
@@ -748,7 +790,8 @@ def _write_reports(
 ## 测试边界
 
 - Stella：一个隐藏知识库，覆盖 2 个用户 × 2 个 Agent 的四象限累加与交叉隔离。
-- 企业版：两个租户各有公司、产品 A、产品 B 三个显式知识库，覆盖单挂载、多挂载、全挂载和无挂载。
+- 企业版：两个租户各有三个显式知识库，分别使用 3/5/7 维 Embedding 和独立 Key/Rerank。
+- 企业版挂载：覆盖单库、双库、三库和无挂载。
 - 存储路由：验证每个租户对应一个 Collection，并验证一次 Search 混入两个租户的知识库时返回 422。
 - 正确性覆盖 BM25、Dense、Hybrid；并发阶段使用 Hybrid。
 - Dense 使用已命中 Chunk 原文验证，并要求结果非空且全部位于允许范围内；测试 Stub 不承担语义召回评测。
@@ -790,6 +833,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="http://127.0.0.1:8321")
     parser.add_argument("--qdrant-url", default="http://127.0.0.1:6333")
     parser.add_argument("--collection-prefix", default="shared_knowledge")
+    parser.add_argument(
+        "--runtime-token",
+        default=os.environ.get("KNOWLEDGE_RUNTIME_TOKEN", "runtime-e2e-at-least-sixteen"),
+        help="统一 Knowledge API Runtime Token；默认读取 KNOWLEDGE_RUNTIME_TOKEN",
+    )
     parser.add_argument("--baseline-seconds", type=float, default=4.0)
     parser.add_argument("--search-rounds", type=int, default=50)
     parser.add_argument("--search-concurrency", type=int, default=8)
@@ -807,7 +855,7 @@ def main() -> int:
 
     repository_root = Path(__file__).parents[2]
     sampler = DockerStatsSampler(repository_root)
-    simulation = ProductSimulation(args.base_url, args.qdrant_url, args.collection_prefix)
+    simulation = ProductSimulation(args.base_url, args.qdrant_url, args.collection_prefix, args.runtime_token)
     cleanup_errors: list[str] = []
     load_result: dict[str, Any] = {}
     try:

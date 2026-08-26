@@ -22,7 +22,6 @@ import httpx
 from simulate_product_usage import DockerStatsSampler, ResourceSample
 
 RUNTIME_TOKEN = "runtime-e2e-at-least-sixteen"
-ADMIN_TOKEN = "admin-e2e-at-least-sixteen"
 TERMINAL_OPERATION_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -85,25 +84,19 @@ def _load_cases(manifest_path: Path) -> list[FormatCase]:
     return cases
 
 
-def _configure_embedding(client: httpx.Client, tenant_id: str) -> None:
-    response = client.put(
-        f"/knowledge/v1/tenants/{tenant_id}/embedding-config",
-        headers=_headers(ADMIN_TOKEN),
-        json={
-            "base_url": "http://embedding-stub:18080/v1",
-            "api_key": "document-format-evaluation-only",
-            "model_id": "deterministic-test",
-            "dimension": 3,
-        },
-    )
-    response.raise_for_status()
-
-
 def _create_knowledge_base(client: httpx.Client, tenant_id: str, run_id: str) -> str:
     response = client.post(
         "/knowledge/v1/knowledge-bases",
         headers=_headers(RUNTIME_TOKEN, **{"Idempotency-Key": f"formats-create-{run_id}"}),
-        json={"tenant_id": tenant_id},
+        json={
+            "tenant_id": tenant_id,
+            "embedding": {
+                "base_url": "http://embedding-stub:18080/v1",
+                "api_key": "document-format-evaluation-only",
+                "model_id": "deterministic-test",
+                "dimension": 3,
+            },
+        },
     )
     response.raise_for_status()
     return str(response.json()["knowledge_base_id"])
@@ -405,7 +398,6 @@ def main() -> int:
 
     with httpx.Client(base_url=args.base_url, timeout=max(30, args.operation_timeout), trust_env=False) as client:
         try:
-            _configure_embedding(client, tenant_id)
             knowledge_base_id = _create_knowledge_base(client, tenant_id, run_id)
             sampler.start()
             sampler.set_phase("baseline")

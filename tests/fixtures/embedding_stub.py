@@ -26,6 +26,13 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
 
     server_version = "KnowledgeEmbeddingStub/1.0"
     failure_file: Path | None = None
+    # 只有带 keyed- 前缀的测试模型校验固定 Key，用于证明 KB 凭证不会串用。
+    keyed_models = {
+        "keyed-embedding-a": "embedding-key-a",
+        "keyed-embedding-b": "embedding-key-b",
+        "keyed-rerank-a": "rerank-key-a",
+        "keyed-rerank-b": "rerank-key-b",
+    }
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -79,12 +86,22 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             return
 
         model = str(payload.get("model", "deterministic-test"))
+        if not self._authorize_keyed_model(model):
+            return
+        raw_dimension = payload.get("dimensions", 3)
+        if not isinstance(raw_dimension, int) or raw_dimension < 1 or raw_dimension > 128:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "dimensions 必须为 1～128 的整数"})
+            return
         self._write_json(
             HTTPStatus.OK,
             {
                 "object": "list",
                 "data": [
-                    {"object": "embedding", "index": index, "embedding": deterministic_embedding(text)}
+                    {
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": deterministic_embedding(text, raw_dimension),
+                    }
                     for index, text in enumerate(texts)
                 ],
                 "model": model,
@@ -109,6 +126,10 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
+        model = str(payload.get("model", "deterministic-rerank"))
+        if not self._authorize_keyed_model(model):
+            return
+
         ranked_indexes = list(reversed(range(len(documents))))[:top_n]
         self._write_json(
             HTTPStatus.OK,
@@ -119,6 +140,17 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": len(query) + sum(map(len, documents))},
             },
         )
+
+    def _authorize_keyed_model(self, model: str) -> bool:
+        """对少量 E2E 模型校验 Bearer Key，其他模型保持原有宽松行为。"""
+
+        expected = self.keyed_models.get(model)
+        if expected is None:
+            return True
+        if self.headers.get("Authorization") == f"Bearer {expected}":
+            return True
+        self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+        return False
 
     def log_message(self, format_: str, *args: Any) -> None:
         # 测试输出只保留显式断言结果，避免并发请求日志干扰诊断。

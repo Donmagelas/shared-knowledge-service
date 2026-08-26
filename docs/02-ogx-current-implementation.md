@@ -14,9 +14,9 @@
 | Docling | `2.121.0` | 文档解析 |
 | Chunker | Docling `HybridChunker` | 结构感知切块 |
 | Qdrant | Server `1.18.2` / Client `1.18.0` | Dense、BM25 Sparse、Payload Filter 和 RRF |
-| PostgreSQL | `17.10` | OGX 元数据、任务、幂等状态和加密后的租户配置 |
+| PostgreSQL | `17.10` | OGX 元数据、任务、幂等状态和加密后的 KnowledgeBase 模型配置 |
 | Python / API | Python `3.12`、FastAPI | OGX Distribution 与统一 Knowledge API |
-| 模型 | OpenAI-compatible 远程服务 | 每租户独立 Embedding 和可选 Rerank |
+| 模型 | OpenAI-compatible 远程服务 | 每 KnowledgeBase 独立 Embedding 和可选 Rerank |
 | 原文件 | `inline::localfs` 或 `remote::s3` | 部署时二选一，产品 API 不变 |
 
 生产 Compose 只需要三个服务：
@@ -59,36 +59,37 @@ knowledge-ogx  ── PostgreSQL
 | Payload | 保存技术范围、File/Chunk ID、业务 attributes、可恢复的 OGX Chunk 和文本 |
 | Payload Index | 固定索引 `vector_store_id / file_id / chunk_id`；业务高频字段由部署配置声明类型 |
 | 通用过滤 | 支持 `and / or / eq / ne / in / nin / gt / gte / lt / lte`，并保护保留字段 |
-| 范围强制 | 每次查询服务端强制加入 `vector_store_id IN knowledge_base_ids` |
-| Dense | 调用租户 Embedding 生成文档和 Query Vector，Qdrant Cosine 检索 |
+| 范围强制 | 每个检索分支强制加入精确 `vector_store_id = knowledge_base_id` |
+| Dynamic Named Vector | 每个 `model_id + dimension` 生成稳定 Named Vector；同一 Collection 可动态增加不同维度 |
+| Dense | 调用当前 KnowledgeBase 的 Embedding，查询其 Named Vector |
 | BM25 | Qdrant 原生 `qdrant/bm25`，multilingual tokenizer，动态 IDF |
-| Hybrid | 一次 Qdrant Query 使用 Dense 与 BM25 两个 Prefetch，再用原生 RRF 融合 |
-| 多知识库检索 | 同一租户多个逻辑 VectorStore 在一次 Qdrant 查询中完成，不在应用层二次合并 |
+| 单库 Hybrid | 一次 Qdrant Query 使用 Dense 与 BM25 两个 Prefetch，再用原生内层 RRF 融合 |
+| 多知识库检索 | 每个库独立检索并按该库配置可选 Rerank；Python Search 层再做等权外层 RRF |
 | 删除 | File 和 VectorStore 删除都带逻辑范围，不误删同 Collection 的其他知识库 |
 
-### 2.3 租户感知 Inference Provider
+### 2.3 KnowledgeBase 感知 Inference Provider
 
-当前不是每个租户启动一个 Provider，而是一个 Provider 根据内部 Profile ID 动态解析租户连接：
+当前不是每个 KnowledgeBase 启动一个 Provider，而是一个 Provider 根据内部 Profile ID 动态解析连接：
 
 ```text
 OGX 内部模型 ID
       ↓
-租户 Embedding / Rerank Profile
+KnowledgeBase Embedding / Rerank Profile
       ↓
 从 PostgreSQL 读取 AES-GCM 密文
       ↓
 使用部署 Master Key 在内存解密
       ↓
-调用该租户配置的 OpenAI-compatible URL、Key 和模型
+调用该 KnowledgeBase 配置的 OpenAI-compatible URL、Key 和模型
 ```
 
 已实现：
 
-- 每租户独立 Embedding URL、Key、模型 ID 和维度。
-- 每租户独立 Rerank URL、Key、模型 ID 和开关。
+- 每 KnowledgeBase 独立 Embedding URL、Key、模型 ID 和维度。
+- 每 KnowledgeBase 独立 Rerank URL、Key、模型 ID 和开关。
 - 不获取、不列举、不推荐远程模型列表。
 - 配置写入前调用确切 `/embeddings` 或 `/rerank` 接口做探针。
-- 租户第一次 Ingest 创建或确认 Collection 后，Embedding URL、模型和维度锁定；即使后续解析失败也不会自动解锁，Key 仍可轮换。
+- 空 KnowledgeBase 可修改 Embedding 模型和维度；首次 Ingest 接受后模型与维度锁定，URL/Key 仍可轮换。
 - Rerank 不影响持久向量，可随时关闭或修改。
 - 默认拒绝不安全的内网/HTTP 模型地址，部署方可显式放行。
 
@@ -96,12 +97,12 @@ OGX 内部模型 ID
 
 在 OGX 同一个 FastAPI 进程中挂载了稳定产品接口，隐藏 OGX 原生对象细节：
 
-- 租户 Embedding/Rerank 配置。
-- 创建、查询、删除技术 KnowledgeBase。
+- 携带模型配置创建、查询、删除技术 KnowledgeBase。
+- 查询/修改 KnowledgeBase Embedding 与 Rerank 配置。
 - 单文件异步 Ingest。
 - Operation 状态查询和失败重试。
 - File 列表、详情和删除。
-- 单租户多 KnowledgeBase 的 Dense/BM25/Hybrid Search。
+- 单租户多 KnowledgeBase 的独立 Dense/BM25/Hybrid 分支与等权外层 RRF。
 - Runtime/Admin 双 Token、请求 ID 和统一错误信封。
 
 ### 2.5 异步、恢复和生命周期补强
@@ -116,7 +117,7 @@ OGX 内部模型 ID
 | File 删除 | 处理中返回 `409 file_busy`；终态同步清理索引和最后一份原文件引用 |
 | KnowledgeBase 删除 | 有在途任务返回 `409`；无任务时同步、幂等清理逻辑范围 |
 | 无效原文件 | 启动即扫描并周期清理未提交、过期失败和孤儿 File |
-| Rerank 上游失败 | Search 降级返回 Qdrant RRF 结果，不让基础检索整体失败 |
+| Rerank 上游失败 | 仅对应 KnowledgeBase 回退到 Qdrant 内层 RRF，不让外部模型故障中断整次 Search |
 
 任务边界仍然是：Docling 解析和 HybridChunker 由 OGX PostgreSQL 持久任务执行；Embedding、BM25 编码和 Qdrant Upsert 不在同一个持久任务事务中。当前通过幂等、状态快照和显式重试恢复，不宣称跨 PostgreSQL/Qdrant 原子提交。
 
@@ -135,9 +136,10 @@ OGX 内部模型 ID
 
 | 功能 | 状态 | 说明 |
 | --- | --- | --- |
-| 每租户 Embedding 配置 | 已实现 | 首次 Ingest 创建或确认 Collection 后锁定向量空间，Key 可轮换 |
-| 每租户 Rerank 配置 | 已实现 | 独立 Key、模型和开关 |
-| 技术 KnowledgeBase 创建/查询/删除 | 已实现 | 创建和删除幂等；暂无列表、重命名接口 |
+| 每 KnowledgeBase Embedding 配置 | 已实现 | 创建时提交；空库可换模型/维度，首次 Ingest 后锁定，URL/Key 可轮换 |
+| 每 KnowledgeBase Rerank 配置 | 已实现 | 独立 URL、Key、模型和开关，可随时修改 |
+| Dynamic Named Vector | 已实现 | 同租户不同知识库可在一个 Collection 中使用不同模型和维度 |
+| 技术 KnowledgeBase 创建/查询/删除 | 已实现 | 创建和删除幂等；创建失败回滚；暂无列表、重命名接口 |
 | 本地原文件存储 | 已实现并验证 | Docker named volume |
 | S3/S3-compatible 原文件存储 | 已接入配置 | 真实生产 S3 尚未完成 E2E |
 | 单文件异步 Ingest | 已实现 | 请求返回 `202`，后台继续处理 |
@@ -146,11 +148,11 @@ OGX 内部模型 ID
 | File 查询、详情和删除 | 已实现 | Cursor 分页，支持状态和 attributes Filter |
 | Docling 解析 | 已实现 | 当前关闭扫描 PDF OCR 和 VLM |
 | Docling HybridChunker | 已实现 | 当前自动目标 800 tokens |
-| Dense 检索 | 已实现 | 每租户远程 Embedding |
+| Dense 检索 | 已实现 | 每 KnowledgeBase 远程 Embedding 和 Named Vector |
 | BM25 检索 | 已实现 | Qdrant 原生 multilingual BM25 + 动态 IDF |
 | Hybrid 检索 | 已实现 | Qdrant 原生 RRF |
-| 可选远程 Rerank | 已实现 | 仅用于 Hybrid，失败降级 |
-| 同租户多 KnowledgeBase Search | 已实现 | 一次 Qdrant Query |
+| 可选远程 Rerank | 已实现 | 每 KnowledgeBase 独立配置；仅用于 Hybrid，局部失败降级 |
+| 同租户多 KnowledgeBase Search | 已实现 | 各库本地检索/可选重排后，Python 等权外层 RRF |
 | 跨租户隔离 | 已实现 | 每租户 Collection；跨租户 Search 整体拒绝 |
 | Stella 四级范围 Filter | 已验证 | System、Agent、User、User-Agent 累加与交叉隔离 |
 | 企业版挂载检索 | 已验证 | 公司/产品库单挂载、多挂载、无挂载和双租户 |
@@ -260,24 +262,28 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 
 ### 5.5 混合检索并发
 
-700 个 Hybrid 请求、并发 8：
+2026-08-26 在新链路下重跑 700 个 Hybrid 请求、并发 8。负载混合 Stella 单库与企业版单库/双库/三库请求；企业版同租户三个库分别使用 3/5/7 维 Embedding，其中两个库使用不同 Rerank Key/模型，第三个库不启用 Rerank：
 
 | 指标 | 结果 |
 | --- | ---: |
-| 总耗时 | 11.121 s |
-| 吞吐 | 62.95 req/s |
-| 平均延迟 | 126.26 ms |
-| P50 | 124.25 ms |
-| P95 | 181.76 ms |
-| 最大延迟 | 428.39 ms |
+| 总耗时 | 49.627 s |
+| 吞吐 | 14.11 req/s |
+| 平均延迟 | 564.34 ms |
+| P50 | 499.23 ms |
+| P95 | 979.30 ms |
+| 最大延迟 | 1279.39 ms |
 
 | 服务 | CPU 平均 | CPU P95 | 内存最大 |
 | --- | ---: | ---: | ---: |
-| Knowledge OGX | 92.82% | 105.60% | 1172.48 MiB |
-| PostgreSQL | 7.75% | 10.95% | 70.68 MiB |
-| Qdrant | 14.60% | 18.31% | 165.70 MiB |
+| Knowledge OGX | 98.59% | 107.52% | 1181.70 MiB |
+| PostgreSQL | 5.84% | 7.74% | 75.09 MiB |
+| Qdrant | 5.81% | 7.14% | 836.50 MiB |
 
-这轮查询使用远程模型 Stub，因此 OGX 侧 HTTP、序列化和流程调度占比被放大；真实远程 Embedding/Rerank 的网络和模型延迟通常会成为主要部分。
+单次正确性矩阵中，企业版 Hybrid 的代表延迟为：单库约 `70～109 ms`、双库约 `82～111 ms`、三库约 `134～135 ms`。这不是严格的逐级基准，只能证明分支数增加会增加模型调用和融合开销。
+
+改造前同一组 700 请求基线约 `62.95 req/s`、P95 `181.76 ms`；新链路为了支持每库独立模型，必须按库执行模型与 Qdrant 分支，不能再把多个库合并为一次查询，因此性能下降是实际架构代价。默认并发上限 8 防止无界扇出，后续应按真实模型延迟和常见挂载库数量调优。
+
+这轮仍使用本地确定性模型 Stub，因此真实远程 Embedding/Rerank 的网络和模型延迟通常会更高。Qdrant 在本轮之前已经经过动态 Schema、重启与故障测试，进程分配内存未回落到冷启动水平，`836.50 MiB` 不能与旧的 `165.70 MiB` 直接归因比较；判断 Named Vector 数量的长期内存/磁盘成本仍需专门的全新进程曲线测试。
 
 ### 5.6 真实远程 Embedding 链路参考
 
@@ -301,15 +307,17 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 
 | 参数 | 当前值 | 配置位置/方式 | 当前限制 |
 | --- | --- | --- | --- |
-| Embedding 模型 | 每租户配置 | Admin API | 第一次 Ingest 后锁定，不能直接切换 |
-| Embedding 维度 | 每租户 `1～65536` | Admin API | 第一次 Ingest 后锁定；Collection Dense 维度必须一致 |
+| Embedding 模型 | 每 KnowledgeBase 配置 | 创建请求 / Admin API | 第一次 Ingest 后锁定；空库可切换 |
+| Embedding 维度 | 每 KnowledgeBase `1～65536`，可探测 | 创建请求 / Admin API | 第一次 Ingest 后锁定；不同维度使用不同 Named Vector |
 | Chunk 目标大小 | 800 tokens | `config/ogx.yaml` | 所有租户共用；产品请求不能单独指定 |
 | Chunk overlap | 配置写为 400 tokens | `config/ogx.yaml` | OGX `1.3.0` Docling Provider 实际没有把该值传给 HybridChunker，不能宣称当前存在固定 400-token overlap |
 | Chunk tokenizer | `all-MiniLM-L6-v2` 固定 revision | Docker 构建参数 | 只用于切块计数，与实际 Embedding 模型可能不同 |
 | Search `limit` | 默认 10，范围 1～50 | 每次 Search 请求 | Dense/BM25 最终 TopK |
 | Hybrid Prefetch | `max(k × 4, 20)` | Provider 硬编码 | Dense/BM25 两路相同候选上限 |
-| Rerank 候选数 | 默认 50，范围 1～200 | `RERANK_CANDIDATE_LIMIT` | 启用租户 Rerank 时生效 |
-| RRF | Qdrant 默认 RRF | Provider 固定 | 当前未开放 RRF `k`、权重或分路 TopK |
+| 单库 Rerank 候选数 | 默认 50，范围 1～200 | `RERANK_CANDIDATE_LIMIT` | 当前 KnowledgeBase 启用 Rerank 时生效 |
+| 跨库分支候选数 | 默认 50，范围 1～200 | `KNOWLEDGE_SEARCH_BRANCH_CANDIDATE_LIMIT` | 多 KnowledgeBase 外层融合前每库保留的候选数 |
+| 跨库并发 | 默认 8 | `KNOWLEDGE_SEARCH_BRANCH_CONCURRENCY` | 限制一次 Search 同时发起的独立知识库分支 |
+| RRF | Qdrant 内层 RRF + Python 外层 RRF `k=60` | `KNOWLEDGE_OUTER_RRF_K` | 多库等权；当前未开放每库权重 |
 | BM25 | multilingual tokenizer、`language=none` | Provider 固定 | 升级 Qdrant 或更换 tokenizer 必须重建并重评 |
 | 上传大小 | 100 MiB | OGX API 默认值 | 当前没有产品级覆盖配置 |
 | 高性能 Filter 字段 | 部署声明类型 | `payload_indexes` | 范围比较只允许声明为 integer/float/datetime 的字段 |
@@ -336,9 +344,9 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 - 400 / 800 / 1200 token 三档。
 - 标题、表格、代码块和跨段引用是否被拆散。
 - 是否需要显式 overlap，还是依赖 HybridChunker 的结构合并和上下文化文本。
-- 是否需要让 Chunk tokenizer 与租户 Embedding tokenizer 对齐。
+- 是否需要让 Chunk tokenizer 与实际 Embedding tokenizer 对齐。
 
-首期更适合保持部署级统一规则，不要立即把任意 Chunk 参数开放给每个 Ingest，否则同一租户会混入不同切块语义，后续重建与评测更难管理。
+首期更适合保持部署级统一规则，不要立即把任意 Chunk 参数开放给每个 Ingest，否则同一服务会混入不同切块语义，后续重建与评测更难管理。
 
 ### 7.3 高优先级：扩大中文 BM25 评测
 

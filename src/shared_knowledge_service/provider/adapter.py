@@ -32,11 +32,13 @@ from .index import SharedQdrantIndex
 
 log = get_logger(name=__name__, category="vector_io::shared_qdrant")
 TENANT_METADATA_KEY = "tenant_id"
+DENSE_VECTOR_METADATA_KEY = "dense_vector_name"
 _IMMUTABLE_METADATA_KEYS = frozenset(
     {
         TENANT_METADATA_KEY,
         "embedding_dimension",
         "embedding_model",
+        DENSE_VECTOR_METADATA_KEY,
         "provider_id",
         "provider_vector_store_id",
     }
@@ -77,29 +79,37 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             raise ValueError("VectorStore metadata.tenant_id 不能超过 256 个字符")
         return normalized
 
-    def _tenant_id_for_vector_store(self, vector_store_id: str) -> str | None:
+    @staticmethod
+    def _dense_vector_name_from_metadata(metadata: dict[str, Any] | None) -> str:
+        if not metadata:
+            raise ValueError("VectorStore metadata 缺少 dense_vector_name")
+        value = metadata.get(DENSE_VECTOR_METADATA_KEY)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("VectorStore metadata.dense_vector_name 必须是非空字符串")
+        return value.strip()
+
+    async def _bind_cached_store(
+        self,
+        cached: VectorStoreWithIndex,
+        tenant_id: str | None,
+        dense_vector_name: str,
+    ) -> str:
+        if not isinstance(cached.index, SharedQdrantIndex):
+            raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
+        collection_name = self.config.collection_name_for_tenant(tenant_id)
+        cached.index.bind_storage(collection_name, dense_vector_name)
+        return collection_name
+
+    async def _ensure_cached_store_route(self, vector_store_id: str, cached: VectorStoreWithIndex) -> str:
         store_info = self.openai_vector_stores.get(vector_store_id)
         if store_info is None:
             raise VectorStoreNotFoundError(vector_store_id)
         metadata = store_info.get("metadata")
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError("VectorStore metadata 必须是对象")
-        return self._tenant_id_from_metadata(metadata)
-
-    async def _bind_cached_store(
-        self,
-        cached: VectorStoreWithIndex,
-        tenant_id: str | None,
-    ) -> str:
-        if not isinstance(cached.index, SharedQdrantIndex):
-            raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
-        collection_name = self.config.collection_name_for_tenant(tenant_id)
-        cached.index.bind_collection(collection_name)
-        return collection_name
-
-    async def _ensure_cached_store_route(self, vector_store_id: str, cached: VectorStoreWithIndex) -> str:
-        tenant_id = self._tenant_id_for_vector_store(vector_store_id)
-        return await self._bind_cached_store(cached, tenant_id)
+        tenant_id = self._tenant_id_from_metadata(metadata)
+        dense_name = self._dense_vector_name_from_metadata(metadata)
+        return await self._bind_cached_store(cached, tenant_id, dense_name)
 
     async def initialize(self) -> None:
         self.client = AsyncQdrantClient(**self.config.qdrant_client_kwargs())
@@ -173,7 +183,8 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
         if cached is None:
             raise VectorStoreNotFoundError(vector_store_id)
         tenant_id = self._tenant_id_from_metadata(params.metadata)
-        await self._bind_cached_store(cached, tenant_id)
+        dense_name = self._dense_vector_name_from_metadata(params.metadata)
+        await self._bind_cached_store(cached, tenant_id, dense_name)
         return await super().openai_create_vector_store(params)
 
     async def ensure_vector_store_collection(self, vector_store_id: str) -> str:
@@ -225,40 +236,42 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
             for batch_info in self.openai_file_batches.values()
         )
 
-    async def reconfigure_empty_tenant_stores(
+    async def reconfigure_empty_vector_store(
         self,
-        tenant_id: str,
+        vector_store_id: str,
         *,
         embedding_model: str,
         embedding_dimension: int,
-    ) -> list[str]:
-        """首次 Ingest 前同步同租户空 VectorStore 的可变向量空间配置。"""
+        dense_vector_name: str,
+    ) -> None:
+        """首次 Ingest 前只更新目标 KB，不再连带修改同租户其他知识库。"""
 
-        changed: list[str] = []
-        for vector_store_id, store_info in self.openai_vector_stores.items():
-            metadata = dict(store_info.get("metadata") or {})
-            if self._tenant_id_from_metadata(metadata) != tenant_id:
-                continue
-            counts = store_info.get("file_counts") or {}
-            if counts.get("total", 0) != 0:
-                raise RuntimeError("存在已接收文件的 VectorStore，不能修改租户 Embedding 配置")
-            metadata["embedding_model"] = embedding_model
-            metadata["embedding_dimension"] = str(embedding_dimension)
-            store_info["metadata"] = metadata
-            await self._save_openai_vector_store(vector_store_id, store_info)
-            cached = self.cache.get(vector_store_id)
-            if cached is not None:
-                cached.vector_store.embedding_model = embedding_model
-                cached.vector_store.embedding_dimension = embedding_dimension
-                if isinstance(cached.index, SharedQdrantIndex):
-                    cached.index.dimension = embedding_dimension
-            if self.kvstore is not None and cached is not None:
-                await self.kvstore.set(
-                    key=f"{VECTOR_DBS_PREFIX}{vector_store_id}",
-                    value=cached.vector_store.model_dump_json(),
-                )
-            changed.append(vector_store_id)
-        return changed
+        store_info = self.openai_vector_stores.get(vector_store_id)
+        if store_info is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        counts = store_info.get("file_counts") or {}
+        if counts.get("total", 0) != 0:
+            raise RuntimeError("已有文件的 VectorStore 不能修改 Embedding 模型或维度")
+        metadata = dict(store_info.get("metadata") or {})
+        metadata["embedding_model"] = embedding_model
+        metadata["embedding_dimension"] = str(embedding_dimension)
+        metadata[DENSE_VECTOR_METADATA_KEY] = dense_vector_name
+        store_info["metadata"] = metadata
+        await self._save_openai_vector_store(vector_store_id, store_info)
+        cached = self.cache.get(vector_store_id)
+        if cached is None:
+            cached = await self._get_and_cache_vector_store_index(vector_store_id)
+        if cached is None or not isinstance(cached.index, SharedQdrantIndex):
+            raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
+        cached.vector_store.embedding_model = embedding_model
+        cached.vector_store.embedding_dimension = embedding_dimension
+        cached.index.reconfigure_empty_vector_space(dense_vector_name, embedding_dimension)
+        if self.kvstore is None:
+            raise RuntimeError("KVStore 尚未初始化")
+        await self.kvstore.set(
+            key=f"{VECTOR_DBS_PREFIX}{vector_store_id}",
+            value=cached.vector_store.model_dump_json(),
+        )
 
     async def openai_update_vector_store(
         self,
@@ -324,62 +337,38 @@ class SharedQdrantVectorIOAdapter(QdrantVectorIOAdapter):  # type: ignore[misc]
         await self._ensure_cached_store_route(vector_store_id, cached)
         return cached
 
-    async def query_multiple_vector_stores(
+    async def query_vector_store(
         self,
-        vector_store_ids: list[str],
+        vector_store_id: str,
         query: str,
         mode: Literal["hybrid", "dense", "bm25"],
         limit: int,
         filters: ComparisonFilter | CompoundFilter | None = None,
         rerank_model: str | None = None,
     ) -> QueryChunksResponse:
-        """用一次 Qdrant 查询检索同一 Collection 中的多个逻辑 VectorStore。"""
+        """按单个 KnowledgeBase 的模型、Named Vector 和 Payload 范围完成本地排序。"""
 
-        if not vector_store_ids:
-            raise ValueError("vector_store_ids 不能为空")
-
-        cached_stores: list[VectorStoreWithIndex] = []
-        collection_names: set[str] = set()
-        for vector_store_id in vector_store_ids:
-            cached = await self._get_and_cache_vector_store_index(vector_store_id)
-            if cached is None:
-                raise VectorStoreNotFoundError(vector_store_id)
-            cached_stores.append(cached)
-            if not isinstance(cached.index, SharedQdrantIndex):
-                raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
-            collection_names.add(cached.index.bound_collection_name)
-
-        if len(collection_names) != 1:
-            raise ValueError("一次检索中的 knowledge_base_ids 不能跨租户 Collection")
-
-        first = cached_stores[0]
-        expected_model = first.vector_store.embedding_model
-        expected_dimension = first.vector_store.embedding_dimension
-        if any(
-            cached.vector_store.embedding_model != expected_model
-            or cached.vector_store.embedding_dimension != expected_dimension
-            for cached in cached_stores[1:]
-        ):
-            raise ValueError("一次检索中的 knowledge_base_ids 必须使用同一 Embedding 模型和维度")
-        if not isinstance(first.index, SharedQdrantIndex):
+        cached = await self._get_and_cache_vector_store_index(vector_store_id)
+        if cached is None:
+            raise VectorStoreNotFoundError(vector_store_id)
+        if not isinstance(cached.index, SharedQdrantIndex):
             raise RuntimeError("逻辑知识库未使用 SharedQdrantIndex")
 
         if mode == "bm25":
-            return await first.index.query_keyword_scoped(vector_store_ids, query, limit, 0.0, filters)
+            return await cached.index.query_keyword(query, limit, 0.0, filters)
 
         embeddings = await self.inference_api.openai_embeddings(
             OpenAIEmbeddingsRequestWithExtraBody(
-                model=expected_model,
+                model=cached.vector_store.embedding_model,
                 input=[query],
-                dimensions=expected_dimension,
+                dimensions=cached.vector_store.embedding_dimension,
             )
         )
         query_vector = np.asarray(embeddings.data[0].embedding, dtype=np.float32)
         if mode == "dense":
-            return await first.index.query_vector_scoped(vector_store_ids, query_vector, limit, 0.0, filters)
+            return await cached.index.query_vector(query_vector, limit, 0.0, filters)
         candidate_limit = max(limit, self.config.rerank_candidate_limit) if rerank_model is not None else limit
-        candidates = await first.index.query_hybrid_scoped(
-            vector_store_ids,
+        candidates = await cached.index.query_hybrid(
             query_vector,
             query,
             candidate_limit,

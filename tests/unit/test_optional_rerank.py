@@ -80,13 +80,13 @@ async def test_enabled_rerank_reorders_candidates_and_replaces_scores() -> None:
         "退款材料",
         _candidates(),
         2,
-        rerank_model="tenant-inference/rerank-tenant-a",
+        rerank_model="knowledge-base-inference/rerank-kb-a",
     )
 
     assert [chunk.chunk_id for chunk in result.chunks] == ["second", "first"]
     assert result.scores == [0.99, 0.01]
     assert len(inference.requests) == 1
-    assert inference.requests[0].model == "tenant-inference/rerank-tenant-a"
+    assert inference.requests[0].model == "knowledge-base-inference/rerank-kb-a"
     assert inference.requests[0].max_num_results == 2
 
 
@@ -111,7 +111,7 @@ async def test_rerank_failure_falls_back_to_rrf_results() -> None:
         "退款材料",
         _candidates(),
         1,
-        rerank_model="tenant-inference/rerank-tenant-a",
+        rerank_model="knowledge-base-inference/rerank-kb-a",
     )
 
     assert [chunk.chunk_id for chunk in result.chunks] == ["first"]

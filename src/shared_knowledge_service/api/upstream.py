@@ -1,4 +1,4 @@
-"""租户模型 URL 安全校验与精确配置探针。"""
+"""KnowledgeBase 模型 URL 安全校验与精确配置探针。"""
 
 from __future__ import annotations
 
@@ -131,34 +131,39 @@ async def probe_embedding(
     base_url: str,
     api_key: str,
     model_id: str,
-    dimension: int,
+    dimension: int | None,
     timeout_seconds: float,
-) -> None:
-    """只探测调用方提交的确切 Embedding 模型和维度，不发现模型列表。"""
+) -> int:
+    """探测确切模型并返回实际维度；调用方未指定时不发送 dimensions。"""
 
+    payload: dict[str, Any] = {"model": model_id, "input": ["knowledge service probe"]}
+    if dimension is not None:
+        payload["dimensions"] = dimension
     result = await post_model_request(
         policy=policy,
         base_url=base_url,
         api_key=api_key,
         operation="embeddings",
-        payload={"model": model_id, "input": ["knowledge service probe"], "dimensions": dimension},
+        payload=payload,
         timeout_seconds=timeout_seconds,
     )
     data = result.get("data")
     if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
         raise KnowledgeError(502, "invalid_embedding_response", "Embedding 服务返回结构不合法")
     vector = data[0].get("embedding")
-    if (
-        not isinstance(vector, list)
-        or len(vector) != dimension
-        or not all(isinstance(item, int | float) for item in vector)
-    ):
+    if not isinstance(vector, list) or not vector or not all(isinstance(item, int | float) for item in vector):
+        raise KnowledgeError(502, "invalid_embedding_response", "Embedding 服务返回向量不合法")
+    actual_dimension = len(vector)
+    if actual_dimension > 65_536:
+        raise KnowledgeError(502, "invalid_embedding_response", "Embedding 服务返回维度超过服务上限")
+    if dimension is not None and actual_dimension != dimension:
         raise KnowledgeError(
             502,
             "embedding_dimension_mismatch",
             "Embedding 服务返回维度与配置不一致",
-            {"expected_dimension": dimension, "actual_dimension": len(vector) if isinstance(vector, list) else None},
+            {"expected_dimension": dimension, "actual_dimension": actual_dimension},
         )
+    return actual_dimension
 
 
 async def probe_rerank(

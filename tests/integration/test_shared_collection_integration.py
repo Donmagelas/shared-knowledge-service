@@ -12,30 +12,40 @@ from ogx.core.storage.datatypes import KVStoreReference
 from ogx_api import ChunkMetadata, ComparisonFilter, CompoundFilter, EmbeddedChunk, VectorStore
 from qdrant_client import AsyncQdrantClient
 
-from shared_knowledge_service.provider.config import PayloadIndexType, SharedQdrantVectorIOConfig
-from shared_knowledge_service.provider.index import SharedQdrantIndex
+from shared_knowledge_service.provider.config import (
+    PayloadIndexType,
+    SharedQdrantVectorIOConfig,
+    dense_vector_name,
+)
+from shared_knowledge_service.provider.index import SharedQdrantIndex, compound_point_id
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
-def _vector_store(identifier: str) -> VectorStore:
+def _vector_store(identifier: str, *, model_id: str = "test-model", dimension: int = 3) -> VectorStore:
     return VectorStore(
         identifier=identifier,
         provider_id="shared-qdrant",
-        embedding_model="test-model",
-        embedding_dimension=3,
+        embedding_model=model_id,
+        embedding_dimension=dimension,
     )
 
 
-def _chunk(file_id: str, department_id: str, embedding: list[float]) -> EmbeddedChunk:
+def _chunk(
+    file_id: str,
+    department_id: str,
+    embedding: list[float],
+    *,
+    model_id: str = "test-model",
+) -> EmbeddedChunk:
     return EmbeddedChunk(
         content=f"{department_id} 的内容",
         chunk_id="same-chunk-id",
         metadata={"file_id": file_id, "department_id": department_id},
         chunk_metadata=ChunkMetadata(document_id=file_id),
         embedding=embedding,
-        embedding_model="test-model",
-        embedding_dimension=3,
+        embedding_model=model_id,
+        embedding_dimension=len(embedding),
     )
 
 
@@ -72,8 +82,23 @@ async def test_two_logical_vector_stores_share_collection_without_leaking() -> N
     # 本地测试地址不应经过开发机代理，否则代理依赖会掩盖真实 Qdrant 行为。
     client = AsyncQdrantClient(url=qdrant_url, trust_env=False, check_compatibility=False)
     collection_lock = asyncio.Lock()
-    index_a = SharedQdrantIndex(client, _vector_store("vs-a"), config, collection_lock, collection_name)
-    index_b = SharedQdrantIndex(client, _vector_store("vs-b"), config, collection_lock, collection_name)
+    dense_name = dense_vector_name("test-model", 3)
+    index_a = SharedQdrantIndex(
+        client,
+        _vector_store("vs-a"),
+        config,
+        collection_lock,
+        collection_name,
+        dense_name,
+    )
+    index_b = SharedQdrantIndex(
+        client,
+        _vector_store("vs-b"),
+        config,
+        collection_lock,
+        collection_name,
+        dense_name,
+    )
 
     try:
         await index_a.initialize()
@@ -106,14 +131,6 @@ async def test_two_logical_vector_stores_share_collection_without_leaking() -> N
             "rrf",
         )
         assert [chunk.metadata["department_id"] for chunk in hybrid_b.chunks] == ["dept-b"]
-
-        multi_store = await index_a.query_vector_scoped(
-            ["vs-a", "vs-b"],
-            np.asarray([1.0, 0.0, 0.0]),
-            10,
-            0.0,
-        )
-        assert {chunk.metadata["department_id"] for chunk in multi_store.chunks} == {"dept-a", "dept-b"}
 
         await index_a.add_chunks(
             [
@@ -170,6 +187,83 @@ async def test_two_logical_vector_stores_share_collection_without_leaking() -> N
         assert remaining.count == 1
         result_b_after_delete = await index_b.query_vector(np.asarray([1.0, 0.0, 0.0]), 10, 0.0)
         assert [chunk.metadata["department_id"] for chunk in result_b_after_delete.chunks] == ["dept-b"]
+    finally:
+        if await client.collection_exists(collection_name):
+            await client.delete_collection(collection_name)
+        await client.close()
+
+
+async def test_dynamic_named_vectors_keep_different_kb_vector_spaces_independent() -> None:
+    """同租户可动态追加不同维度的向量空间，旧 Point 无需补新向量。"""
+
+    qdrant_url = os.environ.get("QDRANT_INTEGRATION_URL")
+    if not qdrant_url:
+        pytest.skip("未设置 QDRANT_INTEGRATION_URL")
+
+    collection_name = f"integration_vectors_{uuid.uuid4().hex}"
+    config = SharedQdrantVectorIOConfig(
+        url=qdrant_url,
+        persistence=KVStoreReference(backend="test", namespace="test"),
+        collection_name=collection_name,
+    )
+    client = AsyncQdrantClient(url=qdrant_url, trust_env=False, check_compatibility=False)
+    collection_lock = asyncio.Lock()
+    model_a = "embedding/model-a"
+    model_b = "embedding/model-b"
+    dense_a = dense_vector_name(model_a, 3)
+    dense_b = dense_vector_name(model_b, 5)
+    index_a = SharedQdrantIndex(
+        client,
+        _vector_store("vs-a", model_id=model_a, dimension=3),
+        config,
+        collection_lock,
+        collection_name,
+        dense_a,
+    )
+    index_b = SharedQdrantIndex(
+        client,
+        _vector_store("vs-b", model_id=model_b, dimension=5),
+        config,
+        collection_lock,
+        collection_name,
+        dense_b,
+    )
+
+    try:
+        await index_a.initialize()
+        await index_a.add_chunks([_chunk("file-a", "dept-a", [1.0, 0.0, 0.0], model_id=model_a)])
+        # B 初始化发生在 A 已有 Point 之后，验证动态追加不会要求回填旧 Point。
+        await index_b.initialize()
+        await index_b.add_chunks([_chunk("file-b", "dept-b", [1.0, 0.0, 0.0, 0.0, 0.0], model_id=model_b)])
+
+        info = await client.get_collection(collection_name)
+        vectors = info.config.params.vectors
+        assert isinstance(vectors, dict)
+        assert vectors[dense_a].size == 3
+        assert vectors[dense_b].size == 5
+
+        records = await client.retrieve(
+            collection_name,
+            ids=[compound_point_id("vs-a", "same-chunk-id"), compound_point_id("vs-b", "same-chunk-id")],
+            with_vectors=True,
+        )
+        by_store = {str(record.payload["vector_store_id"]): record for record in records if record.payload}
+        assert dense_a in by_store["vs-a"].vector
+        assert dense_b not in by_store["vs-a"].vector
+        assert dense_b in by_store["vs-b"].vector
+        assert dense_a not in by_store["vs-b"].vector
+
+        result_a = await index_a.query_vector(np.asarray([1.0, 0.0, 0.0]), 10, 0.0)
+        result_b = await index_b.query_vector(np.asarray([1.0, 0.0, 0.0, 0.0, 0.0]), 10, 0.0)
+        assert [chunk.metadata["department_id"] for chunk in result_a.chunks] == ["dept-a"]
+        assert [chunk.metadata["department_id"] for chunk in result_b.chunks] == ["dept-b"]
+
+        await index_a.delete()
+        remaining = await client.count(collection_name=collection_name, exact=True)
+        assert remaining.count == 1
+        info_after_delete = await client.get_collection(collection_name)
+        assert isinstance(info_after_delete.config.params.vectors, dict)
+        assert {dense_a, dense_b} <= set(info_after_delete.config.params.vectors)
     finally:
         if await client.collection_exists(collection_name):
             await client.delete_collection(collection_name)

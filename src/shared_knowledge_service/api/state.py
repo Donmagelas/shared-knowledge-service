@@ -1,4 +1,4 @@
-"""Knowledge API 控制面状态与租户凭证的加密持久化。"""
+"""Knowledge API 控制面状态与 KnowledgeBase 凭证的加密持久化。"""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class EncryptedCredential(BaseModel):
 
 
 class CredentialCipher:
-    """用部署级 Master Key 加密租户模型凭证。"""
+    """用部署级 Master Key 加密 KnowledgeBase 模型凭证。"""
 
     def __init__(self, master_key: str) -> None:
         if len(master_key) < 16:
@@ -80,8 +80,9 @@ class CredentialCipher:
 
 
 class EmbeddingProfileRecord(BaseModel):
-    """一个租户唯一的 Embedding Profile。"""
+    """一个 KnowledgeBase 唯一的 Embedding Profile。"""
 
+    knowledge_base_id: str
     tenant_id: str
     profile_id: str
     base_url: str
@@ -93,12 +94,13 @@ class EmbeddingProfileRecord(BaseModel):
 
     @property
     def internal_model_id(self) -> str:
-        return f"tenant-inference/embedding_{opaque_suffix(self.tenant_id)}"
+        return f"knowledge-base-inference/embedding_{opaque_suffix(self.knowledge_base_id)}"
 
 
 class RerankProfileRecord(BaseModel):
-    """一个租户唯一且可随时切换的 Rerank Profile。"""
+    """一个 KnowledgeBase 唯一且可随时切换的 Rerank Profile。"""
 
+    knowledge_base_id: str
     tenant_id: str
     profile_id: str
     enabled: bool
@@ -109,7 +111,7 @@ class RerankProfileRecord(BaseModel):
 
     @property
     def internal_model_id(self) -> str:
-        return f"tenant-inference/rerank_{opaque_suffix(self.tenant_id)}"
+        return f"knowledge-base-inference/rerank_{opaque_suffix(self.knowledge_base_id)}"
 
 
 class CreateIdempotencyRecord(BaseModel):
@@ -180,7 +182,7 @@ class KnowledgeState:
 
     @asynccontextmanager
     async def locked(self, key: str) -> AsyncIterator[None]:
-        """单实例部署内串行化同租户、幂等键或文件生命周期。"""
+        """单实例部署内串行化同 KnowledgeBase、幂等键或文件生命周期。"""
 
         async with self._locks_guard:
             lock = self._locks.setdefault(key, asyncio.Lock())
@@ -188,20 +190,20 @@ class KnowledgeState:
             yield
 
     @staticmethod
-    def embedding_profile_id(tenant_id: str) -> str:
-        return f"embp_{opaque_suffix(tenant_id)}"
+    def embedding_profile_id(knowledge_base_id: str) -> str:
+        return f"embp_{opaque_suffix(knowledge_base_id)}"
 
     @staticmethod
-    def rerank_profile_id(tenant_id: str) -> str:
-        return f"rerp_{opaque_suffix(tenant_id)}"
+    def rerank_profile_id(knowledge_base_id: str) -> str:
+        return f"rerp_{opaque_suffix(knowledge_base_id)}"
 
     @staticmethod
-    def _embedding_key(tenant_id: str) -> str:
-        return f"profile:embedding:{opaque_suffix(tenant_id)}"
+    def _embedding_key(knowledge_base_id: str) -> str:
+        return f"profile:embedding:{opaque_suffix(knowledge_base_id)}"
 
     @staticmethod
-    def _rerank_key(tenant_id: str) -> str:
-        return f"profile:rerank:{opaque_suffix(tenant_id)}"
+    def _rerank_key(knowledge_base_id: str) -> str:
+        return f"profile:rerank:{opaque_suffix(knowledge_base_id)}"
 
     @staticmethod
     def _create_idempotency_key(tenant_id: str, idempotency_key: str) -> str:
@@ -229,31 +231,49 @@ class KnowledgeState:
     def _knowledge_base_lifecycle_key(knowledge_base_id: str) -> str:
         return f"knowledge-base:lifecycle:{opaque_suffix(knowledge_base_id)}"
 
-    async def get_embedding(self, tenant_id: str) -> EmbeddingProfileRecord | None:
-        value = await self.kvstore.get(self._embedding_key(tenant_id))
+    async def get_embedding(self, knowledge_base_id: str) -> EmbeddingProfileRecord | None:
+        value = await self.kvstore.get(self._embedding_key(knowledge_base_id))
         return EmbeddingProfileRecord.model_validate_json(value) if value else None
 
     async def save_embedding(self, record: EmbeddingProfileRecord) -> None:
         value = record.model_dump_json()
-        await self.kvstore.set(self._embedding_key(record.tenant_id), value)
+        await self.kvstore.set(self._embedding_key(record.knowledge_base_id), value)
         await self.kvstore.set(f"profile:embedding-id:{record.profile_id}", value)
 
     async def get_embedding_by_profile(self, profile_id: str) -> EmbeddingProfileRecord | None:
         value = await self.kvstore.get(f"profile:embedding-id:{profile_id}")
         return EmbeddingProfileRecord.model_validate_json(value) if value else None
 
-    async def get_rerank(self, tenant_id: str) -> RerankProfileRecord | None:
-        value = await self.kvstore.get(self._rerank_key(tenant_id))
+    async def delete_embedding(self, knowledge_base_id: str) -> None:
+        record = await self.get_embedding(knowledge_base_id)
+        await self.kvstore.delete(self._embedding_key(knowledge_base_id))
+        if record is not None:
+            await self.kvstore.delete(f"profile:embedding-id:{record.profile_id}")
+
+    async def get_rerank(self, knowledge_base_id: str) -> RerankProfileRecord | None:
+        value = await self.kvstore.get(self._rerank_key(knowledge_base_id))
         return RerankProfileRecord.model_validate_json(value) if value else None
 
     async def save_rerank(self, record: RerankProfileRecord) -> None:
         value = record.model_dump_json()
-        await self.kvstore.set(self._rerank_key(record.tenant_id), value)
+        await self.kvstore.set(self._rerank_key(record.knowledge_base_id), value)
         await self.kvstore.set(f"profile:rerank-id:{record.profile_id}", value)
 
     async def get_rerank_by_profile(self, profile_id: str) -> RerankProfileRecord | None:
         value = await self.kvstore.get(f"profile:rerank-id:{profile_id}")
         return RerankProfileRecord.model_validate_json(value) if value else None
+
+    async def delete_rerank(self, knowledge_base_id: str) -> None:
+        record = await self.get_rerank(knowledge_base_id)
+        await self.kvstore.delete(self._rerank_key(knowledge_base_id))
+        if record is not None:
+            await self.kvstore.delete(f"profile:rerank-id:{record.profile_id}")
+
+    async def delete_inference_profiles(self, knowledge_base_id: str) -> None:
+        """删除 KB 主记录和 opaque Profile 反向索引。"""
+
+        await self.delete_embedding(knowledge_base_id)
+        await self.delete_rerank(knowledge_base_id)
 
     def encrypt_api_key(self, api_key: str, *, profile_id: str) -> EncryptedCredential:
         return self.cipher.encrypt(api_key, context=profile_id)
@@ -274,6 +294,9 @@ class KnowledgeState:
             self._create_idempotency_key(record.tenant_id, idempotency_key),
             record.model_dump_json(),
         )
+
+    async def delete_create_idempotency(self, tenant_id: str, idempotency_key: str) -> None:
+        await self.kvstore.delete(self._create_idempotency_key(tenant_id, idempotency_key))
 
     async def delete_create_idempotency_for_knowledge_base(self, knowledge_base_id: str) -> None:
         keys = await self.kvstore.keys_in_range("idempotency:create:", "idempotency:create:\xff")

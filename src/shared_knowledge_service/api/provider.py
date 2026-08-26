@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared_knowledge_service.provider.adapter import SharedQdrantVectorIOAdapter
 from shared_knowledge_service.provider.attributes import encode_attributes_for_ogx
+from shared_knowledge_service.provider.config import dense_vector_name
 from shared_knowledge_service.provider.filtering import FilterTranslationError, payload_field_path
 
 from .errors import ApiSecurity, KnowledgeError
@@ -55,6 +56,7 @@ from .models import (
     IngestResponse,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseEmbedding,
+    KnowledgeBaseInferenceConfigResponse,
     KnowledgeBaseResponse,
     OperationResponse,
     OperationStatus,
@@ -131,6 +133,41 @@ def _request_fingerprint(parts: list[bytes]) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
+
+
+def _secret_digest(value: str) -> str:
+    """只把不可逆摘要放入幂等指纹，避免明文凭证进入控制面记录。"""
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def outer_rrf(
+    ranked_results: list[QueryChunksResponse],
+    *,
+    limit: int,
+    rrf_k: int,
+) -> QueryChunksResponse:
+    """等权融合各 KB 的最终排名，并按分支及本地名次稳定处理同分。"""
+
+    scores: dict[tuple[str, str], float] = {}
+    chunks: dict[tuple[str, str], Any] = {}
+    first_order: dict[tuple[str, str], tuple[int, int]] = {}
+    for branch_index, result in enumerate(ranked_results):
+        seen: set[tuple[str, str]] = set()
+        for rank, chunk in enumerate(result.chunks, start=1):
+            metadata = dict(chunk.metadata or {})
+            identity = (str(metadata.get("vector_store_id") or ""), chunk.chunk_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            scores[identity] = scores.get(identity, 0.0) + 1.0 / (rrf_k + rank)
+            chunks.setdefault(identity, chunk)
+            first_order.setdefault(identity, (branch_index, rank))
+    ordered = sorted(scores, key=lambda item: (-scores[item], *first_order[item]))[:limit]
+    return QueryChunksResponse(
+        chunks=[chunks[item] for item in ordered],
+        scores=[scores[item] for item in ordered],
+    )
 
 
 def _cursor_encode(record: FileRecord) -> str:
@@ -219,6 +256,9 @@ class KnowledgeApiConfig(BaseModel):
     failed_source_retention_days: int = Field(default=7, ge=0, le=3650)
     uncommitted_source_retention_hours: int = Field(default=24, ge=0, le=8760)
     file_cleanup_interval_hours: float = Field(default=24.0, gt=0, le=8760)
+    search_branch_concurrency: int = Field(default=8, ge=1, le=64)
+    search_branch_candidate_limit: int = Field(default=50, ge=1, le=200)
+    outer_rrf_k: int = Field(default=60, ge=1, le=10_000)
 
 
 class KnowledgeApiProvider:
@@ -237,6 +277,9 @@ class KnowledgeApiProvider:
         failed_source_retention_days: int = 7,
         uncommitted_source_retention_hours: int = 24,
         file_cleanup_interval_hours: float = 24.0,
+        search_branch_concurrency: int = 8,
+        search_branch_candidate_limit: int = 50,
+        outer_rrf_k: int = 60,
     ) -> None:
         self.files_api = files_api
         self.vector_io = vector_io
@@ -248,6 +291,9 @@ class KnowledgeApiProvider:
         self.failed_source_retention = timedelta(days=failed_source_retention_days)
         self.uncommitted_source_retention = timedelta(hours=uncommitted_source_retention_hours)
         self.file_cleanup_interval_seconds = file_cleanup_interval_hours * 3600
+        self.search_branch_concurrency = search_branch_concurrency
+        self.search_branch_candidate_limit = search_branch_candidate_limit
+        self.outer_rrf_k = outer_rrf_k
         self._cleanup_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
@@ -339,42 +385,68 @@ class KnowledgeApiProvider:
             await self.inference_api.register_model(
                 model_id=internal_model_id,
                 provider_model_id=profile_id,
-                provider_id="tenant-inference",
+                provider_id="knowledge-base-inference",
                 metadata=metadata,
                 model_type=model_type,
             )
             return
-        if existing.provider_id != "tenant-inference" or existing.provider_resource_id != profile_id:
-            raise RuntimeError("内部租户模型资源与 Profile 映射冲突")
+        if existing.provider_id != "knowledge-base-inference" or existing.provider_resource_id != profile_id:
+            raise RuntimeError("内部 KnowledgeBase 模型资源与 Profile 映射冲突")
         if dimension is not None and existing.metadata.get("embedding_dimension") != dimension:
             if routing_table is None:
                 raise RuntimeError("Inference 没有可用的 OGX RoutingTable")
-            updated = existing.model_copy(update={"metadata": metadata})
-            await routing_table.dist_registry.register(updated)
+            # OGX DistributionRegistry 不支持修改已存在资源的 immutable metadata。
+            # 空 KB 切换维度时按正式生命周期替换同一内部 ID，并在失败时尽力恢复旧资源。
+            await routing_table.unregister_model(model_id=internal_model_id)
+            try:
+                await self.inference_api.register_model(
+                    model_id=internal_model_id,
+                    provider_model_id=profile_id,
+                    provider_id="knowledge-base-inference",
+                    metadata=metadata,
+                    model_type=model_type,
+                )
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await self.inference_api.register_model(
+                        model_id=existing.identifier,
+                        provider_model_id=existing.provider_resource_id,
+                        provider_id=existing.provider_id,
+                        metadata=existing.metadata,
+                        model_type=existing.model_type,
+                    )
+                raise
 
-    async def _sync_empty_store_embeddings(self, profile: EmbeddingProfileRecord) -> None:
+    async def _delete_internal_model(self, internal_model_id: str) -> None:
+        """幂等删除 KB 专属内部模型资源，Profile 凭证由状态层另行清理。"""
+
+        if self.inference_api is None:
+            return
+        routing_table = getattr(self.inference_api, "routing_table", None)
+        if routing_table is None:
+            return
+        existing = await routing_table.get_object_by_identifier("model", internal_model_id)
+        if existing is not None:
+            await routing_table.unregister_model(model_id=internal_model_id)
+
+    async def _sync_empty_store_embedding(self, profile: EmbeddingProfileRecord) -> None:
+        """只同步该 Profile 所属的空 KnowledgeBase。"""
+
         routing_table = getattr(self.vector_io, "routing_table", None)
         if routing_table is None:
             raise RuntimeError("VectorIO 没有可用的 OGX RoutingTable")
         provider = routing_table.impls_by_provider_id.get("shared-qdrant")
         if not isinstance(provider, SharedQdrantVectorIOAdapter):
             raise RuntimeError("shared-qdrant Provider 未注册")
-        changed = await provider.reconfigure_empty_tenant_stores(
-            profile.tenant_id,
+        dense_name = dense_vector_name(profile.model_id, profile.dimension)
+        await provider.reconfigure_empty_vector_store(
+            profile.knowledge_base_id,
             embedding_model=profile.internal_model_id,
             embedding_dimension=profile.dimension,
+            dense_vector_name=dense_name,
         )
-        for knowledge_base_id in changed:
-            resource = await routing_table.get_object_by_identifier("vector_store", knowledge_base_id)
-            if resource is None:
-                continue
-            updated = resource.model_copy(
-                update={
-                    "embedding_model": profile.internal_model_id,
-                    "embedding_dimension": profile.dimension,
-                }
-            )
-            await routing_table.dist_registry.register(updated)
+        # VectorStore Registry 只承担 provider 路由；内部模型 ID 不变。实际模型与维度
+        # 由 KB Profile 和 Provider 持久化对象共同作为权威来源，无需制造冲突更新。
 
     @staticmethod
     def _embedding_response(profile: EmbeddingProfileRecord) -> EmbeddingConfigResponse:
@@ -387,65 +459,75 @@ class KnowledgeApiProvider:
             updated_at=profile.updated_at,
         )
 
+    async def _validated_embedding(
+        self,
+        request: EmbeddingConfigPutRequest,
+    ) -> tuple[str, int]:
+        normalized_url = await self.url_policy.normalize_and_validate(request.base_url)
+        actual_dimension = await probe_embedding(
+            policy=self.url_policy,
+            base_url=normalized_url,
+            api_key=request.api_key,
+            model_id=request.model_id,
+            dimension=request.dimension,
+            timeout_seconds=self.inference_timeout_seconds,
+        )
+        return normalized_url, actual_dimension
+
     async def put_embedding_config(
         self,
-        tenant_id: str,
+        knowledge_base_id: str,
         request: EmbeddingConfigPutRequest,
     ) -> EmbeddingConfigResponse:
-        tenant_id = _normalize_identifier(tenant_id, field_name="tenant_id")
+        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
         state = self._state()
-        async with state.locked(f"tenant:{opaque_suffix(tenant_id)}"):
-            existing = await state.get_embedding(tenant_id)
-            if existing is None and request.api_key is None:
-                raise KnowledgeError(422, "embedding_api_key_required", "首次配置 Embedding 必须提供 api_key")
-            normalized_url = await self.url_policy.normalize_and_validate(request.base_url)
-            if existing is not None and existing.locked:
-                locked_values = (existing.base_url, existing.model_id, existing.dimension)
-                requested_values = (normalized_url, request.model_id, request.dimension)
-                if requested_values != locked_values:
-                    raise KnowledgeError(409, "embedding_config_locked", "租户 Embedding 向量空间已经锁定")
-            profile_id = existing.profile_id if existing else state.embedding_profile_id(tenant_id)
-            credential = existing.credential if existing and request.api_key is None else None
-            if request.api_key is not None:
-                credential = state.encrypt_api_key(request.api_key, profile_id=profile_id)
-            if credential is None:
-                raise KnowledgeError(422, "embedding_api_key_required", "Embedding api_key 尚未配置")
-            effective_key = request.api_key or state.decrypt_api_key(credential, profile_id=profile_id)
-            await probe_embedding(
-                policy=self.url_policy,
-                base_url=normalized_url,
-                api_key=effective_key,
-                model_id=request.model_id,
-                dimension=request.dimension,
-                timeout_seconds=self.inference_timeout_seconds,
-            )
+        async with state.locked(f"knowledge-base:{opaque_suffix(knowledge_base_id)}"):
+            _, stores = await self._shared_provider_and_stores([knowledge_base_id])
+            tenant_id = self._tenant_id(stores[0])
+            existing = await state.get_embedding(knowledge_base_id)
+            if existing is None:
+                raise RuntimeError("KnowledgeBase 对应的 Embedding Profile 不存在")
+            normalized_url, actual_dimension = await self._validated_embedding(request)
+            if existing.locked and (request.model_id, actual_dimension) != (existing.model_id, existing.dimension):
+                raise KnowledgeError(409, "embedding_config_locked", "KnowledgeBase Embedding 向量空间已经锁定")
+            profile_id = existing.profile_id
             profile = EmbeddingProfileRecord(
+                knowledge_base_id=knowledge_base_id,
                 tenant_id=tenant_id,
                 profile_id=profile_id,
                 base_url=normalized_url,
                 model_id=request.model_id,
-                dimension=request.dimension,
-                credential=credential,
-                locked=existing.locked if existing else False,
+                dimension=actual_dimension,
+                credential=state.encrypt_api_key(request.api_key, profile_id=profile_id),
+                locked=existing.locked,
                 updated_at=utc_now(),
             )
             await state.save_embedding(profile)
-            await self._ensure_internal_model(
-                internal_model_id=profile.internal_model_id,
-                profile_id=profile.profile_id,
-                model_type=ModelType.embedding,
-                dimension=profile.dimension,
-            )
-            if not profile.locked:
-                await self._sync_empty_store_embeddings(profile)
+            try:
+                await self._ensure_internal_model(
+                    internal_model_id=profile.internal_model_id,
+                    profile_id=profile.profile_id,
+                    model_type=ModelType.embedding,
+                    dimension=profile.dimension,
+                )
+                if not profile.locked:
+                    await self._sync_empty_store_embedding(profile)
+            except Exception:
+                # Profile 是推理 Provider 的权威来源；同步失败时同时恢复状态、
+                # 内部模型元数据和空 KB 路由，避免三处配置指向不同向量空间。
+                await state.save_embedding(existing)
+                with contextlib.suppress(Exception):
+                    await self._ensure_internal_model(
+                        internal_model_id=existing.internal_model_id,
+                        profile_id=existing.profile_id,
+                        model_type=ModelType.embedding,
+                        dimension=existing.dimension,
+                    )
+                if not existing.locked:
+                    with contextlib.suppress(Exception):
+                        await self._sync_empty_store_embedding(existing)
+                raise
             return self._embedding_response(profile)
-
-    async def get_embedding_config(self, tenant_id: str) -> EmbeddingConfigResponse:
-        tenant_id = _normalize_identifier(tenant_id, field_name="tenant_id")
-        profile = await self._state().get_embedding(tenant_id)
-        if profile is None:
-            raise KnowledgeError(404, "embedding_config_not_found", "租户 Embedding 配置不存在")
-        return self._embedding_response(profile)
 
     @staticmethod
     def _rerank_response(profile: RerankProfileRecord) -> RerankConfigResponse:
@@ -459,55 +541,79 @@ class KnowledgeApiProvider:
 
     async def put_rerank_config(
         self,
-        tenant_id: str,
+        knowledge_base_id: str,
         request: RerankConfigPutRequest,
     ) -> RerankConfigResponse:
-        tenant_id = _normalize_identifier(tenant_id, field_name="tenant_id")
+        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
         state = self._state()
-        async with state.locked(f"tenant-rerank:{opaque_suffix(tenant_id)}"):
-            existing = await state.get_rerank(tenant_id)
-            profile_id = existing.profile_id if existing else state.rerank_profile_id(tenant_id)
-            base_url = request.base_url if request.base_url is not None else (existing.base_url if existing else None)
-            model_id = request.model_id if request.model_id is not None else (existing.model_id if existing else None)
-            credential = existing.credential if existing else None
-            if request.api_key is not None:
-                credential = state.encrypt_api_key(request.api_key, profile_id=profile_id)
-            normalized_url = await self.url_policy.normalize_and_validate(base_url) if base_url is not None else None
-            if request.enabled and (normalized_url is None or model_id is None or credential is None):
-                raise KnowledgeError(422, "rerank_config_incomplete", "启用 Rerank 需要完整 URL、api_key 和 model_id")
+        async with state.locked(f"knowledge-base:{opaque_suffix(knowledge_base_id)}"):
+            _, stores = await self._shared_provider_and_stores([knowledge_base_id])
+            tenant_id = self._tenant_id(stores[0])
+            existing = await state.get_rerank(knowledge_base_id)
+            profile_id = existing.profile_id if existing else state.rerank_profile_id(knowledge_base_id)
+            normalized_url: str | None = None
+            credential = None
             if request.enabled:
-                api_key = request.api_key or state.decrypt_api_key(cast(Any, credential), profile_id=profile_id)
+                if request.base_url is None or request.api_key is None or request.model_id is None:
+                    raise KnowledgeError(422, "rerank_config_incomplete", "启用 Rerank 需要完整连接配置")
+                normalized_url = await self.url_policy.normalize_and_validate(request.base_url)
                 await probe_rerank(
                     policy=self.url_policy,
-                    base_url=cast(str, normalized_url),
-                    api_key=api_key,
-                    model_id=cast(str, model_id),
+                    base_url=normalized_url,
+                    api_key=request.api_key,
+                    model_id=request.model_id,
                     timeout_seconds=self.inference_timeout_seconds,
                 )
+                credential = state.encrypt_api_key(request.api_key, profile_id=profile_id)
             profile = RerankProfileRecord(
+                knowledge_base_id=knowledge_base_id,
                 tenant_id=tenant_id,
                 profile_id=profile_id,
                 enabled=request.enabled,
                 base_url=normalized_url,
-                model_id=model_id,
+                model_id=request.model_id if request.enabled else None,
                 credential=credential,
                 updated_at=utc_now(),
             )
+            if not profile.enabled:
+                # 先移除路由资源再持久化关闭态；若状态写入失败，旧 Profile 仍可在
+                # 下一次 Search 中按需重建资源，不会出现“已关闭但仍可调用”。
+                await self._delete_internal_model(profile.internal_model_id)
+                await state.save_rerank(profile)
+                return self._rerank_response(profile)
+
             await state.save_rerank(profile)
-            if profile.base_url is not None and profile.model_id is not None and profile.credential is not None:
+            try:
                 await self._ensure_internal_model(
                     internal_model_id=profile.internal_model_id,
                     profile_id=profile.profile_id,
                     model_type=ModelType.rerank,
                 )
+            except Exception:
+                if existing is None:
+                    await state.delete_rerank(knowledge_base_id)
+                    with contextlib.suppress(Exception):
+                        await self._delete_internal_model(profile.internal_model_id)
+                else:
+                    await state.save_rerank(existing)
+                raise
             return self._rerank_response(profile)
 
-    async def get_rerank_config(self, tenant_id: str) -> RerankConfigResponse:
-        tenant_id = _normalize_identifier(tenant_id, field_name="tenant_id")
-        profile = await self._state().get_rerank(tenant_id)
-        if profile is None:
-            raise KnowledgeError(404, "rerank_config_not_found", "租户 Rerank 配置不存在")
-        return self._rerank_response(profile)
+    async def get_inference_config(
+        self,
+        knowledge_base_id: str,
+    ) -> KnowledgeBaseInferenceConfigResponse:
+        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
+        await self._shared_provider([knowledge_base_id])
+        embedding = await self._state().get_embedding(knowledge_base_id)
+        if embedding is None:
+            raise RuntimeError("KnowledgeBase 对应的 Embedding Profile 不存在")
+        rerank = await self._state().get_rerank(knowledge_base_id)
+        return KnowledgeBaseInferenceConfigResponse(
+            knowledge_base_id=knowledge_base_id,
+            embedding=self._embedding_response(embedding),
+            rerank=self._rerank_response(rerank) if rerank is not None else None,
+        )
 
     async def _create_vector_store_with_id(
         self,
@@ -516,6 +622,7 @@ class KnowledgeApiProvider:
     ) -> Any:
         """预分配 ID，保证创建幂等记录可以在 OGX 对象之前落盘。"""
 
+        dense_name = dense_vector_name(profile.model_id, profile.dimension)
         routing_table = getattr(self.vector_io, "routing_table", None)
         if routing_table is None:
             raise RuntimeError("VectorIO 没有可用的 OGX RoutingTable")
@@ -534,7 +641,12 @@ class KnowledgeApiProvider:
         except VectorStoreNotFoundError:
             params = OpenAICreateVectorStoreRequestWithExtraBody.model_validate(
                 {
-                    "metadata": {"tenant_id": profile.tenant_id},
+                    "metadata": {
+                        "tenant_id": profile.tenant_id,
+                        "embedding_model": profile.internal_model_id,
+                        "embedding_dimension": str(profile.dimension),
+                        "dense_vector_name": dense_name,
+                    },
                     "provider_vector_store_id": knowledge_base_id,
                     "provider_id": "shared-qdrant",
                     "embedding_model": profile.internal_model_id,
@@ -552,6 +664,7 @@ class KnowledgeApiProvider:
                         "tenant_id": profile.tenant_id,
                         "embedding_model": profile.internal_model_id,
                         "embedding_dimension": str(profile.dimension),
+                        "dense_vector_name": dense_name,
                     }
                 ),
             )
@@ -566,21 +679,23 @@ class KnowledgeApiProvider:
         if len(idempotency_key) > 255:
             raise KnowledgeError(422, "invalid_idempotency_key", "Idempotency-Key 不能超过 255 个字符")
         state = self._state()
-        profile = await state.get_embedding(request.tenant_id)
-        if profile is None:
-            raise KnowledgeError(409, "embedding_config_required", "创建 KnowledgeBase 前必须配置 Embedding")
-        await self._ensure_internal_model(
-            internal_model_id=profile.internal_model_id,
-            profile_id=profile.profile_id,
-            model_type=ModelType.embedding,
-            dimension=profile.dimension,
+        fingerprint_payload = request.model_dump(mode="json")
+        fingerprint_payload["embedding"]["api_key"] = _secret_digest(request.embedding.api_key)
+        if request.rerank is not None:
+            fingerprint_payload["rerank"]["api_key"] = _secret_digest(request.rerank.api_key)
+        fingerprint = _request_fingerprint(
+            [json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")]
         )
-        fingerprint = _request_fingerprint([request.tenant_id.encode("utf-8")])
         lock_key = f"create:{opaque_suffix(request.tenant_id)}:{opaque_suffix(idempotency_key)}"
         async with state.locked(lock_key):
             record = await state.get_create_idempotency(request.tenant_id, idempotency_key)
             if record is not None and record.fingerprint != fingerprint:
                 raise KnowledgeError(409, "idempotency_conflict", "Idempotency-Key 已用于不同请求")
+            if record is not None and record.state == "completed":
+                _, stores = await self._shared_provider_and_stores([record.knowledge_base_id])
+                response = await self._knowledge_base_response(stores[0])
+                response.replayed = True
+                return response
             if record is None:
                 record = CreateIdempotencyRecord(
                     tenant_id=request.tenant_id,
@@ -589,20 +704,83 @@ class KnowledgeApiProvider:
                     knowledge_base_id=f"vs_{uuid.uuid4()}",
                 )
                 await state.save_create_idempotency(idempotency_key, record)
-            store = await self._create_vector_store_with_id(record.knowledge_base_id, profile)
-            replayed = record.state == "completed"
-            if not replayed:
+            knowledge_base_id = record.knowledge_base_id
+            embedding_internal_id = f"knowledge-base-inference/embedding_{opaque_suffix(knowledge_base_id)}"
+            rerank_internal_id = f"knowledge-base-inference/rerank_{opaque_suffix(knowledge_base_id)}"
+            try:
+                normalized_embedding_url, actual_dimension = await self._validated_embedding(request.embedding)
+                embedding_profile_id = state.embedding_profile_id(knowledge_base_id)
+                embedding = EmbeddingProfileRecord(
+                    knowledge_base_id=knowledge_base_id,
+                    tenant_id=request.tenant_id,
+                    profile_id=embedding_profile_id,
+                    base_url=normalized_embedding_url,
+                    model_id=request.embedding.model_id,
+                    dimension=actual_dimension,
+                    credential=state.encrypt_api_key(request.embedding.api_key, profile_id=embedding_profile_id),
+                )
+                rerank: RerankProfileRecord | None = None
+                if request.rerank is not None:
+                    normalized_rerank_url = await self.url_policy.normalize_and_validate(request.rerank.base_url)
+                    await probe_rerank(
+                        policy=self.url_policy,
+                        base_url=normalized_rerank_url,
+                        api_key=request.rerank.api_key,
+                        model_id=request.rerank.model_id,
+                        timeout_seconds=self.inference_timeout_seconds,
+                    )
+                    rerank_profile_id = state.rerank_profile_id(knowledge_base_id)
+                    rerank = RerankProfileRecord(
+                        knowledge_base_id=knowledge_base_id,
+                        tenant_id=request.tenant_id,
+                        profile_id=rerank_profile_id,
+                        enabled=True,
+                        base_url=normalized_rerank_url,
+                        model_id=request.rerank.model_id,
+                        credential=state.encrypt_api_key(request.rerank.api_key, profile_id=rerank_profile_id),
+                    )
+                await state.save_embedding(embedding)
+                if rerank is not None:
+                    await state.save_rerank(rerank)
+                await self._ensure_internal_model(
+                    internal_model_id=embedding.internal_model_id,
+                    profile_id=embedding.profile_id,
+                    model_type=ModelType.embedding,
+                    dimension=embedding.dimension,
+                )
+                if rerank is not None:
+                    await self._ensure_internal_model(
+                        internal_model_id=rerank.internal_model_id,
+                        profile_id=rerank.profile_id,
+                        model_type=ModelType.rerank,
+                    )
+                store = await self._create_vector_store_with_id(knowledge_base_id, embedding)
                 record.state = "completed"
                 await state.save_create_idempotency(idempotency_key, record)
+            except Exception:
+                # 创建接口失败不能留下可被产品误认为有效的 KB 或凭证。
+                with contextlib.suppress(Exception):
+                    await self.vector_io.openai_delete_vector_store(knowledge_base_id)
+                routing_table = getattr(self.vector_io, "routing_table", None)
+                if routing_table is not None:
+                    with contextlib.suppress(Exception):
+                        await routing_table.unregister_vector_store(knowledge_base_id)
+                with contextlib.suppress(Exception):
+                    await self._delete_internal_model(embedding_internal_id)
+                with contextlib.suppress(Exception):
+                    await self._delete_internal_model(rerank_internal_id)
+                await state.delete_inference_profiles(knowledge_base_id)
+                await state.delete_create_idempotency(request.tenant_id, idempotency_key)
+                raise
             response = await self._knowledge_base_response(store)
-            response.replayed = replayed
             return response
 
     async def _knowledge_base_response(self, store: Any) -> KnowledgeBaseResponse:
         tenant_id = self._tenant_id(store)
-        profile = await self._state().get_embedding(tenant_id)
+        profile = await self._state().get_embedding(store.id)
         if profile is None:
             raise RuntimeError("KnowledgeBase 对应的 Embedding Profile 不存在")
+        rerank = await self._state().get_rerank(store.id)
         counts = await self._file_counts(store.id)
         return KnowledgeBaseResponse(
             knowledge_base_id=store.id,
@@ -612,6 +790,7 @@ class KnowledgeApiProvider:
                 dimension=profile.dimension,
                 locked=profile.locked,
             ),
+            rerank=self._rerank_response(rerank) if rerank is not None else None,
             file_counts=counts,
             created_at=_datetime_from_timestamp(store.created_at),
         )
@@ -632,18 +811,17 @@ class KnowledgeApiProvider:
 
     async def _prepare_embedding_for_ingest(
         self,
-        tenant_id: str,
         provider: SharedQdrantVectorIOAdapter,
         knowledge_base_id: str,
     ) -> EmbeddingProfileRecord:
-        """在同一租户锁内确认 Collection 后锁定向量空间配置。"""
+        """在同一 KB 生命周期锁内确认 Named Vector 后锁定向量空间配置。"""
 
         state = self._state()
-        async with state.locked(f"tenant:{opaque_suffix(tenant_id)}"):
-            profile = await state.get_embedding(tenant_id)
+        async with state.locked(f"embedding:{opaque_suffix(knowledge_base_id)}"):
+            profile = await state.get_embedding(knowledge_base_id)
             if profile is None:
-                raise KnowledgeError(409, "embedding_config_required", "Ingest 前必须配置 Embedding")
-            # Qdrant 初始化失败时请求尚未被接受，不应提前把租户配置永久锁死。
+                raise KnowledgeError(409, "embedding_config_required", "KnowledgeBase 缺少 Embedding 配置")
+            # Qdrant 初始化失败时请求尚未被接受，不应提前把 KB 配置永久锁死。
             await provider.ensure_vector_store_collection(knowledge_base_id)
             if not profile.locked:
                 profile.locked = True
@@ -713,9 +891,8 @@ class KnowledgeApiProvider:
                         status=operation.status,
                         replayed=True,
                     )
-                provider, stores = await self._shared_provider_and_stores([knowledge_base_id])
-                tenant_id = self._tenant_id(stores[0])
-                profile = await self._prepare_embedding_for_ingest(tenant_id, provider, knowledge_base_id)
+                provider, _ = await self._shared_provider_and_stores([knowledge_base_id])
+                profile = await self._prepare_embedding_for_ingest(provider, knowledge_base_id)
                 if record is None:
                     record = IngestIdempotencyRecord(
                         knowledge_base_id=knowledge_base_id,
@@ -781,7 +958,7 @@ class KnowledgeApiProvider:
                 log.info(
                     "Knowledge ingest accepted",
                     vector_store_id=knowledge_base_id,
-                    tenant_profile_id=profile.profile_id,
+                    knowledge_base_profile_id=profile.profile_id,
                     operation_id=batch.id,
                     file_id=uploaded.id,
                 )
@@ -1119,6 +1296,13 @@ class KnowledgeApiProvider:
                 await self._delete_file_under_knowledge_base_lock(knowledge_base_id, record.file_id)
             if store_exists:
                 await self.vector_io.openai_delete_vector_store(knowledge_base_id)
+            embedding = await state.get_embedding(knowledge_base_id)
+            rerank = await state.get_rerank(knowledge_base_id)
+            if embedding is not None:
+                await self._delete_internal_model(embedding.internal_model_id)
+            if rerank is not None:
+                await self._delete_internal_model(rerank.internal_model_id)
+            await state.delete_inference_profiles(knowledge_base_id)
             await state.delete_create_idempotency_for_knowledge_base(knowledge_base_id)
             await state.clear_knowledge_base_lifecycle(knowledge_base_id)
 
@@ -1252,25 +1436,57 @@ class KnowledgeApiProvider:
         tenant_ids = {self._tenant_id(store) for store in stores}
         if len(tenant_ids) != 1:
             raise KnowledgeError(422, "cross_tenant_search", "一次 Search 不能跨租户 Collection")
-        rerank_model: str | None = None
-        if request.mode == "hybrid":
-            rerank = await self._state().get_rerank(next(iter(tenant_ids)))
-            if rerank is not None and rerank.enabled:
-                await self._ensure_internal_model(
-                    internal_model_id=rerank.internal_model_id,
-                    profile_id=rerank.profile_id,
-                    model_type=ModelType.rerank,
-                )
-                rerank_model = rerank.internal_model_id
         try:
             filters = parse_filter(request.filters) if request.filters is not None else None
-            result = await provider.query_multiple_vector_stores(
-                vector_store_ids=request.knowledge_base_ids,
-                query=request.query,
-                mode=request.mode,
-                limit=request.limit,
-                filters=filters,
-                rerank_model=rerank_model,
+            is_cross_kb = len(request.knowledge_base_ids) > 1
+            local_limit = max(request.limit, self.search_branch_candidate_limit) if is_cross_kb else request.limit
+            semaphore = asyncio.Semaphore(self.search_branch_concurrency)
+
+            async def search_branch(knowledge_base_id: str) -> QueryChunksResponse:
+                """每个分支只读取自己的配置快照并执行自己的本地排名。"""
+
+                async with (
+                    semaphore,
+                    self._state().locked(f"knowledge-base:{opaque_suffix(knowledge_base_id)}"),
+                ):
+                    # 配置更新和删除使用同一把 KB 锁；持锁到模型调用结束，保证
+                    # 进行中的 Search 使用开始时看到的完整 URL/Key/模型配置。
+                    embedding = await self._state().get_embedding(knowledge_base_id)
+                    if embedding is None:
+                        raise RuntimeError("KnowledgeBase 对应的 Embedding Profile 不存在")
+                    if request.mode != "bm25":
+                        await self._ensure_internal_model(
+                            internal_model_id=embedding.internal_model_id,
+                            profile_id=embedding.profile_id,
+                            model_type=ModelType.embedding,
+                            dimension=embedding.dimension,
+                        )
+                    rerank_model: str | None = None
+                    if request.mode == "hybrid":
+                        rerank = await self._state().get_rerank(knowledge_base_id)
+                        if rerank is not None and rerank.enabled:
+                            await self._ensure_internal_model(
+                                internal_model_id=rerank.internal_model_id,
+                                profile_id=rerank.profile_id,
+                                model_type=ModelType.rerank,
+                            )
+                            rerank_model = rerank.internal_model_id
+                    return await provider.query_vector_store(
+                        vector_store_id=knowledge_base_id,
+                        query=request.query,
+                        mode=request.mode,
+                        limit=local_limit,
+                        filters=filters,
+                        rerank_model=rerank_model,
+                    )
+
+            ranked_results = await asyncio.gather(
+                *(search_branch(knowledge_base_id) for knowledge_base_id in request.knowledge_base_ids)
+            )
+            result = (
+                outer_rrf(ranked_results, limit=request.limit, rrf_k=self.outer_rrf_k)
+                if is_cross_kb
+                else ranked_results[0]
             )
         except ValueError as exc:
             raise KnowledgeError(422, "invalid_search", str(exc)) from exc
@@ -1362,6 +1578,9 @@ async def get_provider_impl(config: KnowledgeApiConfig, deps: dict[Api, Any]) ->
         failed_source_retention_days=config.failed_source_retention_days,
         uncommitted_source_retention_hours=config.uncommitted_source_retention_hours,
         file_cleanup_interval_hours=config.file_cleanup_interval_hours,
+        search_branch_concurrency=config.search_branch_concurrency,
+        search_branch_candidate_limit=config.search_branch_candidate_limit,
+        outer_rrf_k=config.outer_rrf_k,
     )
     await impl.initialize()
     return impl

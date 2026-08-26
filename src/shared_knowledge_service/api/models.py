@@ -170,18 +170,18 @@ class SearchResponse(BaseModel):
 
 
 class EmbeddingConfigPutRequest(BaseModel):
-    """租户提交的完整 Embedding 连接配置。"""
+    """KnowledgeBase 提交的完整 Embedding 连接配置。"""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
     base_url: str = Field(min_length=1, max_length=2048)
-    api_key: str | None = Field(default=None, min_length=1, max_length=8192)
+    api_key: str = Field(min_length=1, max_length=8192)
     model_id: str = Field(min_length=1, max_length=512)
-    dimension: int = Field(ge=1, le=65_536)
+    dimension: int | None = Field(default=None, ge=1, le=65_536)
 
 
 class EmbeddingConfigResponse(BaseModel):
-    """不包含明文凭证的租户 Embedding 配置。"""
+    """不包含明文凭证的 KnowledgeBase Embedding 配置。"""
 
     base_url: str
     model_id: str
@@ -192,7 +192,7 @@ class EmbeddingConfigResponse(BaseModel):
 
 
 class RerankConfigPutRequest(BaseModel):
-    """租户 Rerank 开关与独立连接配置。"""
+    """KnowledgeBase Rerank 开关与独立连接配置。"""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -201,9 +201,30 @@ class RerankConfigPutRequest(BaseModel):
     api_key: str | None = Field(default=None, min_length=1, max_length=8192)
     model_id: str | None = Field(default=None, min_length=1, max_length=512)
 
+    @model_validator(mode="after")
+    def validate_complete_connection(self) -> RerankConfigPutRequest:
+        """启用时必须完整提交；关闭时不隐式保留旧连接。"""
+
+        values = (self.base_url, self.api_key, self.model_id)
+        if self.enabled and any(value is None for value in values):
+            raise ValueError("启用 Rerank 需要完整的 base_url、api_key 和 model_id")
+        if not self.enabled and any(value is not None for value in values):
+            raise ValueError("关闭 Rerank 时不能同时提交连接配置")
+        return self
+
+
+class RerankConfigCreateRequest(BaseModel):
+    """创建 KnowledgeBase 时提交的可选完整 Rerank 连接。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str = Field(min_length=1, max_length=8192)
+    model_id: str = Field(min_length=1, max_length=512)
+
 
 class RerankConfigResponse(BaseModel):
-    """不包含明文凭证的租户 Rerank 配置。"""
+    """不包含明文凭证的 KnowledgeBase Rerank 配置。"""
 
     enabled: bool
     base_url: str | None
@@ -213,11 +234,13 @@ class RerankConfigResponse(BaseModel):
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
-    """创建技术 KnowledgeBase 时唯一需要的业务路由信息。"""
+    """创建技术 KnowledgeBase 时提交存储路由和完整模型配置。"""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
     tenant_id: str = Field(min_length=1, max_length=256)
+    embedding: EmbeddingConfigPutRequest
+    rerank: RerankConfigCreateRequest | None = None
 
     @field_validator("tenant_id")
     @classmethod
@@ -248,9 +271,18 @@ class KnowledgeBaseResponse(BaseModel):
     knowledge_base_id: str
     tenant_id: str
     embedding: KnowledgeBaseEmbedding
+    rerank: RerankConfigResponse | None
     file_counts: FileCounts
     created_at: datetime
     replayed: bool = Field(default=False, exclude=True)
+
+
+class KnowledgeBaseInferenceConfigResponse(BaseModel):
+    """KnowledgeBase 当前完整但不含凭证的模型配置。"""
+
+    knowledge_base_id: str
+    embedding: EmbeddingConfigResponse
+    rerank: RerankConfigResponse | None
 
 
 class FileQueryRequest(BaseModel):

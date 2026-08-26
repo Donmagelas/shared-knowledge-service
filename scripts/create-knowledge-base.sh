@@ -8,15 +8,16 @@ cd "${repo_root}"
 usage() {
     cat <<'EOF'
 用法：
-  ./scripts/configure-tenant.sh \
+  ./scripts/create-knowledge-base.sh \
     --tenant TENANT_ID \
     --embedding-url URL \
     --embedding-model MODEL_ID \
-    --embedding-dimension DIMENSION \
+    [--embedding-dimension DIMENSION] \
     [--enable-rerank --rerank-url URL --rerank-model MODEL_ID]
 
 Embedding/Rerank API Key 默认从终端隐藏输入；自动化时可分别设置
-EMBEDDING_API_KEY 和 RERANK_API_KEY 环境变量。Key 不作为命令行参数传递。
+EMBEDDING_API_KEY 和 RERANK_API_KEY。Key 不作为命令行参数传递。
+可用 IDEMPOTENCY_KEY 固定创建请求的幂等键。
 EOF
 }
 
@@ -42,12 +43,12 @@ while (($#)); do
     esac
 done
 
-if [[ -z "${tenant_id}" || -z "${embedding_url}" || -z "${embedding_model}" || -z "${embedding_dimension}" ]]; then
+if [[ -z "${tenant_id}" || -z "${embedding_url}" || -z "${embedding_model}" ]]; then
     echo "缺少必填的租户或 Embedding 参数。" >&2
     usage >&2
     exit 2
 fi
-if [[ ! "${embedding_dimension}" =~ ^[1-9][0-9]*$ ]]; then
+if [[ -n "${embedding_dimension}" && ! "${embedding_dimension}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Embedding dimension 必须是正整数。" >&2
     exit 2
 fi
@@ -79,61 +80,62 @@ if [[ "${rerank_enabled}" == true ]]; then
     fi
 fi
 
-# Secret 通过 stdin 进入容器，不出现在命令行参数、Compose 配置或脚本日志中。
+idempotency_key="${IDEMPOTENCY_KEY:-create-$(date +%s)-$$}"
+
+# Secret 只经 stdin 进入容器；Python 在容器内组装 JSON，避免 Key 出现在进程参数和日志中。
 printf '%s\n' \
     "${tenant_id}" \
     "${embedding_url}" \
     "${embedding_api_key}" \
     "${embedding_model}" \
-    "${embedding_dimension}" \
+    "${embedding_dimension:--}" \
     "${rerank_enabled}" \
     "${rerank_url:--}" \
     "${rerank_api_key:--}" \
-    "${rerank_model:--}" | \
+    "${rerank_model:--}" \
+    "${idempotency_key}" | \
 docker compose exec -T knowledge-ogx /app/.venv/bin/python -c '
 import json
 import os
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
 values = sys.stdin.read().splitlines()
-if len(values) != 9:
-    raise SystemExit("租户配置输入不完整")
-tenant, emb_url, emb_key, emb_model, emb_dim, rerank_enabled, rerank_url, rerank_key, rerank_model = values
-admin_token = os.environ["KNOWLEDGE_ADMIN_TOKEN"]
-headers = {
-    "Authorization": "Bearer " + admin_token,
-    "Content-Type": "application/json",
+if len(values) != 10:
+    raise SystemExit("KnowledgeBase 创建输入不完整")
+tenant, emb_url, emb_key, emb_model, emb_dim, rerank_enabled, rerank_url, rerank_key, rerank_model, key = values
+payload = {
+    "tenant_id": tenant,
+    "embedding": {
+        "base_url": emb_url,
+        "api_key": emb_key,
+        "model_id": emb_model,
+    },
 }
-
-def put(path: str, payload: dict[str, object]) -> None:
-    request = urllib.request.Request(
-        f"http://127.0.0.1:8321{path}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            print(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        print(error.read().decode("utf-8"), file=sys.stderr)
-        raise SystemExit(1) from None
-
-tenant_path = urllib.parse.quote(tenant, safe="")
-put(
-    f"/knowledge/v1/tenants/{tenant_path}/embedding-config",
-    {"base_url": emb_url, "api_key": emb_key, "model_id": emb_model, "dimension": int(emb_dim)},
-)
+if emb_dim != "-":
+    payload["embedding"]["dimension"] = int(emb_dim)
 if rerank_enabled == "true":
-    put(
-        f"/knowledge/v1/tenants/{tenant_path}/rerank-config",
-        {"enabled": True, "base_url": rerank_url, "api_key": rerank_key, "model_id": rerank_model},
-    )
-else:
-    put(f"/knowledge/v1/tenants/{tenant_path}/rerank-config", {"enabled": False})
-'
+    payload["rerank"] = {
+        "base_url": rerank_url,
+        "api_key": rerank_key,
+        "model_id": rerank_model,
+    }
 
-echo "租户 ${tenant_id} 的模型配置已提交；服务响应不会回显 API Key。"
+request = urllib.request.Request(
+    "http://127.0.0.1:8321/knowledge/v1/knowledge-bases",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+        "Authorization": "Bearer " + os.environ["KNOWLEDGE_RUNTIME_TOKEN"],
+        "Content-Type": "application/json",
+        "Idempotency-Key": key,
+    },
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=60) as response:
+        print(response.read().decode("utf-8"))
+except urllib.error.HTTPError as error:
+    print(error.read().decode("utf-8"), file=sys.stderr)
+    raise SystemExit(1) from None
+'

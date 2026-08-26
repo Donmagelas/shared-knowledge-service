@@ -14,8 +14,10 @@ from ogx.providers.inline.files.localfs.config import LocalfsFilesImplConfig
 from ogx.providers.remote.files.s3.config import S3FilesImplConfig
 from ogx_api import Api, RemoteProviderSpec
 
+from shared_knowledge_service.knowledge_base_inference import (
+    get_provider_spec as get_knowledge_base_inference_provider_spec,
+)
 from shared_knowledge_service.provider import get_provider_spec
-from shared_knowledge_service.tenant_inference import get_provider_spec as get_tenant_inference_provider_spec
 
 
 def test_provider_spec_declares_external_vector_io() -> None:
@@ -50,17 +52,17 @@ def test_ogx_registry_loads_provider_from_project_module() -> None:
     assert loaded.config_class.endswith("SharedQdrantVectorIOConfig")
 
 
-def test_tenant_inference_provider_spec_declares_external_inference() -> None:
-    spec = get_tenant_inference_provider_spec()
+def test_knowledge_base_inference_provider_spec_declares_external_inference() -> None:
+    spec = get_knowledge_base_inference_provider_spec()
 
     assert spec.api is Api.inference
-    assert spec.provider_type == "remote::tenant-inference"
-    assert spec.module == "shared_knowledge_service.tenant_inference.provider"
+    assert spec.provider_type == "remote::knowledge-base-inference"
+    assert spec.module == "shared_knowledge_service.knowledge_base_inference.provider"
     assert spec.is_external is True
 
 
-def test_project_config_registers_tenant_inference_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """真实项目配置只启用租户感知 Provider，不再使用全局模型连接。"""
+def test_project_config_registers_knowledge_base_inference_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实项目配置只启用 KnowledgeBase 感知 Provider。"""
 
     monkeypatch.setenv("KNOWLEDGE_CREDENTIAL_MASTER_KEY", "test-master-key-at-least-sixteen")
     monkeypatch.setenv("KNOWLEDGE_RUNTIME_TOKEN", "runtime-test-at-least-sixteen")
@@ -70,7 +72,7 @@ def test_project_config_registers_tenant_inference_provider(monkeypatch: pytest.
 
     registry = get_provider_registry(config)
 
-    assert "remote::tenant-inference" in registry[Api.inference]
+    assert "remote::knowledge-base-inference" in registry[Api.inference]
 
 
 @pytest.mark.parametrize(

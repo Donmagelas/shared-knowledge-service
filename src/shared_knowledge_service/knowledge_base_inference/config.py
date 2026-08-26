@@ -1,4 +1,4 @@
-"""租户感知 Inference Provider 配置。"""
+"""KnowledgeBase 感知 Inference Provider 配置。"""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from ogx.core.storage.datatypes import KVStoreReference
 from pydantic import BaseModel, Field
 
 
-class TenantInferenceConfig(BaseModel):
-    """只保存设施级安全配置，不保存任何租户 API Key。"""
+class KnowledgeBaseInferenceConfig(BaseModel):
+    """只保存设施级安全配置，不保存任何 KnowledgeBase API Key。"""
 
     persistence: KVStoreReference
     credential_master_key: str = Field(min_length=16)

@@ -12,9 +12,9 @@ external_apis_dir: config/apis.d
 
 providers:
   inference:
-    - provider_id: tenant-inference
-      provider_type: remote::tenant-inference
-      module: shared_knowledge_service.tenant_inference
+    - provider_id: knowledge-base-inference
+      provider_type: remote::knowledge-base-inference
+      module: shared_knowledge_service.knowledge_base_inference
       config:
         allowed_hosts: ${env.KNOWLEDGE_INFERENCE_ALLOWED_HOSTS:=}
         credential_master_key: ${env.KNOWLEDGE_CREDENTIAL_MASTER_KEY}
@@ -31,7 +31,6 @@ providers:
       config:
         api_key: ${env.QDRANT_API_KEY:=}
         collection_name: ${env.QDRANT_COLLECTION_NAME:=shared_knowledge}
-        dense_vector_name: dense
         # 需要高性能过滤的业务字段由 Stella/企业版部署时按实际 Payload 契约声明。
         payload_indexes: {}
         persistence:
@@ -77,10 +76,13 @@ providers:
         file_cleanup_interval_hours: ${env.KNOWLEDGE_FILE_CLEANUP_INTERVAL_HOURS:=24}
         http_allowed_inference_hosts: ${env.KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS:=}
         inference_timeout_seconds: ${env.KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS:=30}
+        outer_rrf_k: ${env.KNOWLEDGE_OUTER_RRF_K:=60}
         persistence:
           backend: kv_default
           namespace: knowledge_control
         runtime_token: ${env.KNOWLEDGE_RUNTIME_TOKEN}
+        search_branch_candidate_limit: ${env.KNOWLEDGE_SEARCH_BRANCH_CANDIDATE_LIMIT:=50}
+        search_branch_concurrency: ${env.KNOWLEDGE_SEARCH_BRANCH_CONCURRENCY:=8}
         uncommitted_source_retention_hours: ${env.KNOWLEDGE_UNCOMMITTED_SOURCE_RETENTION_HOURS:=24}
 
 storage:

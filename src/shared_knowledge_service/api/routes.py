@@ -25,6 +25,7 @@ from .models import (
     FileQueryResponse,
     IngestResponse,
     KnowledgeBaseCreateRequest,
+    KnowledgeBaseInferenceConfigResponse,
     KnowledgeBaseResponse,
     OperationResponse,
     RerankConfigPutRequest,
@@ -95,50 +96,6 @@ def create_router(
             raise KnowledgeError(401, "unauthorized", "OGX 原生接口需要 Admin Token")
         return {"principal": "knowledge-admin", "attributes": {"roles": ["admin"]}}
 
-    @router.put(
-        "/tenants/{tenant_id}/embedding-config",
-        response_model=EmbeddingConfigResponse,
-        summary="配置租户 Embedding",
-    )
-    async def put_embedding_config(
-        tenant_id: str,
-        body: EmbeddingConfigPutRequest,
-        request: Request,
-    ) -> EmbeddingConfigResponse:
-        require_admin(request)
-        return await impl.put_embedding_config(tenant_id, body)
-
-    @router.get(
-        "/tenants/{tenant_id}/embedding-config",
-        response_model=EmbeddingConfigResponse,
-        summary="查询租户 Embedding 配置",
-    )
-    async def get_embedding_config(tenant_id: str, request: Request) -> EmbeddingConfigResponse:
-        require_admin(request)
-        return await impl.get_embedding_config(tenant_id)
-
-    @router.put(
-        "/tenants/{tenant_id}/rerank-config",
-        response_model=RerankConfigResponse,
-        summary="配置租户 Rerank",
-    )
-    async def put_rerank_config(
-        tenant_id: str,
-        body: RerankConfigPutRequest,
-        request: Request,
-    ) -> RerankConfigResponse:
-        require_admin(request)
-        return await impl.put_rerank_config(tenant_id, body)
-
-    @router.get(
-        "/tenants/{tenant_id}/rerank-config",
-        response_model=RerankConfigResponse,
-        summary="查询租户 Rerank 配置",
-    )
-    async def get_rerank_config(tenant_id: str, request: Request) -> RerankConfigResponse:
-        require_admin(request)
-        return await impl.get_rerank_config(tenant_id)
-
     @router.post(
         "/knowledge-bases",
         response_model=KnowledgeBaseResponse,
@@ -164,6 +121,44 @@ def create_router(
     async def get_knowledge_base(knowledge_base_id: str, request: Request) -> KnowledgeBaseResponse:
         require_runtime(request)
         return await impl.get_knowledge_base(knowledge_base_id)
+
+    @router.get(
+        "/knowledge-bases/{knowledge_base_id}/inference-config",
+        response_model=KnowledgeBaseInferenceConfigResponse,
+        summary="查询 KnowledgeBase 模型配置",
+    )
+    async def get_inference_config(
+        knowledge_base_id: str,
+        request: Request,
+    ) -> KnowledgeBaseInferenceConfigResponse:
+        require_admin(request)
+        return await impl.get_inference_config(knowledge_base_id)
+
+    @router.put(
+        "/knowledge-bases/{knowledge_base_id}/embedding-config",
+        response_model=EmbeddingConfigResponse,
+        summary="更新 KnowledgeBase Embedding 配置",
+    )
+    async def put_embedding_config(
+        knowledge_base_id: str,
+        body: EmbeddingConfigPutRequest,
+        request: Request,
+    ) -> EmbeddingConfigResponse:
+        require_admin(request)
+        return await impl.put_embedding_config(knowledge_base_id, body)
+
+    @router.put(
+        "/knowledge-bases/{knowledge_base_id}/rerank-config",
+        response_model=RerankConfigResponse,
+        summary="更新或关闭 KnowledgeBase Rerank",
+    )
+    async def put_rerank_config(
+        knowledge_base_id: str,
+        body: RerankConfigPutRequest,
+        request: Request,
+    ) -> RerankConfigResponse:
+        require_admin(request)
+        return await impl.put_rerank_config(knowledge_base_id, body)
 
     @router.delete(
         "/knowledge-bases/{knowledge_base_id}",

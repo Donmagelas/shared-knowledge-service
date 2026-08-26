@@ -93,7 +93,7 @@ Qdrant 1.18.2 已能在服务端根据 `qdrant/bm25` 文档生成 Sparse Vector�
 
 **解决**
 
-- `tenant-inference` 明确返回空模型目录，并禁止自动刷新。
+- `knowledge-base-inference` 明确返回空模型目录，并禁止自动刷新。
 - Admin API 只探测调用方提交的确切 URL、模型和 Embedding 维度，不访问或包装 `/models`。
 - 以配置接口的探针、真实 Ingest 和 Search 判断可用性；实际调用失败仍按稳定错误或 Operation 失败处理。
 
@@ -143,7 +143,7 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 
 - Dockerfile 已把 Debian、PyPI 和 Hugging Face 下载地址做成构建参数；版本、commit 和 `uv.lock` 哈希校验不随镜像地址改变。
 - 当前默认使用阿里云 Debian、Debian Security 与 PyPI 镜像，避免当前部署网络反复等待官方源；其他环境仍可显式覆盖。
-- 使用 `scripts/build-production-image.sh` 构建生产镜像。脚本先探测 `HF_ENDPOINT` 上固定 revision 的 tokenizer、layout 和 TableFormer 配置文件；任一不可达时明确提示并尝试 `HF_FALLBACK_ENDPOINT`，不会只根据站点首页判断。
+- 使用 `scripts/build-production-image.sh` 构建生产镜像。没有 `.env` 时脚本仍默认使用 `https://hf-mirror.com`，与 Compose/.env.example 一致；只有部署方显式设置 `HF_ENDPOINT` 才改用官方站点或内部制品库。脚本会探测固定 revision 的 tokenizer、layout 和 TableFormer 配置文件，任一不可达时明确提示并尝试 `HF_FALLBACK_ENDPOINT`。
 - 在对应网络中通过 `.env` 或构建环境设置已验证可达的 `DEBIAN_MIRROR`、`DEBIAN_SECURITY_MIRROR`、`PYPI_SIMPLE_URL`、`PYPI_FILES_URL`、`HF_ENDPOINT` 和 `HF_FALLBACK_ENDPOINT`。
 - 切换镜像只改变传输来源，不得去掉基础镜像 digest、Python 锁文件或 Docling 模型 revision。
 - 如果官方源只是慢而未失败，应先确认实际下载进程；不要把网络等待误判为新接口启动故障。
@@ -180,19 +180,22 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 - 依次区分网络/网关、鉴权、模型路由和响应协议；只有请求已进入模型路由后，模型不存在的 `404` 才能用于淘汰模型 ID。
 - 当前实测 `qwen/qwen3-embedding-8b` 可返回 4096 维向量；该结论仍需以部署环境的实时探针为准。
 
-## 12. 已初始化 Collection 不能直接切换 Embedding 向量空间
+## 12. 非空 KnowledgeBase 不能直接切换 Embedding 向量空间
 
 **现象**
 
-如果已有 Chunk 后直接修改 Embedding 模型、URL 或维度，旧向量与新查询向量不再属于同一向量空间；即使维度数字相同，也可能静默降低结果质量。修改维度还会与 Qdrant Collection Schema 直接冲突。
+如果一个 KnowledgeBase 已有 Chunk 后直接修改 Embedding 模型或维度，旧向量与新查询向量不再属于同一向量空间；即使维度数字相同，也可能静默降低结果质量。
 
 **影响与解决**
 
-- 租户第一次 Ingest 初始化 Collection 后，服务锁定该租户的 Embedding URL、模型和维度。
-- 后续提交不同 URL、模型或维度返回 `409 embedding_config_locked`；只允许在其他字段不变时轮换 Key。
-- 多模型评测必须使用独立租户 Collection，不能在已有 Collection 中混写两种向量空间。
+- 每个 KnowledgeBase 第一次 Ingest 接受后，服务锁定该库的 Embedding 模型 ID 和维度。
+- 后续提交不同模型或维度返回 `409 embedding_config_locked`；模型和维度不变时允许轮换 URL/Key。
+- 空 KnowledgeBase 可以更换模型和维度。Provider 使用 `model_id + dimension` 派生稳定 Named Vector，并通过 Qdrant 动态添加向量字段，不需要重建租户 Collection。
+- 同一租户不同 KnowledgeBase 可使用不同模型和维度；每个 Point 只写所属知识库需要的 Dense Named Vector，并共享 BM25 Sparse Vector。
+- 相同模型 ID 在不同 NewAPI 实例中必须表达同一种模型语义，这是部署契约；服务不会对向量空间做黑盒兼容性探测。
+- 当前不实现非空库的全量重新向量化。
 
-## 13. OGX vLLM Rerank 路径与租户配置模型不一致
+## 13. OGX vLLM Rerank 路径与 KnowledgeBase 配置模型不一致
 
 **现象**
 
@@ -201,8 +204,8 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 **原因与解决**
 
 - OGX `1.3.0` 的 vLLM Provider 会主动去掉 Base URL 末尾的 `/v1`，这是针对原生 vLLM 路径的行为，不适用于当前版本化网关。
-- 早期的全局 `remote::shared-rerank` 只能在进程启动时固定一套 URL、Key 和模型，不能满足企业版每租户使用独立 Key/模型。
-- 当前只保留 `remote::tenant-inference`：OGX 内部模型资源指向不含敏感信息的租户 Profile ID，实际调用时再从 PostgreSQL 解密该租户凭证。
+- 早期的全局 `remote::shared-rerank` 只能在进程启动时固定一套 URL、Key 和模型，不能满足企业版每 KnowledgeBase 使用独立 Key/模型。
+- 当前只保留 `remote::knowledge-base-inference`：OGX 内部模型资源指向不含敏感信息的 KnowledgeBase Profile ID，实际调用时再从 PostgreSQL 解密对应凭证。
 - Provider 保留调用方配置中的 `/v1` 等路径，最终拼接 `/rerank`；不使用伪造 `/v1/v1` 的配置技巧。
 ## 14. 租户 Collection 路由
 
@@ -218,10 +221,12 @@ Qdrant 的 WAL 或存储文件可能是稀疏文件；Docker 的汇总数字不�
 
 只修改 Provider 代码后重建完整镜像，Debian 系统包可以通过镜像源完成，但构建环境无法连接 Hugging Face，固定 revision 的 Docling tokenizer/layout/TableFormer 无法重新下载。
 
+还可能出现宿主机 `curl` 能访问官方站点、Docker BuildKit 网络却返回 `Network is unreachable` 的情况；因此宿主机预检通过不等于构建容器一定能使用同一来源。
+
 **解决**
 
 - 生产镜像仍必须在能够访问已批准模型源或内部制品库的环境中完整重建，并执行离线 Pipeline 初始化，不能跳过模型资产验收。
-- `scripts/build-production-image.sh` 可以在官方 Hugging Face 端点不可达时选择兼容镜像，并在日志中打印本次实际使用的 `HF_ENDPOINT`；正式发布流水线可以把两个端点都指向经过批准的内部制品库。
+- `scripts/build-production-image.sh` 默认选择兼容镜像，并在日志中打印本次实际使用的 `HF_ENDPOINT`；正式发布流水线可以把首选和回退端点都指向经过批准的内部制品库。
 - 测试专用 `compose.e2e.yaml` 会复用上一版已包含固定模型资产的镜像，并把当前 `src/shared_knowledge_service` 与 `config` 只读挂载进去，只用于验证代码变更。
 - 测试挂载不能作为生产镜像构建成功的证据；交付前需要在模型源可达时补跑完整 `docker compose build`。
 

@@ -1,4 +1,4 @@
-"""根据 opaque Profile ID 在调用时解析租户模型连接。"""
+"""根据 opaque Profile ID 在调用时解析 KnowledgeBase 模型连接。"""
 
 from __future__ import annotations
 
@@ -34,11 +34,11 @@ def _rerank_text(
         return item
     if isinstance(item, OpenAIChatCompletionContentPartTextParam):
         return cast(str, item.text)
-    raise ValueError("租户 Rerank Provider 暂不支持图像候选")
+    raise ValueError("KnowledgeBase Rerank Provider 暂不支持图像候选")
 
 
-class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
-    """一个 Provider 服务全部租户，连接参数从加密 Profile 动态解析。"""
+class KnowledgeBaseInferenceAdapter(InferenceProvider):  # type: ignore[misc]
+    """一个 Provider 服务全部 KB，连接参数从加密 Profile 动态解析。"""
 
     def __init__(
         self,
@@ -68,7 +68,7 @@ class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
         return []
 
     async def should_refresh_models(self) -> bool:
-        """租户模型只由 Admin API 注册，禁止远程自动刷新。"""
+        """KnowledgeBase 模型只由 Admin API 注册，禁止远程自动刷新。"""
 
         return False
 
@@ -83,11 +83,11 @@ class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
         embedding = await self.state.get_embedding_by_profile(model.provider_resource_id)
         rerank = await self.state.get_rerank_by_profile(model.provider_resource_id)
         if embedding is None and rerank is None:
-            raise ValueError("租户模型 Profile 不存在")
+            raise ValueError("KnowledgeBase 模型 Profile 不存在")
         return model
 
     async def unregister_model(self, model_id: str) -> None:
-        """V1 不删除租户 Profile；Registry 删除无需修改 Provider 状态。"""
+        """Profile 生命周期由 Knowledge API 管理；Registry 删除无需修改 Provider 状态。"""
 
         del model_id
 
@@ -99,7 +99,7 @@ class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
         if profile is None:
             raise RuntimeError("Embedding Profile 不存在")
         if params.dimensions is not None and params.dimensions != profile.dimension:
-            raise ValueError("Embedding 请求维度与租户锁定配置不一致")
+            raise ValueError("Embedding 请求维度与 KnowledgeBase 锁定配置不一致")
         api_key = self.state.decrypt_api_key(profile.credential, profile_id=profile.profile_id)
         payload: dict[str, Any] = {
             "model": profile.model_id,
@@ -126,7 +126,11 @@ class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
                 raise KnowledgeError(502, "invalid_embedding_response", "Embedding 服务返回结构不合法")
             vector = row["embedding"]
             if len(vector) != profile.dimension or not all(isinstance(value, int | float) for value in vector):
-                raise KnowledgeError(502, "embedding_dimension_mismatch", "Embedding 服务返回维度与租户配置不一致")
+                raise KnowledgeError(
+                    502,
+                    "embedding_dimension_mismatch",
+                    "Embedding 服务返回维度与 KnowledgeBase 配置不一致",
+                )
             index = row.get("index", position)
             if not isinstance(index, int):
                 raise KnowledgeError(502, "invalid_embedding_response", "Embedding 服务返回 index 不合法")
@@ -184,7 +188,7 @@ class TenantInferenceAdapter(InferenceProvider):  # type: ignore[misc]
                 item = RerankData(index=int(row["index"]), relevance_score=float(row["relevance_score"]))
             except (KeyError, TypeError, ValueError) as exc:
                 raise KnowledgeError(502, "invalid_rerank_response", "Rerank 服务返回结构不合法") from exc
-            if item.index >= len(request.items):
+            if item.index < 0 or item.index >= len(request.items):
                 raise KnowledgeError(502, "invalid_rerank_response", "Rerank 服务返回越界 index")
             data.append(item)
         data.sort(key=lambda item: item.relevance_score, reverse=True)
