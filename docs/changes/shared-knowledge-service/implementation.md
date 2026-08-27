@@ -140,7 +140,7 @@ shared-knowledge-service/
 - `knowledge-ogx / postgres / qdrant` 可以通过一个 Compose 启动并通过健康检查。
 - OGX 只启用 Files、File Processors、Inference、VectorIO。
 - 外置 Provider 通过 `get_provider_spec` / `get_adapter_impl` 或对应外置规范加载，不修改 OGX Core。
-- Docling 使用 OGX v1.3.0 固定的两个 Worker、`do_ocr=false`、无 VLM、HybridChunker `800/400`；不修改 Core 只为减少 Worker 数。
+- Docling 使用 OGX v1.3.0 固定的两个 Worker、`do_ocr=false`、无 VLM、HybridChunker 最终上限 `1000` tokens、相邻 overlap 最多 `200` tokens；固定版本镜像应用最小 overlap 补丁，但不修改 Core 只为减少 Worker 数。
 
 **改动区域**
 

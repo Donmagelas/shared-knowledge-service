@@ -5,7 +5,7 @@
 当前技术基线：
 
 - OGX `1.3.0` 最小 Distribution
-- Docling `2.121.0` + Docling `HybridChunker`
+- Docling `2.121.0` + Docling `HybridChunker`（最终上限 1000 tokens、相邻 overlap 最多 200 tokens）
 - Qdrant Server `1.18.2` / Client `1.18.0`
 - PostgreSQL `17.10`
 - Python `3.12`、FastAPI、KnowledgeBase 感知 Inference Provider
@@ -63,7 +63,7 @@ POST /knowledge/v1/ingest
   → OGX File 持久化
   → 单文件 FileBatch
   → Docling 解析
-  → Docling HybridChunker
+  → Docling HybridChunker（800-token 新内容预算 + 上一 Chunk 最多 200-token overlap）
   → 当前 KnowledgeBase 的远程 Embedding
   → Qdrant 对应 Named Vector + 共享 multilingual BM25
 ```
@@ -105,6 +105,7 @@ POST /knowledge/v1/search
 - Rerank 使用独立 URL、Key、模型和开关，可按 KnowledgeBase 随时修改；只增强 `hybrid`，单个知识库的 Rerank 失败时退回该库的 Qdrant RRF 排名。
 - 一个 Search 可以包含同一租户的多个 KnowledgeBase；每个库先独立检索/重排，再做等权外层 RRF。跨租户请求直接拒绝，不做跨 Collection 融合。
 - 需要高性能过滤的业务属性由部署方在 `config/ogx.yaml` 的 `payload_indexes` 中声明类型。
+- 切块规则是部署级统一配置；修改 `1000/200` 规则只影响新导入文件，已有文件需要重新导入和重新 Embedding。
 
 ## 服务间认证
 

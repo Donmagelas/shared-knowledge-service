@@ -62,6 +62,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # README 只参与本项目打包，不应让文档修改使第三方依赖和 Docling 模型层失效。
 COPY --chown=knowledge:knowledge README.md ./README.md
 COPY --chown=knowledge:knowledge src ./src
+COPY --chown=knowledge:knowledge patches/patch_ogx_docling_overlap.py /tmp/patch_ogx_docling_overlap.py
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
@@ -70,7 +71,9 @@ USER knowledge
 
 # 业务代码独立成轻量缓存层；修改 Provider/API 时不重新安装依赖或下载 Docling 模型。
 RUN --mount=type=cache,target=/tmp/uv-cache,uid=10001,gid=10001 \
-    UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-editable
+    UV_CACHE_DIR=/tmp/uv-cache uv sync --frozen --no-dev --no-editable \
+    && .venv/bin/python /tmp/patch_ogx_docling_overlap.py \
+    && rm /tmp/patch_ogx_docling_overlap.py
 
 COPY --chown=knowledge:knowledge config ./config
 

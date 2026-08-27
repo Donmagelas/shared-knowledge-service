@@ -161,7 +161,7 @@ KnowledgeBase 配置的 Embedding 与 Rerank URL 指向外部依赖，不进入�
 | `vector_io` | 本项目外置 Qdrant Provider | 保存和检索 Dense、BM25 与 Payload |
 | `knowledge` | 本项目统一 Knowledge API | 向 Stella 和企业版提供稳定的 Ingest、Search、对象、任务与 KnowledgeBase 模型配置接口 |
 
-MVP 将 Docling 配置为 `do_ocr=false`、不配置 VLM，并使用已确认的 HybridChunker 默认目标 `800` tokens、overlap `400` tokens。OGX v1.3.0 的持久任务池固定启动两个 Worker；`ServerConfig` 没有暴露 `job_workers` 字段，因此本项目不修改 Core 只为减少一个 Worker。这些参数在格式与资源测试后可以调整。
+MVP 将 Docling 配置为 `do_ocr=false`、不配置 VLM，并使用 HybridChunker 最终上限 `1000` tokens、相邻 overlap 最多 `200` tokens。OGX v1.3.0 原生 Provider 忽略 overlap 配置，因此固定版本镜像在构建时应用最小补丁：先按 800-token 新内容预算切块，再前置上一基础 Chunk 尾部，且不递归传播重叠内容。OGX 的持久任务池固定启动两个 Worker；`ServerConfig` 没有暴露 `job_workers` 字段，因此本项目不修改 Core 只为减少一个 Worker。
 
 OGX Docling Provider 会构造默认 `HybridChunker`，其 tokenizer 来自 `sentence-transformers/all-MiniLM-L6-v2`。镜像构建必须分别固定 tokenizer、Transformers layout 与 Accurate TableFormer 的 commit，只预置当前 PDF Pipeline 实际使用的模型变体；构建阶段在离线模式初始化 PDF Pipeline，避免首次导入临时联网。该 tokenizer 只服务切块计数，不参与 Dense Embedding；若后续要求与实际 Embedding 模型严格使用同一 tokenizer，需要扩展 Docling Provider，而不是靠部署配置假装已经一致。
 
@@ -259,10 +259,10 @@ Provider 支持 OGX 的 `eq / ne / gt / gte / lt / lte / in / nin / and / or` �
 
 MVP 已比较两条做法：
 
-1. Jieba 精确/搜索模式 + 自定义或 FastEmbed-compatible BM25 Sparse Encoder。
+1. Jieba 搜索模式预分词 + Qdrant whitespace tokenizer。
 2. Qdrant 1.18.2 服务端 `qdrant/bm25` + multilingual tokenizer。
 
-8 篇文档、9 条工程查询的冒烟语料中，两条路线均为 9/9 Top1、MRR 1.0，未发现明显效果回归。当前暂定第二条路线：它由 Qdrant 统一完成分词、TF/长度权重和动态 IDF，可以删除生产路径中的 Jieba、mmh3、自定义 token hash 与权重公式。该小型语料不足以证明真实业务效果；后续若 Stella 或企业版语料验证较差，再以已保留的评测基线重新考虑 Jieba。
+两条路线都由 Qdrant 统一完成 BM25 权重和动态 IDF，不再维护自定义 token hash 与权重公式。8 篇文档、9 条工程查询的冒烟语料中，两者均为 9/9 Top1、MRR 1.0；真实教材查询中 Jieba把目标表格从第 28 提升到第 17，但仍未进入 Top10。当前继续选择第二条生产路线，Jieba只作为评测依赖；若后续更大规模业务语料显示稳定收益，再评估全量重建 Sparse Vector。
 
 ## 6. 两侧的数据映射与维护边界
 

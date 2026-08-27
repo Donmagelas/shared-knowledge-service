@@ -147,7 +147,7 @@ KnowledgeBase Embedding / Rerank Profile
 | 失败 Operation 重试 | 已实现 | 复用原文件，不要求重新上传 |
 | File 查询、详情和删除 | 已实现 | Cursor 分页，支持状态和 attributes Filter |
 | Docling 解析 | 已实现 | 当前关闭扫描 PDF OCR 和 VLM |
-| Docling HybridChunker | 已实现 | 当前自动目标 800 tokens |
+| Docling HybridChunker | 已实现 | 当前最终上限 1000 tokens，并前置上一基础 Chunk 最多 200 tokens |
 | Dense 检索 | 已实现 | 每 KnowledgeBase 远程 Embedding 和 Named Vector |
 | BM25 检索 | 已实现 | Qdrant 原生 multilingual BM25 + 动态 IDF |
 | Hybrid 检索 | 已实现 | Qdrant 原生 RRF |
@@ -309,8 +309,8 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 | --- | --- | --- | --- |
 | Embedding 模型 | 每 KnowledgeBase 配置 | 创建请求 / Admin API | 第一次 Ingest 后锁定；空库可切换 |
 | Embedding 维度 | 每 KnowledgeBase `1～65536`，可探测 | 创建请求 / Admin API | 第一次 Ingest 后锁定；不同维度使用不同 Named Vector |
-| Chunk 目标大小 | 800 tokens | `config/ogx.yaml` | 所有租户共用；产品请求不能单独指定 |
-| Chunk overlap | 配置写为 400 tokens | `config/ogx.yaml` | OGX `1.3.0` Docling Provider 实际没有把该值传给 HybridChunker，不能宣称当前存在固定 400-token overlap |
+| Chunk 最终上限 | 1000 tokens | `config/ogx.yaml` | 所有租户共用；产品请求不能单独指定 |
+| Chunk overlap | 最多 200 tokens | `config/ogx.yaml` + 固定 OGX 构建补丁 | HybridChunker 使用 800-token 新内容预算，再前置上一基础 Chunk 尾部；原子结构已经超限时不再追加 overlap |
 | Chunk tokenizer | `all-MiniLM-L6-v2` 固定 revision | Docker 构建参数 | 只用于切块计数，与实际 Embedding 模型可能不同 |
 | Search `limit` | 默认 10，范围 1～50 | 每次 Search 请求 | Dense/BM25 最终 TopK |
 | Hybrid Prefetch | `max(k × 4, 20)` | Provider 硬编码 | Dense/BM25 两路相同候选上限 |
@@ -335,22 +335,23 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 3. 明确某一批失败时的残留 Point 清理和重试语义。
 4. 用真实大 PDF、DOCX 和 HTML 验证内存峰值。
 
-### 7.2 高优先级：明确切块规则
+### 7.2 高优先级：继续评测 1000/200 切块规则
 
-当前“800/400”并不等于实际执行了 800-token 窗口加 400-token overlap：OGX Docling Provider只把 `max_tokens` 传给 HybridChunker，配置中的 overlap 没有进入 Chunker。
+OGX `1.3.0` 原生 Docling Provider 不使用已存在的 overlap 配置。本项目在固定版本镜像构建时应用最小补丁：HybridChunker 先按 800-token 新内容预算保持结构切块，再把上一基础 Chunk 末尾最多 200 tokens 前置到当前 Chunk，最终目标不超过 1000 tokens。补丁使用原文 offset mapping，不通过 tokenizer decode 改写表格或标点。
 
-建议先评测再改：
+真实 Markdown 教材验证中，原本分离的“表 5-1”标题与表体被合入同一 728-token Chunk。查询“输出表5-1内容”时，该 Chunk 在纯 BM25 排第 28、Dense 排第 36，进入 50 条候选后由现有 Rerank 提升到 Hybrid 第 1。这个结果证明 overlap 解决了当前内容完整性问题，但不证明 1000/200 已适合所有文档。
 
-- 400 / 800 / 1200 token 三档。
-- 标题、表格、代码块和跨段引用是否被拆散。
-- 是否需要显式 overlap，还是依赖 HybridChunker 的结构合并和上下文化文本。
+仍需继续覆盖：
+
+- 标题、代码块、跨页表格和超长不可拆结构。
+- 普通问答相对原切块的召回回归、索引体积和 Embedding/Rerank 成本。
 - 是否需要让 Chunk tokenizer 与实际 Embedding tokenizer 对齐。
 
-首期更适合保持部署级统一规则，不要立即把任意 Chunk 参数开放给每个 Ingest，否则同一服务会混入不同切块语义，后续重建与评测更难管理。
+首期继续保持部署级统一规则，不把任意 Chunk 参数开放给每个 Ingest，避免同一服务混入不同切块语义。
 
 ### 7.3 高优先级：扩大中文 BM25 评测
 
-当前生产路径使用 Qdrant 原生 multilingual BM25。Jieba + FastEmbed-compatible 编码器只保留在评测代码中，不进入生产依赖。小型真实语料结果支持继续使用原生方案，但不足以证明所有企业语料都合适。
+当前生产路径使用 Qdrant 原生 multilingual BM25。Jieba 搜索分词 + whitespace tokenizer 只保留在评测依赖中，两者都由 Qdrant 计算 BM25 与动态 IDF。小型工程语料中两者均为 9/9 Top1；上述真实教材查询中，完整表格 Chunk 的纯 BM25 排名分别为 multilingual 第 28、Jieba 第 17。Jieba有所改善但仍未进入 Top10，暂不足以支持增加生产依赖和全量重建 Sparse Vector。
 
 下一轮应覆盖：
 

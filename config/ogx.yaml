@@ -60,8 +60,9 @@ providers:
     - provider_id: docling
       provider_type: inline::docling
       config:
-        default_chunk_overlap_tokens: 400
-        default_chunk_size_tokens: 800
+        # 固定 OGX 构建补丁会用 800-token 新内容预算，再前置最多 200 tokens。
+        default_chunk_overlap_tokens: 200
+        default_chunk_size_tokens: 1000
         do_ocr: false
         vlm_model: null
 
@@ -131,8 +132,9 @@ server:
 vector_stores:
   default_provider_id: shared-qdrant
   file_ingestion_params:
-    default_chunk_overlap_tokens: 400
-    default_chunk_size_tokens: 800
+    # 与 Docling Provider 保持相同的最终上限和 overlap 契约。
+    default_chunk_overlap_tokens: 200
+    default_chunk_size_tokens: 1000
   chunk_retrieval_params:
     default_search_mode: hybrid
     default_reranker_strategy: rrf

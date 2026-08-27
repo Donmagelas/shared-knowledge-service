@@ -10,44 +10,23 @@ import os
 import time
 import unicodedata
 import uuid
-from collections import Counter
-from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import mean
 
 import jieba  # type: ignore[import-untyped]
-import mmh3
 from qdrant_client import QdrantClient, models
 
 
-class LegacyJiebaBm25Encoder:
-    """仅用于评测旧路线的 Jieba + FastEmbed-compatible 编码器。"""
+def jieba_search_text(text: str) -> str | None:
+    """使用 Jieba 搜索模式切词，并用空格把词边界显式传给 Qdrant。"""
 
-    def tokenize(self, text: str) -> list[str]:
-        normalized = unicodedata.normalize("NFKC", text).lower()
-        raw_tokens: Iterable[str] = jieba.cut_for_search(normalized)
-        return [token.strip() for token in raw_tokens if token.strip() and any(char.isalnum() for char in token)]
-
-    def document_vector(self, text: str) -> models.SparseVector | None:
-        tokens = self.tokenize(text)
-        if not tokens:
-            return None
-        counts = Counter(tokens)
-        document_length = len(tokens)
-        weighted_ids: dict[int, float] = {}
-        for token, frequency in counts.items():
-            token_identifier = abs(mmh3.hash(token))
-            weight = frequency * 2.2
-            weight /= frequency + 1.2 * (0.25 + 0.75 * document_length / 256.0)
-            weighted_ids[token_identifier] = weight
-        indices = sorted(weighted_ids)
-        return models.SparseVector(indices=indices, values=[weighted_ids[index] for index in indices])
-
-    def query_vector(self, text: str) -> models.SparseVector | None:
-        indices = sorted({abs(mmh3.hash(token)) for token in self.tokenize(text)})
-        if not indices:
-            return None
-        return models.SparseVector(indices=indices, values=[1.0] * len(indices))
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    tokens = [
+        token.strip()
+        for token in jieba.cut_for_search(normalized)
+        if token.strip() and any(char.isalnum() for char in token)
+    ]
+    return " ".join(tokens) if tokens else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +74,12 @@ NATIVE_BM25_OPTIONS = models.Bm25Config(
     language="none",
 )
 
+JIEBA_BM25_OPTIONS = models.Bm25Config(
+    # Jieba 已经提供中文词边界，Qdrant 只按空格读取并继续负责 BM25 与动态 IDF。
+    tokenizer=models.TokenizerType.WHITESPACE,
+    language="none",
+)
+
 
 def _metrics(rankings: list[list[str]]) -> dict[str, float]:
     """计算小型评测使用的 Top1、Recall@3 和 MRR。"""
@@ -124,17 +109,20 @@ def _metrics(rankings: list[list[str]]) -> dict[str, float]:
 def _evaluate(client: QdrantClient, collection_name: str) -> dict[str, object]:
     """写入两套 Sparse Vector，逐查询记录排序、指标和客户端耗时。"""
 
-    jieba_encoder = LegacyJiebaBm25Encoder()
     points: list[models.PointStruct] = []
     for point_id, document in enumerate(DOCUMENTS, start=1):
-        jieba_vector = jieba_encoder.document_vector(document.text)
-        if jieba_vector is None:
+        jieba_text = jieba_search_text(document.text)
+        if jieba_text is None:
             raise RuntimeError(f"评测文档不能产生 Jieba Sparse Vector：{document.identifier}")
         points.append(
             models.PointStruct(
                 id=point_id,
                 vector={
-                    "jieba": jieba_vector,
+                    "jieba": models.Document(
+                        text=jieba_text,
+                        model="qdrant/bm25",
+                        options=JIEBA_BM25_OPTIONS,
+                    ),
                     "multilingual": models.Document(
                         text=document.text,
                         model="qdrant/bm25",
@@ -151,8 +139,13 @@ def _evaluate(client: QdrantClient, collection_name: str) -> dict[str, object]:
     rows: list[dict[str, object]] = []
     for query in QUERIES:
         row: dict[str, object] = {"query": query.text, "relevant": query.relevant_document}
-        query_vectors: dict[str, models.SparseVector | models.Document | None] = {
-            "jieba": jieba_encoder.query_vector(query.text),
+        jieba_query = jieba_search_text(query.text)
+        query_vectors: dict[str, models.Document | None] = {
+            "jieba": (
+                models.Document(text=jieba_query, model="qdrant/bm25", options=JIEBA_BM25_OPTIONS)
+                if jieba_query
+                else None
+            ),
             "multilingual": models.Document(
                 text=query.text,
                 model="qdrant/bm25",

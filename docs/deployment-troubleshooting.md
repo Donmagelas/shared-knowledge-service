@@ -299,3 +299,16 @@ OGX File、FileBatch、统一 API 幂等记录和 Qdrant 不在一个物理事�
 - Operation 终态第一次被读取后持久化快照；即使 OGX Batch 后续过期，仍可返回稳定终态。
 - Knowledge 进程启动时及每日扫描无效原文件：未提交记录默认保留 24 小时，最终失败文件默认保留 7 天，孤儿 File 默认保留 24 小时。
 - 清理步骤保持幂等；检测到仍有 `in_progress` Batch 时不删除原文件。保留周期可由部署环境调整，但不增加公开清理 API。
+
+## 21. OGX Docling 的 overlap 配置存在但没有生效
+
+**现象**
+
+OGX `1.3.0` 的 Docling 配置和静态 Chunking Strategy 都包含 `chunk_overlap_tokens`，但原生 `_create_chunks()` 只把 `max_chunk_size_tokens` 传给 HybridChunker。配置 `800/400` 并不会生成 400-token 重叠内容，表题与紧随其后的表体仍可能落入两个独立 Chunk。
+
+**解决**
+
+- 固定 OGX `1.3.0`，在生产镜像构建时应用 `patches/patch_ogx_docling_overlap.py`；源码结构或版本变化时补丁必须让构建失败，不能静默跳过。
+- 当前统一规则为最终上限 1000 tokens、overlap 最多 200 tokens。HybridChunker 使用 800-token 新内容预算，随后通过 Hugging Face tokenizer 的 offset mapping 从上一基础 Chunk 原文截取尾部。
+- overlap 只读取上一基础 Chunk，避免重叠内容逐级传播；Docling 为表格等原子结构产生已经超限的 Chunk 时不再追加 overlap，也不在补丁中破坏结构二次切分。
+- 修改切块规则只影响新导入文件；已有 Chunk 必须重新导入和重新 Embedding，不能把配置修改误认为在线迁移。
