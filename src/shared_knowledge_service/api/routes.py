@@ -35,6 +35,7 @@ from .models import (
     SearchResponse,
     validate_attributes,
 )
+from .openapi import build_product_openapi, register_documentation_routes
 from .protocol import KnowledgeApi
 
 
@@ -66,7 +67,7 @@ def create_router(
 ) -> APIRouter:
     """创建挂载在 OGX 同一 FastAPI 进程中的产品接口。"""
 
-    router = APIRouter(prefix="/knowledge/v1", tags=["Knowledge"], route_class=StableKnowledgeRoute)
+    router = APIRouter(tags=["Knowledge"], route_class=StableKnowledgeRoute)
 
     def require_runtime(request: Request) -> None:
         impl.security.require(request)
@@ -75,7 +76,7 @@ def create_router(
         impl.security.require(request, admin=True)
 
     @router.post(
-        "/internal/auth/validate",
+        "/knowledge/v1/internal/auth/validate",
         include_in_schema=False,
         openapi_extra={PUBLIC_ROUTE_KEY: True},
     )
@@ -97,7 +98,7 @@ def create_router(
         return {"principal": "knowledge-admin", "attributes": {"roles": ["admin"]}}
 
     @router.post(
-        "/knowledge-bases",
+        "/knowledge/v1/knowledge-bases",
         response_model=KnowledgeBaseResponse,
         status_code=201,
         summary="创建技术 KnowledgeBase",
@@ -114,7 +115,7 @@ def create_router(
         return result
 
     @router.get(
-        "/knowledge-bases/{knowledge_base_id}",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}",
         response_model=KnowledgeBaseResponse,
         summary="查询技术 KnowledgeBase",
     )
@@ -123,7 +124,7 @@ def create_router(
         return await impl.get_knowledge_base(knowledge_base_id)
 
     @router.get(
-        "/knowledge-bases/{knowledge_base_id}/inference-config",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config",
         response_model=KnowledgeBaseInferenceConfigResponse,
         summary="查询 KnowledgeBase 模型配置",
     )
@@ -135,7 +136,7 @@ def create_router(
         return await impl.get_inference_config(knowledge_base_id)
 
     @router.put(
-        "/knowledge-bases/{knowledge_base_id}/embedding-config",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
         response_model=EmbeddingConfigResponse,
         summary="更新 KnowledgeBase Embedding 配置",
     )
@@ -148,7 +149,7 @@ def create_router(
         return await impl.put_embedding_config(knowledge_base_id, body)
 
     @router.put(
-        "/knowledge-bases/{knowledge_base_id}/rerank-config",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
         response_model=RerankConfigResponse,
         summary="更新或关闭 KnowledgeBase Rerank",
     )
@@ -161,7 +162,7 @@ def create_router(
         return await impl.put_rerank_config(knowledge_base_id, body)
 
     @router.delete(
-        "/knowledge-bases/{knowledge_base_id}",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}",
         status_code=204,
         summary="删除技术 KnowledgeBase",
     )
@@ -170,7 +171,7 @@ def create_router(
         await impl.delete_knowledge_base(knowledge_base_id)
 
     @router.post(
-        "/ingest",
+        "/knowledge/v1/ingest",
         response_model=IngestResponse,
         status_code=202,
         summary="异步提交一个原始文件",
@@ -195,7 +196,7 @@ def create_router(
         return result
 
     @router.get(
-        "/operations/{operation_id}",
+        "/knowledge/v1/operations/{operation_id}",
         response_model=OperationResponse,
         summary="查询异步导入状态",
     )
@@ -207,7 +208,7 @@ def create_router(
         return await impl.get_ingest_operation(operation_id)
 
     @router.post(
-        "/operations/{operation_id}/retry",
+        "/knowledge/v1/operations/{operation_id}/retry",
         response_model=RetryOperationResponse,
         status_code=202,
         summary="重试最终失败的导入",
@@ -223,7 +224,7 @@ def create_router(
         return result
 
     @router.post(
-        "/knowledge-bases/{knowledge_base_id}/files/query",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query",
         response_model=FileQueryResponse,
         summary="查询 KnowledgeBase 文件",
     )
@@ -236,7 +237,7 @@ def create_router(
         return await impl.query_files(knowledge_base_id, body)
 
     @router.get(
-        "/knowledge-bases/{knowledge_base_id}/files/{file_id}",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",
         response_model=FileDetail,
         summary="查询 KnowledgeBase 文件详情",
     )
@@ -245,7 +246,7 @@ def create_router(
         return await impl.get_file(knowledge_base_id, file_id)
 
     @router.delete(
-        "/knowledge-bases/{knowledge_base_id}/files/{file_id}",
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",
         status_code=204,
         summary="删除 KnowledgeBase 文件",
     )
@@ -253,13 +254,18 @@ def create_router(
         require_runtime(request)
         await impl.delete_file(knowledge_base_id, file_id)
 
-    @router.post("/search", response_model=SearchResponse, summary="检索一个或多个逻辑知识库")
+    @router.post("/knowledge/v1/search", response_model=SearchResponse, summary="检索一个或多个逻辑知识库")
     async def search(body: SearchRequest, request: Request) -> SearchResponse:
         require_runtime(request)
         return await impl.search(body)
 
+    # 产品 OpenAPI 只从 Knowledge 路由生成，不能把同进程的 OGX 原生接口暴露给调用方。
+    product_openapi = build_product_openapi(router.routes)
+    register_documentation_routes(router, product_openapi)
+
     # OGX 全局鉴权只保护其原生接口；统一 Knowledge API 继续使用自己的
     # Runtime/Admin 双 Token，以保持已经约定的稳定错误码和权限差异。
+    # Scalar 页面和产品 OpenAPI 不含凭证，保持可直接打开；真实接口仍自行鉴权。
     for route in router.routes:
         if isinstance(route, APIRoute):
             route.openapi_extra = {**(route.openapi_extra or {}), PUBLIC_ROUTE_KEY: True}

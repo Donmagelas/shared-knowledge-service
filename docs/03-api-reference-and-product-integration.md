@@ -6,6 +6,12 @@
 
 默认本地地址：**http://localhost:8321**
 
+交互式联调页面：**http://localhost:8321/api-docs**
+
+产品 OpenAPI：**http://localhost:8321/knowledge-openapi.json**
+
+Scalar 页面只展示本文件定义的 `/knowledge/v1/*` 稳定接口，并允许临时输入 Bearer Token、选择文件和发送真实请求。产品 OpenAPI 不包含 OGX 原生接口，也不会保存或预置 Runtime/Admin Token。
+
 ## 1. 边界与核心对象
 
 ### 1.1 API 面向谁

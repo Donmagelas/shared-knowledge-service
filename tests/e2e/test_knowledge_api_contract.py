@@ -216,6 +216,27 @@ def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_
         assert raw_admin.status_code == 200
 
 
+def test_product_openapi_and_scalar_page_expose_only_stable_knowledge_contract() -> None:
+    """调用方无需 Admin Token 即可打开文档，但真实产品接口仍保持独立鉴权。"""
+
+    with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as client:
+        product_schema = client.get("/knowledge-openapi.json")
+        scalar_page = client.get("/api-docs")
+
+        product_schema.raise_for_status()
+        scalar_page.raise_for_status()
+        schema = product_schema.json()
+        assert len(schema["paths"]) == 11
+        assert all(path.startswith("/knowledge/v1/") for path in schema["paths"])
+        assert not any("/internal/" in path for path in schema["paths"])
+        assert schema["components"]["securitySchemes"]["ServiceToken"]["scheme"] == "bearer"
+        assert schema["paths"]["/knowledge/v1/ingest"]["post"]["requestBody"]["content"].keys() == {
+            "multipart/form-data"
+        }
+        assert "/knowledge-openapi.json" in scalar_page.text
+        assert "@scalar/api-reference@1.66.1" in scalar_page.text
+
+
 def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> None:
     tenant_id = f"contract-{uuid.uuid4().hex[:10]}"
     create_key = f"create-{uuid.uuid4()}"

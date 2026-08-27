@@ -29,6 +29,9 @@ docker compose up -d
 
 服务启动后可运行 `./scripts/create-knowledge-base.sh --help` 查看 KnowledgeBase 创建与 Embedding/Rerank 配置方式；模型 Key 默认通过终端隐藏输入。
 
+需要人工联调 API 时，打开 `http://127.0.0.1:8321/api-docs` 使用 Scalar 页面；页面读取
+`/knowledge-openapi.json`，只展示稳定的 `/knowledge/v1/*` 产品接口，不展示 OGX 原生内部接口。Token 由测试人员在页面中临时填写，服务不会把 Runtime/Admin Token 写入 OpenAPI。
+
 首次构建会在 Docker 中还原锁定的 Python 依赖，并下载固定 revision 的 Docling tokenizer、layout 和 TableFormer 模型；耗时和网络要求高于拉取成品镜像。后续只修改 Provider/API 源码时，Docker 会复用依赖和模型缓存层。
 
 PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像；Knowledge 镜像始终从当前工作区源码构建。默认只在 `127.0.0.1:8321` 暴露 Knowledge API，三个 Docker named volume 保存 PostgreSQL、Qdrant 和本地原文件。

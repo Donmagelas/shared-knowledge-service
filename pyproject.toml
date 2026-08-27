@@ -23,6 +23,8 @@ dependencies = [
     # OGX 的共享 VectorStore 工具在导入 Qdrant Adapter 时会直接加载 PdfReader。
     "pypdf==6.13.3",
     "qdrant-client==1.18.0",
+    # 在现有 FastAPI 进程中渲染产品 OpenAPI，不新增 Node 服务或独立容器。
+    "scalar-fastapi==1.8.2",
     "torch==2.13.0+cpu",
     "torchvision==0.28.0+cpu",
     "transformers==4.57.6",
