@@ -137,6 +137,16 @@ class IngestIdempotencyRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class BatchIngestIdempotencyRecord(BaseModel):
+    """内部批量请求清单指纹；不对应公开 Batch 任务。"""
+
+    knowledge_base_id: str
+    key_hash: str
+    fingerprint: str
+    item_count: int = Field(ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class OperationRecord(BaseModel):
     """OGX FileBatch 之外需要稳定保存的文件和重试关系。"""
 
@@ -212,6 +222,12 @@ class KnowledgeState:
     @staticmethod
     def _ingest_idempotency_key(knowledge_base_id: str, idempotency_key: str) -> str:
         return f"idempotency:ingest:{opaque_suffix(knowledge_base_id)}:{opaque_suffix(idempotency_key, length=40)}"
+
+    @staticmethod
+    def _batch_ingest_idempotency_key(knowledge_base_id: str, idempotency_key: str) -> str:
+        return (
+            f"idempotency:ingest-batch:{opaque_suffix(knowledge_base_id)}:{opaque_suffix(idempotency_key, length=40)}"
+        )
 
     @staticmethod
     def _operation_key(operation_id: str) -> str:
@@ -316,6 +332,24 @@ class KnowledgeState:
     async def save_ingest_idempotency(self, idempotency_key: str, record: IngestIdempotencyRecord) -> None:
         await self.kvstore.set(
             self._ingest_idempotency_key(record.knowledge_base_id, idempotency_key),
+            record.model_dump_json(),
+        )
+
+    async def get_batch_ingest_idempotency(
+        self,
+        knowledge_base_id: str,
+        idempotency_key: str,
+    ) -> BatchIngestIdempotencyRecord | None:
+        value = await self.kvstore.get(self._batch_ingest_idempotency_key(knowledge_base_id, idempotency_key))
+        return BatchIngestIdempotencyRecord.model_validate_json(value) if value else None
+
+    async def save_batch_ingest_idempotency(
+        self,
+        idempotency_key: str,
+        record: BatchIngestIdempotencyRecord,
+    ) -> None:
+        await self.kvstore.set(
+            self._batch_ingest_idempotency_key(record.knowledge_base_id, idempotency_key),
             record.model_dump_json(),
         )
 

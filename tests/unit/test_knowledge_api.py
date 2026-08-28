@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from ogx_api import (
 )
 from ogx_api.inference import RerankRequest
 from ogx_api.router_utils import PUBLIC_ROUTE_KEY
+from starlette.responses import Response, StreamingResponse
 
 from shared_knowledge_service.api.errors import ApiSecurity, KnowledgeError
 from shared_knowledge_service.api.models import (
@@ -61,20 +63,26 @@ class FakeFiles:
     def __init__(self) -> None:
         self.upload_count = 0
         self.files: dict[str, OpenAIFileObject] = {}
+        self.contents: dict[str, bytes] = {}
+        self.content_reads: list[str] = []
         self.deleted: list[str] = []
 
     async def openai_upload_file(self, request: Any, file: UploadFile) -> OpenAIFileObject:
-        del request, file
+        del request
+        content = await file.read()
+        await file.seek(0)
         self.upload_count += 1
+        file_id = f"file-{self.upload_count}"
         result = OpenAIFileObject(
-            id="file-1",
-            bytes=12,
+            id=file_id,
+            bytes=len(content),
             created_at=1,
-            filename="knowledge.md",
+            filename=file.filename or "upload.bin",
             purpose=OpenAIFilePurpose.ASSISTANTS,
             status="uploaded",
         )
         self.files[result.id] = result
+        self.contents[result.id] = content
         return result
 
     async def openai_retrieve_file(self, request: Any) -> OpenAIFileObject:
@@ -93,7 +101,18 @@ class FakeFiles:
     async def openai_delete_file(self, request: Any) -> object:
         self.deleted.append(request.file_id)
         self.files.pop(request.file_id, None)
+        self.contents.pop(request.file_id, None)
         return SimpleNamespace(id=request.file_id, deleted=True)
+
+    async def openai_retrieve_file_content(self, request: Any) -> Response:
+        self.content_reads.append(request.file_id)
+        content = self.contents[request.file_id]
+        filename = self.files[request.file_id].filename
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
 
 class FakeSharedAdapter(SharedQdrantVectorIOAdapter):
@@ -130,6 +149,7 @@ class FakeVectorIO:
         self.routing_table = FakeRoutingTable(provider)
         self.retrieved: list[str] = []
         self.created_batches: list[tuple[str, Any]] = []
+        self.created_batch_objects: dict[str, VectorStoreFileBatchObject] = {}
         self.batch_available = True
         self.batch = VectorStoreFileBatchObject(
             id="batch-1",
@@ -161,7 +181,10 @@ class FakeVectorIO:
         params: Any,
     ) -> VectorStoreFileBatchObject:
         self.created_batches.append((vector_store_id, params))
-        return self.batch
+        batch_number = len(self.created_batches)
+        batch = self.batch if batch_number == 1 else self.batch.model_copy(update={"id": f"batch-{batch_number}"})
+        self.created_batch_objects[batch.id] = batch
+        return batch
 
     async def openai_retrieve_vector_store_file_batch(
         self,
@@ -170,6 +193,8 @@ class FakeVectorIO:
     ) -> VectorStoreFileBatchObject:
         if not self.batch_available:
             raise ValueError("batch expired")
+        if batch_id in self.created_batch_objects:
+            return self.created_batch_objects[batch_id]
         assert batch_id == self.batch.id
         assert vector_store_id == self.batch.vector_store_id
         return self.batch
@@ -420,6 +445,7 @@ def test_operation_routes_use_global_operation_id() -> None:
     assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/inference-config" in paths
     assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config" in paths
     assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config" in paths
+    assert "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download" in paths
 
 
 def test_outer_rrf_is_equal_weight_stable_and_ignores_local_score_scale() -> None:
@@ -741,6 +767,179 @@ async def test_ingest_rejects_reserved_attributes_before_upload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_batch_ingest_returns_ordered_independent_operations_and_replays() -> None:
+    files = FakeFiles()
+    vector_io = FakeVectorIO(FakeSharedAdapter(_query_result()))
+    provider = await _provider(files, vector_io)
+
+    first = await provider.batch_ingest(
+        [
+            UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+            UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+        ],
+        "vs-a",
+        {"department_id": "product-a"},
+        "batch-request-1",
+    )
+    replayed = await provider.batch_ingest(
+        [
+            UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+            UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+        ],
+        "vs-a",
+        {"department_id": "product-a"},
+        "batch-request-1",
+    )
+
+    assert [(item.index, item.filename, item.file_id, item.operation_id) for item in first.items] == [
+        (0, "alpha.md", "file-1", "batch-1"),
+        (1, "beta.md", "file-2", "batch-2"),
+    ]
+    assert first.replayed is False
+    assert replayed.replayed is True
+    assert replayed.items == first.items
+    assert files.upload_count == 2
+    assert len(vector_io.created_batches) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_ingest_keeps_same_filename_files_as_distinct_items() -> None:
+    files = FakeFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+
+    response = await provider.batch_ingest(
+        [
+            UploadFile(file=BytesIO(b"version-a"), filename="manual.md"),
+            UploadFile(file=BytesIO(b"version-b"), filename="manual.md"),
+        ],
+        "vs-a",
+        {},
+        "same-filename-batch",
+    )
+
+    assert [item.filename for item in response.items] == ["manual.md", "manual.md"]
+    assert [item.file_id for item in response.items] == ["file-1", "file-2"]
+    assert files.contents == {"file-1": b"version-a", "file-2": b"version-b"}
+
+
+@pytest.mark.asyncio
+async def test_batch_ingest_rejects_changed_order_before_uploading_again() -> None:
+    files = FakeFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+    await provider.batch_ingest(
+        [
+            UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+            UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+        ],
+        "vs-a",
+        {},
+        "batch-request-1",
+    )
+
+    with pytest.raises(KnowledgeError) as captured:
+        await provider.batch_ingest(
+            [
+                UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+                UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+            ],
+            "vs-a",
+            {},
+            "batch-request-1",
+        )
+
+    assert captured.value.status_code == 409
+    assert captured.value.code == "idempotency_conflict"
+    assert files.upload_count == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_ingest_enforces_count_file_and_total_limits_before_upload() -> None:
+    files = FakeFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+    provider.max_batch_files = 1
+    with pytest.raises(KnowledgeError) as count_error:
+        await provider.batch_ingest(
+            [UploadFile(file=BytesIO(b"a")), UploadFile(file=BytesIO(b"b"))],
+            "vs-a",
+            {},
+            "count-limit",
+        )
+    assert count_error.value.code == "batch_file_count_exceeded"
+
+    provider.max_batch_files = 20
+    provider.max_upload_size_bytes = 2
+    with pytest.raises(KnowledgeError) as file_error:
+        await provider.batch_ingest(
+            [UploadFile(file=BytesIO(b"abc"), filename="large.md")],
+            "vs-a",
+            {},
+            "file-limit",
+        )
+    assert file_error.value.status_code == 413
+    assert file_error.value.code == "payload_too_large"
+
+    provider.max_upload_size_bytes = 10
+    provider.max_batch_upload_size_bytes = 3
+    with pytest.raises(KnowledgeError) as total_error:
+        await provider.batch_ingest(
+            [UploadFile(file=BytesIO(b"ab")), UploadFile(file=BytesIO(b"cd"))],
+            "vs-a",
+            {},
+            "total-limit",
+        )
+    assert total_error.value.status_code == 413
+    assert total_error.value.code == "batch_payload_too_large"
+    assert files.upload_count == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_ingest_resumes_after_middle_operation_creation_failure() -> None:
+    class FailSecondBatchOnce(FakeVectorIO):
+        def __init__(self, provider: FakeSharedAdapter) -> None:
+            super().__init__(provider)
+            self.create_attempts = 0
+            self.failed_once = False
+
+        async def openai_create_vector_store_file_batch(
+            self,
+            vector_store_id: str,
+            params: Any,
+        ) -> VectorStoreFileBatchObject:
+            self.create_attempts += 1
+            if self.create_attempts == 2 and not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("temporary batch failure")
+            return await super().openai_create_vector_store_file_batch(vector_store_id, params)
+
+    files = FakeFiles()
+    vector_io = FailSecondBatchOnce(FakeSharedAdapter(_query_result()))
+    provider = await _provider(files, vector_io)
+    request_files = [
+        UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+        UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+    ]
+
+    with pytest.raises(KnowledgeError) as first_error:
+        await provider.batch_ingest(request_files, "vs-a", {}, "recoverable-batch")
+    assert first_error.value.status_code == 503
+    assert files.upload_count == 2
+
+    recovered = await provider.batch_ingest(
+        [
+            UploadFile(file=BytesIO(b"alpha"), filename="alpha.md"),
+            UploadFile(file=BytesIO(b"beta"), filename="beta.md"),
+        ],
+        "vs-a",
+        {},
+        "recoverable-batch",
+    )
+
+    assert [item.file_id for item in recovered.items] == ["file-1", "file-2"]
+    assert len(vector_io.created_batches) == 2
+    assert files.upload_count == 2
+
+
+@pytest.mark.asyncio
 async def test_cross_kb_search_uses_one_local_branch_per_knowledge_base() -> None:
     adapter = FakeSharedAdapter(_query_result())
     vector_io = FakeVectorIO(adapter)
@@ -846,6 +1045,126 @@ async def test_deleting_knowledge_base_rejects_new_search() -> None:
 
     assert captured.value.status_code == 409
     assert captured.value.code == "knowledge_base_deleting"
+
+
+@pytest.mark.asyncio
+async def test_download_file_returns_original_bytes_after_kb_membership_check() -> None:
+    files = FakeFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+    files.files["file-download"] = OpenAIFileObject(
+        id="file-download",
+        bytes=11,
+        created_at=1,
+        filename="manual.pdf",
+        purpose=OpenAIFilePurpose.ASSISTANTS,
+        status="uploaded",
+    )
+    files.contents["file-download"] = b"pdf-content"
+    await provider._state().save_file(
+        FileRecord(
+            knowledge_base_id="vs-a",
+            file_id="file-download",
+            filename="manual.pdf",
+            size_bytes=11,
+            latest_operation_id="batch-download",
+        )
+    )
+
+    response = await provider.download_file("vs-a", "file-download")
+
+    assert response.body == b"pdf-content"
+    assert response.headers["content-disposition"] == 'attachment; filename="manual.pdf"'
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert files.content_reads == ["file-download"]
+
+
+@pytest.mark.asyncio
+async def test_download_file_preserves_streaming_files_provider_response() -> None:
+    class StreamingFiles(FakeFiles):
+        async def openai_retrieve_file_content(self, request: Any) -> Response:
+            self.content_reads.append(request.file_id)
+
+            async def chunks() -> AsyncIterator[bytes]:
+                yield b"stream-"
+                yield b"content"
+
+            return StreamingResponse(
+                chunks(),
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
+            )
+
+    files = StreamingFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+    await provider._state().save_file(
+        FileRecord(
+            knowledge_base_id="vs-a",
+            file_id="file-stream",
+            filename="archive.zip",
+            size_bytes=14,
+            latest_operation_id="batch-stream",
+        )
+    )
+
+    response = await provider.download_file("vs-a", "file-stream")
+
+    assert isinstance(response, StreamingResponse)
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"stream-content"
+    assert response.headers["content-disposition"] == 'attachment; filename="archive.zip"'
+    assert response.headers["cache-control"] == "private, no-store"
+    assert files.content_reads == ["file-stream"]
+
+
+@pytest.mark.asyncio
+async def test_download_file_does_not_expose_file_from_another_kb() -> None:
+    files = FakeFiles()
+    provider = await _provider(files, FakeVectorIO(FakeSharedAdapter(_query_result())))
+    files.files["file-private"] = OpenAIFileObject(
+        id="file-private",
+        bytes=7,
+        created_at=1,
+        filename="private.md",
+        purpose=OpenAIFilePurpose.ASSISTANTS,
+        status="uploaded",
+    )
+    files.contents["file-private"] = b"private"
+    await provider._state().save_file(
+        FileRecord(
+            knowledge_base_id="vs-a",
+            file_id="file-private",
+            filename="private.md",
+            size_bytes=7,
+            latest_operation_id="batch-private",
+        )
+    )
+
+    with pytest.raises(KnowledgeError) as captured:
+        await provider.download_file("vs-b", "file-private")
+
+    assert captured.value.status_code == 404
+    assert captured.value.code == "file_not_found"
+    assert files.content_reads == []
+
+
+@pytest.mark.asyncio
+async def test_download_file_maps_missing_raw_content_to_stable_not_found() -> None:
+    provider = await _provider(FakeFiles(), FakeVectorIO(FakeSharedAdapter(_query_result())))
+    await provider._state().save_file(
+        FileRecord(
+            knowledge_base_id="vs-a",
+            file_id="file-missing",
+            filename="missing.md",
+            size_bytes=1,
+            latest_operation_id="batch-missing",
+        )
+    )
+
+    with pytest.raises(KnowledgeError) as captured:
+        await provider.download_file("vs-a", "file-missing")
+
+    assert captured.value.status_code == 404
+    assert captured.value.code == "file_not_found"
 
 
 @pytest.mark.asyncio

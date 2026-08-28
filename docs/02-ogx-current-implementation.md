@@ -99,9 +99,9 @@ KnowledgeBase Embedding / Rerank Profile
 
 - 携带模型配置创建、查询、删除技术 KnowledgeBase。
 - 查询/修改 KnowledgeBase Embedding 与 Rerank 配置。
-- 单文件异步 Ingest。
+- 单文件异步 Ingest，以及复用单文件语义的批量提交。
 - Operation 状态查询和失败重试。
-- File 列表、详情和删除。
+- File 列表、详情、原文件下载和删除。
 - 单租户多 KnowledgeBase 的独立 Dense/BM25/Hybrid 分支与等权外层 RRF。
 - Runtime/Admin 双 Token、请求 ID 和统一错误信封。
 
@@ -143,9 +143,10 @@ KnowledgeBase Embedding / Rerank Profile
 | 本地原文件存储 | 已实现并验证 | Docker named volume |
 | S3/S3-compatible 原文件存储 | 已接入配置 | 真实生产 S3 尚未完成 E2E |
 | 单文件异步 Ingest | 已实现 | 请求返回 `202`，后台继续处理 |
+| 批量异步 Ingest | 已实现 | 同 KB、共用 attributes；每项独立 Operation；不创建公开 Batch 对象 |
 | Operation 查询 | 已实现 | `processing/completed/failed/cancelled` |
 | 失败 Operation 重试 | 已实现 | 复用原文件，不要求重新上传 |
-| File 查询、详情和删除 | 已实现 | Cursor 分页，支持状态和 attributes Filter |
+| File 查询、详情、下载和删除 | 已实现 | Cursor 分页，支持状态和 attributes Filter；下载返回上传时保存的原文件 |
 | Docling 解析 | 已实现 | 当前关闭扫描 PDF OCR 和 VLM |
 | Docling HybridChunker | 已实现 | 当前最终上限 1000 tokens，并前置上一基础 Chunk 最多 200 tokens |
 | Dense 检索 | 已实现 | 每 KnowledgeBase 远程 Embedding 和 Named Vector |
@@ -163,7 +164,6 @@ KnowledgeBase Embedding / Rerank Profile
 
 - 产品用户、组织、角色和权限管理。
 - 业务 KnowledgeBase 名称、列表、重命名和挂载关系。
-- 原文件下载接口。
 - 文件替换、Revision 或已有文件原地修改属性。
 - Operation 取消。
 - 跨租户 Search 或跨 Collection 融合。
@@ -319,7 +319,9 @@ Docker CPU `100%` 约等于一个逻辑核，所以 `815%` 是解析期的短时
 | 跨库并发 | 默认 8 | `KNOWLEDGE_SEARCH_BRANCH_CONCURRENCY` | 限制一次 Search 同时发起的独立知识库分支 |
 | RRF | Qdrant 内层 RRF + Python 外层 RRF `k=60` | `KNOWLEDGE_OUTER_RRF_K` | 多库等权；当前未开放每库权重 |
 | BM25 | multilingual tokenizer、`language=none` | Provider 固定 | 升级 Qdrant 或更换 tokenizer 必须重建并重评 |
-| 上传大小 | 100 MiB | OGX API 默认值 | 当前没有产品级覆盖配置 |
+| 单文件上传大小 | 默认 100 MiB | `KNOWLEDGE_MAX_UPLOAD_SIZE_BYTES` | 单文件与批量接口共用，可部署覆盖 |
+| 单批文件数 | 默认 20 | `KNOWLEDGE_MAX_BATCH_FILES` | 批量接口专用，可部署覆盖 |
+| 单批总大小 | 默认 500 MiB | `KNOWLEDGE_MAX_BATCH_UPLOAD_SIZE_BYTES` | 批量接口专用，可部署覆盖 |
 | 高性能 Filter 字段 | 部署声明类型 | `payload_indexes` | 范围比较只允许声明为 integer/float/datetime 的字段 |
 
 ## 7. 仍可打磨和优化的部分

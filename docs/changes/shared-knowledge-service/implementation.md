@@ -1,25 +1,26 @@
 # Stella × Cherry Studio 企业版统一知识库服务实施计划
 
-> 状态：步骤 1～20 已完成；KnowledgeBase 级模型配置、动态 Dense Named Vector 和跨 KB 融合已通过增量验收
+> 状态：步骤 1～23 已完成
 >
 > 方案依据：[solution.md](./solution.md)
 >
-> 本次终点：每个 KnowledgeBase 可独立配置 Embedding/Rerank，单 KB 保留本地排名，跨 KB 查询在各库完成本地排序后执行等权外层 RRF
+> 本次终点：在不新增公开 Batch 对象的前提下提供原文件下载和可恢复的批量上传，并保持既有单文件 Operation、权限与存储抽象不变
 
 ## 1. 目标与方案引用
 
-本计划把已确认的 OGX `v1.3.0` 方案分成四个里程碑：
+本计划把已确认的 OGX `v1.3.0` 方案分成五个里程碑：
 
 1. **MVP 可行性验证**：最小 OGX Distribution、自定义 Qdrant Provider、三服务 Compose、原生 OGX API 和完整验收矩阵。
 2. **统一产品接口**：MVP 后先确认导入语义，再在同一 OGX 进程中挂载外置 Knowledge API，提供 `ingest` 和多知识库 `search`。
 3. **生产化**：认证、备份、S3、可观测性、资源边界和运维文档。
 4. **KnowledgeBase 级模型与跨库检索**：把租户级模型配置下沉到逻辑 KnowledgeBase，在同一租户 Collection 中按 `model_id + dimension` 动态维护 Dense Named Vector，并只在跨 KB 查询时执行外层 RRF。
+5. **文件管理增量**：按 `(knowledge_base_id, file_id)` 下载原文件；批量上传复用现有单文件 Ingest，每项保留独立 File、FileBatch 和 Operation。
 
 实施必须保持方案中的对象模型、权限边界、Collection 组织、任务可靠性边界和非目标，不在编码阶段重新引入 Haystack、Revision、PgQueuer、River 或独立 API 服务。异步导入复用 OGX 单文件 FileBatch 及 PostgreSQL 状态，不新增可部署组件。
 
-步骤 1～14 保留为当前已实现基线和验证证据，其中“租户级模型配置”“固定 `dense` Named Vector”和“一次 Qdrant 查询融合多个 KB”描述的是改造前现状。目标行为以步骤 15～20 为准；本次是明确的不兼容升级，不保留旧租户配置 API，不迁移已有租户 Profile、VectorStore 或 Qdrant Point，开发与验收环境在切换后重新创建数据卷。
+步骤 1～14 保留为当前已实现基线和验证证据，其中“租户级模型配置”“固定 `dense` Named Vector”和“一次 Qdrant 查询融合多个 KB”描述的是改造前现状。KnowledgeBase 模型与检索目标行为以步骤 15～20 为准；文件管理增量以步骤 21～23 为准。新接口不迁移或改写已有 File、Operation、VectorStore 与 Qdrant Point。
 
-### 1.1 2026-08-26 实施快照
+### 1.1 2026-08-28 实施快照
 
 | 步骤 | 当前状态 | 已有证据或剩余事项 |
 | --- | --- | --- |
@@ -43,12 +44,17 @@
 | 18. 跨 KB 检索 | 完成 | 各 KB 独立检索和可选 Rerank，最后执行稳定、等权的 Python 外层 RRF |
 | 19. 配置生命周期 | 完成 | 空 KB 可改 Embedding；已有文件后锁定模型与维度；Rerank 随时可改；删除时清理 KB Profile |
 | 20. 增量验收与交付更新 | 完成 | 契约、产品示例和脚本已更新；多模型、多维度、跨 KB、故障恢复、生产镜像和资源采样均通过 |
+| 21. 原文件下载 | 完成 | Runtime 路由先校验 KB/File 归属，再透传 LocalFS Response 或 S3-compatible StreamingResponse；跨 KB 和缺失原文稳定返回 404 |
+| 22. 批量上传 | 完成 | 同 KB、共用 attributes；每项独立 Operation；批量指纹、精确重放、中途失败续提和 100 MiB/20 个/500 MiB 可配置限制均已实现 |
+| 23. 文件管理增量验收 | 完成 | OpenAPI/Scalar、README、API Reference 和两侧示例已更新；静态、83 项单元、2 项 Qdrant 集成、9 项产品契约、7 项 OGX 原生 E2E 及生产镜像构建通过 |
 
 租户 Collection 与产品调用模拟已按新链路完成一轮本地采样：67 个创建、导入、权限/挂载检索和跨租户拒绝场景全部通过，企业版覆盖 3/5/7 维独立 KB、两套独立 Embedding 凭证、两套独立 Rerank 凭证和关闭 Rerank 的 KB。8 并发下执行 700 个 Hybrid 请求，吞吐约 `14.11 req/s`，平均 `564.34 ms`，P50 `499.23 ms`，P95 `979.30 ms`，最大 `1279.39 ms`。混合阶段 OGX CPU 平均约 `98.59%`、P95 `107.52%`、内存最大约 `1181.70 MiB`；Qdrant CPU 平均约 `5.81%`、P95 `7.14%`、内存最大约 `836.50 MiB`；PostgreSQL CPU 平均约 `5.84%`、P95 `7.74%`、内存最大约 `75.09 MiB`。CPU `100%` 约等于一个逻辑核。
 
 该采样使用确定性 Embedding/Rerank 测试桩和小型 Markdown，只验证接口、隔离、并发路径及本地组件量级，不代表真实模型延迟、检索效果、容量或生产 SLA。它不能与旧版“一个请求只发出一次 Qdrant Query”的 `62.95 req/s` 直接视作等价回归：新版跨 KB 请求会按挂载 KB 数扇出本地检索和可选 Rerank，吞吐下降是真实架构成本。Qdrant 在本次采样前已经过动态 Schema、恢复和文件矩阵预热，因此其内存数字也不是冷启动基线。原始 JSON、CSV 和 Markdown 报告保存在本地 `.reports/`，不进入 Git。
 
 当前镜像已只预置 Docling PDF 默认路径需要的模型：Transformers layout、Accurate TableFormer 和 HybridChunker tokenizer，且都固定到 commit。构建阶段在离线模式初始化 PDF Pipeline，最终镜像约 `1.08 GB`，而不是此前包含未使用 ONNX/Fast 变体时的约 `4.55 GB`。
+
+文件管理增量于 2026-08-28 完成新鲜验收：格式、Ruff、mypy、完整单元测试、Qdrant 集成测试和统一 API Contract E2E 全部通过；从当前工作区重建的生产 Knowledge 镜像健康启动。真实 HTTP 测试覆盖两文件批量提交、独立 Operation 终态、精确重放、顺序冲突、逐文件原文字节下载和文件名响应头；单元测试另覆盖跨 KB 拒绝、原文缺失、三层静态限制、中途临时失败续提和流式 Files Provider 透传。真实生产 S3 仍属于步骤 13 的独立待验证项，本次只证明同一公开接口兼容流式 Provider 响应。
 
 本机 Docker 基线仅用于量级判断，不是生产配额承诺：七类文件矩阵中 OGX 冷态约 `1.07 GiB`，默认两个 Worker 都懒加载 Docling 模型后常驻约 `2.2 GiB`，瞬时内存峰值约 `2.46 GiB`；Qdrant 预热基线/峰值约 `106/113 MiB`，PostgreSQL 约 `62/65 MiB`。资源数字来自三维确定性 Embedding Stub；另行完成的真实模型评测显示，当前服务上 0.6B/1024 维的 5 文档总导入约 `11.47 s`、Hybrid 平均约 `648 ms`，4B 约 `13.61 s / 738 ms`，8B 约 `35.33 s / 5514 ms`。这些只是不同链路可用性的单次测试数据，不是当前选型、吞吐或 SLA 承诺。
 
@@ -70,6 +76,8 @@
 - 所有凭证只从环境变量或 Secret 注入；示例、日志、测试快照和错误信息不得包含真实 Token。
 - 关键边界代码必须带注释或 docstring，尤其是过滤语义、Point ID、共享 Collection 删除和失败恢复。
 - 单元测试不得依赖真实模型服务；真实 Embedding 验证作为显式 live test。
+- 下载只接受 `knowledge_base_id + file_id`，必须先校验挂载关系；不把 Runtime Token、绝对下载 URL、S3 Key 或本地路径暴露给浏览器。
+- 批量上传不新增公开 Batch 对象，每个文件继续使用单文件 Ingest、单文件 OGX FileBatch 和独立 Operation；默认限制为单文件 `100 MiB`、单批 20 个文件、单批总计 `500 MiB`，三项均可配置。
 - 每一步只有通过自己的验证门，才能进入依赖它的下一步。
 
 ## 3. 预期仓库区域
@@ -658,6 +666,87 @@ shared-knowledge-service/
 - 重启 OGX、PostgreSQL 和 Qdrant 后复测所有已完成 KB；验证无 Profile 串用、Named Vector 丢失或错误部分结果。
 - 扫描 OpenAPI、仓库和构建产物，确认旧租户配置端点、真实凭证、无效脚本和兼容代码均不存在。
 
+### 步骤 21：提供按 KnowledgeBase 归属校验的原文件下载
+
+**预期结果**
+
+- 增加 `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download`，只返回上传时保存的原文件，不返回解析结果或 Chunk。
+- 调用方只传 `knowledge_base_id + file_id` 并使用 Runtime Token；服务先验证 File 属于指定 KnowledgeBase，再读取 OGX Files Provider。
+- LocalFS 与 S3-compatible 共用同一公开接口并保留底层 `Response`/`StreamingResponse`，不把 S3 Key、本地路径或服务 Token 暴露给产品前端。
+- `processing / completed / failed / cancelled` 文件在原文仍存在时都可下载；不存在或不属于指定 KB 时统一返回 `404 file_not_found`。
+
+**改动区域**
+
+- `api/routes.py`、`api/protocol.py`、`api/provider.py`：下载路由、Runtime 鉴权、挂载校验和 OGX Files 内容响应透传。
+- `tests/unit/test_knowledge_api.py`：正确归属、跨 KB、原文件缺失、普通响应和流式响应测试。
+- `api/openapi.py`、Scalar 契约测试：二进制响应和 Bearer 鉴权说明。
+
+**依赖**
+
+- 步骤 1～20 的 FileRecord、Files Provider 和 Runtime Token 基线。
+
+**验证方法**
+
+- 从文件列表、文件详情、SearchHit 和 Operation 分别取得相同 KB/File ID，下载字节与原上传内容完全一致。
+- 用存在于其他 KB 的 `file_id` 请求当前 KB，确认返回相同的 `404 file_not_found`，不调用内容读取接口。
+- 分别以 LocalFS `Response` 和模拟 S3 `StreamingResponse` 验证正文、`Content-Disposition` 与响应头不被 JSON 序列化或完整缓冲二次复制。
+- Runtime Token 可下载，缺失/错误 Token 拒绝；接口不接收 `tenant_id`、filename、Operation ID 或请求体。
+
+### 步骤 22：增加复用单文件 Ingest 的批量上传包装
+
+**预期结果**
+
+- 增加 `POST /knowledge/v1/ingest/batch`，使用重复 `files`、一个 `knowledge_base_id`、一份可选 `attributes` 和批量请求级 `Idempotency-Key`。
+- 同批文件进入同一 KB 并共用 attributes；每项继续创建独立 File、单文件 OGX FileBatch 和 Operation，响应按请求顺序返回 `index / filename / operation_id / file_id / knowledge_base_id / status`。
+- 不创建公开 `batch_id`、批次状态或整体重试接口；调用方继续逐个查询和重试 Operation。
+- 默认限制单文件 `100 MiB`、单批 20 个文件、单批总计 `500 MiB`，三项由部署配置覆盖；任何静态限制失败都发生在创建第一个 File 之前。
+- 批量请求在提交前保存有序清单指纹，并为每项派生稳定的内部单文件幂等键；中途临时失败后精确重放可复用已接受前缀并继续剩余项。
+
+**改动区域**
+
+- `api/models.py`、`api/routes.py`、`api/protocol.py`：批量响应、multipart 重复文件字段和 200/202 状态选择。
+- `api/provider.py`：批量预校验、清单指纹、逐项调用现有单文件 Ingest 和稳定响应顺序。
+- `api/state.py`：只保存内部批量幂等指纹和有序清单项数，不增加公开 Batch 领域对象。
+- API Provider 配置、`config/ogx.yaml` 与环境示例：文件数量和批量总大小限制。
+- 单元与 E2E Fixture：多文件、同名文件、幂等重放、清单冲突、限制和中途失败恢复。
+
+**依赖**
+
+- 步骤 11 的单文件 Ingest 与 Operation 语义；步骤 21 可先完成。两步修改相同 API 文件，因此实际编码保持串行。
+
+**验证方法**
+
+- 2～20 个文件一次提交后得到同数量、顺序稳定且互不共享 Operation 的结果，每个 Operation 独立进入终态。
+- 相同 Key 和完全相同的有序文件返回原 File/Operation；替换内容、文件名、顺序、KB 或 attributes 返回 `409 idempotency_conflict`。
+- 单文件、数量和总大小分别越界时，在 Files API 上断言零上传、零 Operation；配置覆盖值实际生效。
+- 在第 N 项创建任务时注入 `503`，确认前缀项继续处理；相同请求重试不重复创建前缀并补齐后缀。
+- 单文件 `/ingest` 的所有既有测试继续通过，证明批量路径没有复制或改变权威导入逻辑。
+
+### 步骤 23：完成文件管理增量契约与交付验收
+
+**预期结果**
+
+- 产品 OpenAPI、Scalar、README、API Reference、产品集成示例和方案文档都包含下载与批量上传，不再保留“产品只能并发调用单文件接口”或“不提供下载”的旧描述。
+- Stella 与企业版示例分别展示从文件列表/详情取得 KB/File ID 后由产品后端代理下载，以及同一 KB 的多文件上传。
+- 全部静态、单元、统一 API 契约、OGX E2E 和构建验证通过，Git diff 不包含本地测试语料、数据库卷或真实凭证。
+
+**改动区域**
+
+- `src/shared_knowledge_service/api/openapi.py`、`tests/unit/test_api_docs.py` 和 `tests/e2e/test_knowledge_api_contract.py`。
+- `README.md`、`docs/03-api-reference-and-product-integration.md`、部署说明和当前实施快照。
+- 必要的本地 Compose/E2E 测试，不新增生产服务。
+
+**依赖**
+
+- 步骤 21、22 全部完成。
+
+**验证方法**
+
+- 运行格式、Ruff、mypy、完整单元、统一 API Contract E2E 和 OGX 原生 E2E。
+- 在实际服务中上传一批小文件，轮询每个 Operation，分别从列表和详情下载并逐字节比对原文。
+- 使用 Scalar 选择多个文件发起批量请求，并验证二进制下载接口不会被 OpenAPI 错误声明为 JSON。
+- 扫描 staged/diff 和构建上下文，确认无测试语料、运行报告、数据卷和密钥。
+
 ## 5. 并行与阻塞关系
 
 ```text
@@ -688,6 +777,16 @@ shared-knowledge-service/
 步骤 19：模型配置生命周期
     ↓
 步骤 20：增量验收与交付更新
+
+本次文件管理增量：
+
+步骤 20 基线
+    ↓
+步骤 21：原文件下载
+    ↓
+步骤 22：批量上传包装
+    ↓
+步骤 23：契约、文档与交付验收
 ```
 
 - 步骤 1～14 的关系只记录已完成基线，不再作为本次执行队列。
@@ -696,6 +795,9 @@ shared-knowledge-service/
 - 步骤 18 必须以步骤 17 的单 KB 最终排名为输入；外层 RRF 不重新实现本地 Dense/BM25/Rerank。
 - 步骤 19 放在检索语义稳定后闭合更新与删除，避免配置切换同时改变仍未确定的查询路径。
 - 步骤 20 是本次硬验收门；文档示例可以提前准备，但只有新接口、动态 Schema、单/跨 KB 搜索和生命周期全部通过后才能标记完成。
+- 步骤 21、22 都会修改统一 API 路由、协议和 Provider，按下载后批量的顺序串行实现，避免同时改动稳定接口表面。
+- 步骤 22 必须复用单文件 Ingest，不能另写第二套上传、任务和失败恢复逻辑；内部批量记录只承担请求幂等，不升级为公开领域对象。
+- 步骤 23 是文件管理增量的硬验收门；文档可以同步准备，但只有下载归属隔离、批量限制、精确重放和中途恢复全部通过后才能标记完成。
 
 ## 6. 整体验证
 
@@ -718,6 +820,8 @@ shared-knowledge-service/
    - 创建 KB 时提交完整模型配置、维度推断/验证、配置锁定/更新/删除；旧租户配置端点不存在
    - 单 KB 的 `hybrid / dense / bm25` 调用与分数语义
    - 多 KB 独立检索、可选本地 Rerank、等权外层 RRF、整体失败和跨租户拒绝
+   - 原文件下载的 KB/File 归属隔离、二进制响应和 LocalFS/S3-compatible 一致性
+   - 批量上传的顺序、单项 Operation、三层限制、完整重放、冲突和中途失败恢复
 6. **两侧产品契约验证**
    - Stella 一个隐藏 KB、四级 attributes/Filter 和单 KB 直返
    - 企业版创建时提交独立模型配置，覆盖单 KB 与跨 KB 挂载、不同 Key/模型/维度/Rerank
@@ -732,4 +836,4 @@ shared-knowledge-service/
    - 无真实凭证、旧租户配置端点、兼容层、内部文件、临时数据和无用途候选实现
    - `solution.md`、`implementation.md` 与最终行为一致
 
-实施完成前不得仅以“服务能启动”判定成功；KB 凭证隔离、动态 Named Vector、过滤隔离、真 BM25、单 KB 直返、跨 KB 外层 RRF、删除和显式恢复协议都是同等级硬性验收项。
+实施完成前不得仅以“服务能启动”判定成功；KB 凭证隔离、动态 Named Vector、过滤隔离、真 BM25、单 KB 直返、跨 KB 外层 RRF、下载归属隔离、批量精确重放、删除和显式恢复协议都是同等级硬性验收项。

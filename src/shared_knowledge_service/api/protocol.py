@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from fastapi import UploadFile
+from starlette.responses import Response
 
 from .errors import ApiSecurity
 from .models import (
     AttributeValue,
+    BatchIngestResponse,
     EmbeddingConfigPutRequest,
     EmbeddingConfigResponse,
     FileDetail,
@@ -68,6 +70,14 @@ class KnowledgeApi(Protocol):
         idempotency_key: str,
     ) -> IngestResponse: ...
 
+    async def batch_ingest(
+        self,
+        files: list[UploadFile],
+        knowledge_base_id: str,
+        attributes: dict[str, AttributeValue],
+        idempotency_key: str,
+    ) -> BatchIngestResponse: ...
+
     async def get_ingest_operation(
         self,
         operation_id: str,
@@ -85,6 +95,8 @@ class KnowledgeApi(Protocol):
     ) -> FileQueryResponse: ...
 
     async def get_file(self, knowledge_base_id: str, file_id: str) -> FileDetail: ...
+
+    async def download_file(self, knowledge_base_id: str, file_id: str) -> Response: ...
 
     async def delete_file(self, knowledge_base_id: str, file_id: str) -> None: ...
 

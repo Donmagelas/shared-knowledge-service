@@ -77,6 +77,9 @@ providers:
         file_cleanup_interval_hours: ${env.KNOWLEDGE_FILE_CLEANUP_INTERVAL_HOURS:=24}
         http_allowed_inference_hosts: ${env.KNOWLEDGE_INFERENCE_HTTP_ALLOWED_HOSTS:=}
         inference_timeout_seconds: ${env.KNOWLEDGE_INFERENCE_TIMEOUT_SECONDS:=30}
+        max_batch_files: ${env.KNOWLEDGE_MAX_BATCH_FILES:=20}
+        max_batch_upload_size_bytes: ${env.KNOWLEDGE_MAX_BATCH_UPLOAD_SIZE_BYTES:=524288000}
+        max_upload_size_bytes: ${env.KNOWLEDGE_MAX_UPLOAD_SIZE_BYTES:=104857600}
         outer_rrf_k: ${env.KNOWLEDGE_OUTER_RRF_K:=60}
         persistence:
           backend: kv_default

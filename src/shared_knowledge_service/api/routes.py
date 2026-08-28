@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from .errors import KnowledgeError, StableKnowledgeRoute
 from .models import (
     AttributeValue,
+    BatchIngestResponse,
     EmbeddingConfigPutRequest,
     EmbeddingConfigResponse,
     FileDetail,
@@ -63,11 +64,16 @@ def parse_attributes(value: str | None) -> dict[str, AttributeValue]:
 
 def create_router(
     impl: KnowledgeApi,
-    max_upload_size_bytes: int = DEFAULT_MAX_UPLOAD_SIZE_BYTES,
+    max_upload_size_bytes: int | None = None,
 ) -> APIRouter:
     """创建挂载在 OGX 同一 FastAPI 进程中的产品接口。"""
 
     router = APIRouter(tags=["Knowledge"], route_class=StableKnowledgeRoute)
+    effective_max_upload_size_bytes = (
+        max_upload_size_bytes
+        if max_upload_size_bytes is not None
+        else int(getattr(impl, "max_upload_size_bytes", DEFAULT_MAX_UPLOAD_SIZE_BYTES))
+    )
 
     def require_runtime(request: Request) -> None:
         impl.security.require(request)
@@ -189,9 +195,32 @@ def create_router(
     ) -> IngestResponse:
         require_runtime(request)
         parsed_attributes = parse_attributes(attributes)
-        content = await read_upload_with_size_limit(file, max_upload_size_bytes)
+        content = await read_upload_with_size_limit(file, effective_max_upload_size_bytes)
         safe_file = PreReadUploadFile(content, filename=file.filename, content_type=file.content_type)
         result = await impl.ingest(safe_file, knowledge_base_id, parsed_attributes, idempotency_key)
+        response.status_code = 200 if result.replayed else 202
+        return result
+
+    @router.post(
+        "/knowledge/v1/ingest/batch",
+        response_model=BatchIngestResponse,
+        status_code=202,
+        summary="异步提交多个原始文件",
+    )
+    async def batch_ingest(
+        request: Request,
+        response: Response,
+        files: Annotated[list[UploadFile], File(description="同一 KnowledgeBase 的多个原始文件")],
+        knowledge_base_id: Annotated[str, Form(description="逻辑知识库 ID，不是 Qdrant Collection ID")],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
+        attributes: Annotated[
+            str | None,
+            Form(description="整批文件共用的可选业务过滤属性，使用 JSON 对象字符串"),
+        ] = None,
+    ) -> BatchIngestResponse:
+        require_runtime(request)
+        parsed_attributes = parse_attributes(attributes)
+        result = await impl.batch_ingest(files, knowledge_base_id, parsed_attributes, idempotency_key)
         response.status_code = 200 if result.replayed else 202
         return result
 
@@ -244,6 +273,23 @@ def create_router(
     async def get_file(knowledge_base_id: str, file_id: str, request: Request) -> FileDetail:
         require_runtime(request)
         return await impl.get_file(knowledge_base_id, file_id)
+
+    @router.get(
+        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download",
+        response_class=Response,
+        summary="下载 KnowledgeBase 原文件",
+        responses={
+            200: {
+                "description": "上传时保存的原文件",
+                "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
+            }
+        },
+    )
+    async def download_file(knowledge_base_id: str, file_id: str, request: Request) -> Response:
+        """只允许通过所属 KnowledgeBase 下载原文件，避免全局 File ID 越界。"""
+
+        require_runtime(request)
+        return await impl.download_file(knowledge_base_id, file_id)
 
     @router.delete(
         "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",

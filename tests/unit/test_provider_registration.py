@@ -75,6 +75,25 @@ def test_project_config_registers_knowledge_base_inference_provider(monkeypatch:
     assert "remote::knowledge-base-inference" in registry[Api.inference]
 
 
+def test_project_config_applies_product_upload_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """三层上传限制都必须能由部署环境覆盖。"""
+
+    monkeypatch.setenv("KNOWLEDGE_CREDENTIAL_MASTER_KEY", "test-master-key-at-least-sixteen")
+    monkeypatch.setenv("KNOWLEDGE_RUNTIME_TOKEN", "runtime-test-at-least-sixteen")
+    monkeypatch.setenv("KNOWLEDGE_ADMIN_TOKEN", "admin-test-at-least-sixteen")
+    monkeypatch.setenv("KNOWLEDGE_MAX_UPLOAD_SIZE_BYTES", "123")
+    monkeypatch.setenv("KNOWLEDGE_MAX_BATCH_FILES", "7")
+    monkeypatch.setenv("KNOWLEDGE_MAX_BATCH_UPLOAD_SIZE_BYTES", "456")
+    repository_root = Path(__file__).parents[2]
+
+    config = parse_and_maybe_upgrade_config(yaml.safe_load((repository_root / "config/ogx.yaml").read_text()))
+    knowledge_config = config.providers["knowledge"][0].config
+
+    assert knowledge_config["max_upload_size_bytes"] == 123
+    assert knowledge_config["max_batch_files"] == 7
+    assert knowledge_config["max_batch_upload_size_bytes"] == 456
+
+
 @pytest.mark.parametrize(
     ("provider_type", "config_type"),
     [

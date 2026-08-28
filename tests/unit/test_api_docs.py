@@ -18,10 +18,12 @@ _PRODUCT_PATHS = {
     "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
     "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
     "/knowledge/v1/ingest",
+    "/knowledge/v1/ingest/batch",
     "/knowledge/v1/operations/{operation_id}",
     "/knowledge/v1/operations/{operation_id}/retry",
     "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query",
     "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",
+    "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download",
     "/knowledge/v1/search",
 }
 
@@ -60,9 +62,7 @@ def test_product_openapi_describes_service_token_levels() -> None:
     assert "Admin Token" in security_scheme["description"]
 
     runtime_operation = schema["paths"]["/knowledge/v1/search"]["post"]
-    admin_operation = schema["paths"][
-        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config"
-    ]["put"]
+    admin_operation = schema["paths"]["/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config"]["put"]
     assert runtime_operation["security"] == [{SERVICE_TOKEN_SCHEME: []}]
     assert runtime_operation["x-required-token"] == "runtime-or-admin"
     assert "Runtime Token 或 Admin Token" in runtime_operation["description"]
@@ -86,12 +86,12 @@ def test_product_openapi_contains_product_examples_and_file_picker_schema() -> N
     )
     assert idempotency_header["example"] == "product-request-0001"
 
-    file_examples = schema["paths"][
-        "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query"
-    ]["post"]["requestBody"]["content"]["application/json"]["examples"]
-    search_examples = schema["paths"]["/knowledge/v1/search"]["post"]["requestBody"]["content"][
-        "application/json"
-    ]["examples"]
+    file_examples = schema["paths"]["/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query"]["post"][
+        "requestBody"
+    ]["content"]["application/json"]["examples"]
+    search_examples = schema["paths"]["/knowledge/v1/search"]["post"]["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
     assert set(file_examples) == {"enterprise", "stella"}
     assert set(search_examples) == {"enterprise-mounted-knowledge-bases", "stella-four-quadrants"}
 
@@ -102,6 +102,20 @@ def test_product_openapi_contains_product_examples_and_file_picker_schema() -> N
     assert multipart_schema["properties"]["knowledge_base_id"]["example"] == "kb-product-a"
     assert multipart_schema["properties"]["attributes"]["example"] == '{"department_id":"product-a"}'
     assert ingest_operation["responses"]["202"]["content"]["application/json"]["example"]["status"] == "processing"
+
+    batch_operation = schema["paths"]["/knowledge/v1/ingest/batch"]["post"]
+    batch_schema_ref = batch_operation["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"]
+    batch_schema = schema["components"]["schemas"][batch_schema_ref.rsplit("/", maxsplit=1)[-1]]
+    assert batch_schema["properties"]["files"]["items"]["format"] == "binary"
+    assert batch_schema["properties"]["knowledge_base_id"]["example"] == "kb-product-a"
+    assert batch_schema["properties"]["attributes"]["example"] == '{"department_id":"product-a"}'
+    assert len(batch_operation["responses"]["202"]["content"]["application/json"]["example"]["items"]) == 2
+
+    download_operation = schema["paths"]["/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download"][
+        "get"
+    ]
+    download_content = download_operation["responses"]["200"]["content"]
+    assert download_content["application/octet-stream"]["schema"] == {"type": "string", "format": "binary"}
 
 
 def test_scalar_page_uses_product_openapi_without_embedding_credentials() -> None:

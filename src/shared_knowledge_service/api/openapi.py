@@ -144,6 +144,26 @@ _RESPONSE_EXAMPLES: dict[tuple[str, str, str], dict[str, Any]] = {
         "knowledge_base_id": "kb-product-a",
         "status": "processing",
     },
+    ("/knowledge/v1/ingest/batch", "post", "202"): {
+        "items": [
+            {
+                "index": 0,
+                "filename": "refund-policy.pdf",
+                "operation_id": "op_01HZXEXAMPLE_1",
+                "file_id": "file_01HZXEXAMPLE_1",
+                "knowledge_base_id": "kb-product-a",
+                "status": "processing",
+            },
+            {
+                "index": 1,
+                "filename": "product-manual.docx",
+                "operation_id": "op_01HZXEXAMPLE_2",
+                "file_id": "file_01HZXEXAMPLE_2",
+                "knowledge_base_id": "kb-product-a",
+                "status": "processing",
+            },
+        ]
+    },
     ("/knowledge/v1/operations/{operation_id}", "get", "200"): {
         "operation_id": "op_01HZXEXAMPLE",
         "knowledge_base_id": "kb-product-a",
@@ -231,7 +251,7 @@ def _describe_auth(path: str, method: str, operation: dict[str, Any]) -> None:
 
 
 def _describe_ingest_form(schema: dict[str, Any], operation: dict[str, Any]) -> None:
-    """让 Scalar 的 multipart 表单显示可理解的文件与属性示例。"""
+    """让 Scalar 的单文件和多文件 multipart 表单显示正确的文件控件。"""
 
     media_type = operation.get("requestBody", {}).get("content", {}).get("multipart/form-data")
     if not isinstance(media_type, dict):
@@ -247,6 +267,11 @@ def _describe_ingest_form(schema: dict[str, Any], operation: dict[str, Any]) -> 
     if isinstance(properties.get("file"), dict):
         # FastAPI 3.1 使用 contentMediaType；补 format 兼容 Scalar 等常见文件控件识别方式。
         properties["file"]["format"] = "binary"
+    if isinstance(properties.get("files"), dict):
+        # 批量接口使用重复 files 字段；数组元素也必须声明为 binary 才会显示多文件选择器。
+        items = properties["files"].get("items")
+        if isinstance(items, dict):
+            items["format"] = "binary"
     if isinstance(properties.get("knowledge_base_id"), dict):
         properties["knowledge_base_id"]["example"] = "kb-product-a"
     if isinstance(properties.get("attributes"), dict):
@@ -304,7 +329,10 @@ def build_product_openapi(routes: Sequence[BaseRoute]) -> dict[str, Any]:
             for response_path, response_method, status in _RESPONSE_EXAMPLES:
                 if (response_path, response_method) == (path, method):
                     _set_response_example(operation, status, _RESPONSE_EXAMPLES[(path, method, status)])
-            if (path, method) == ("/knowledge/v1/ingest", "post"):
+            if (path, method) in {
+                ("/knowledge/v1/ingest", "post"),
+                ("/knowledge/v1/ingest/batch", "post"),
+            }:
                 _describe_ingest_form(schema, operation)
 
     return schema

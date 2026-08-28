@@ -89,6 +89,27 @@ def _submit_ingest(
     )
 
 
+def _submit_batch_ingest(
+    client: httpx.Client,
+    knowledge_base_id: str,
+    *,
+    key: str,
+    documents: list[tuple[str, bytes]],
+    attributes: dict[str, Any] | None = None,
+) -> httpx.Response:
+    """按公开 multipart 契约重复提交 files 字段。"""
+
+    return client.post(
+        "/knowledge/v1/ingest/batch",
+        headers=_runtime_headers(**{"Idempotency-Key": key}),
+        data={
+            "knowledge_base_id": knowledge_base_id,
+            "attributes": json.dumps(attributes or {}, ensure_ascii=False),
+        },
+        files=[("files", (filename, content, "text/markdown")) for filename, content in documents],
+    )
+
+
 def _wait_operation(
     client: httpx.Client,
     operation_id: str,
@@ -193,10 +214,12 @@ def test_openapi_contains_only_confirmed_public_knowledge_endpoints_and_raw_api_
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/embedding-config",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
             "/knowledge/v1/ingest",
+            "/knowledge/v1/ingest/batch",
             "/knowledge/v1/operations/{operation_id}",
             "/knowledge/v1/operations/{operation_id}/retry",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query",
             "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}",
+            "/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download",
             "/knowledge/v1/search",
         }
         assert expected <= paths
@@ -226,13 +249,20 @@ def test_product_openapi_and_scalar_page_expose_only_stable_knowledge_contract()
         product_schema.raise_for_status()
         scalar_page.raise_for_status()
         schema = product_schema.json()
-        assert len(schema["paths"]) == 11
+        assert len(schema["paths"]) == 13
         assert all(path.startswith("/knowledge/v1/") for path in schema["paths"])
         assert not any("/internal/" in path for path in schema["paths"])
         assert schema["components"]["securitySchemes"]["ServiceToken"]["scheme"] == "bearer"
         assert schema["paths"]["/knowledge/v1/ingest"]["post"]["requestBody"]["content"].keys() == {
             "multipart/form-data"
         }
+        assert schema["paths"]["/knowledge/v1/ingest/batch"]["post"]["requestBody"]["content"].keys() == {
+            "multipart/form-data"
+        }
+        download_schema = schema["paths"]["/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download"][
+            "get"
+        ]["responses"]["200"]["content"]["application/octet-stream"]["schema"]
+        assert download_schema == {"type": "string", "format": "binary"}
         assert "/knowledge-openapi.json" in scalar_page.text
         assert "@scalar/api-reference@1.66.1" in scalar_page.text
 
@@ -341,6 +371,14 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
         )
         detail.raise_for_status()
         assert detail.json()["knowledge_base_id"] == knowledge_base_id
+        downloaded = client.get(
+            f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{accepted['file_id']}/download",
+            headers=_runtime_headers(),
+        )
+        downloaded.raise_for_status()
+        assert downloaded.content == _fixture_bytes()
+        assert downloaded.headers["content-disposition"].endswith('filename="knowledge.md"')
+        assert downloaded.headers["cache-control"] == "private, no-store"
 
         rerank_config = client.put(
             f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/rerank-config",
@@ -414,6 +452,75 @@ def test_full_product_contract_idempotency_filters_files_rerank_and_delete() -> 
             ).status_code
             == 404
         )
+        knowledge_base_id = None
+    if knowledge_base_id is not None:
+        with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as cleanup_client:
+            _delete_knowledge_base(cleanup_client, knowledge_base_id)
+
+
+def test_batch_ingest_creates_independent_operations_and_replays_exact_request() -> None:
+    """批量端点只聚合提交；每个文件仍可独立查状态和下载。"""
+
+    tenant_id = f"batch-{uuid.uuid4().hex[:10]}"
+    batch_key = f"batch-{uuid.uuid4()}"
+    knowledge_base_id: str | None = None
+    documents = [
+        ("refund.md", b"# Refund\nRefund requires an order number."),
+        ("manual.md", b"# Manual\nThe product manual covers installation."),
+    ]
+    with httpx.Client(base_url=_base_url(), timeout=120, trust_env=False) as client:
+        knowledge_base_id = str(_create_knowledge_base(client, tenant_id)["knowledge_base_id"])
+        attributes = {"department_id": "product-a"}
+        submitted = _submit_batch_ingest(
+            client,
+            knowledge_base_id,
+            key=batch_key,
+            documents=documents,
+            attributes=attributes,
+        )
+        submitted.raise_for_status()
+        assert submitted.status_code == 202
+        items = submitted.json()["items"]
+        assert [item["filename"] for item in items] == ["refund.md", "manual.md"]
+        assert len({item["operation_id"] for item in items}) == 2
+        assert len({item["file_id"] for item in items}) == 2
+        for item in items:
+            terminal = _wait_operation(client, item["operation_id"])
+            assert terminal["status"] == "completed", terminal
+
+        replayed = _submit_batch_ingest(
+            client,
+            knowledge_base_id,
+            key=batch_key,
+            documents=documents,
+            attributes=attributes,
+        )
+        replayed.raise_for_status()
+        assert replayed.status_code == 200
+        replayed_items = replayed.json()["items"]
+        assert [item["operation_id"] for item in replayed_items] == [item["operation_id"] for item in items]
+        assert [item["file_id"] for item in replayed_items] == [item["file_id"] for item in items]
+        assert all(item["status"] == "completed" for item in replayed_items)
+
+        changed_order = _submit_batch_ingest(
+            client,
+            knowledge_base_id,
+            key=batch_key,
+            documents=list(reversed(documents)),
+            attributes=attributes,
+        )
+        assert changed_order.status_code == 409
+        assert changed_order.json()["error"]["code"] == "idempotency_conflict"
+
+        for item, (_, expected_content) in zip(items, documents, strict=True):
+            downloaded = client.get(
+                f"/knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{item['file_id']}/download",
+                headers=_runtime_headers(),
+            )
+            downloaded.raise_for_status()
+            assert downloaded.content == expected_content
+
+        _delete_knowledge_base(client, knowledge_base_id)
         knowledge_base_id = None
     if knowledge_base_id is not None:
         with httpx.Client(base_url=_base_url(), timeout=30, trust_env=False) as cleanup_client:

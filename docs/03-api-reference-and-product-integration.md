@@ -84,6 +84,7 @@ X-Request-ID: product-generated-id
 
 - 创建技术 KnowledgeBase。
 - 提交文件 Ingest。
+- 批量提交文件 Ingest。
 
 相同 Key 与相同请求重复调用时返回第一次创建的对象，HTTP 状态由首次的 201/202 变为 200。相同 Key 用于不同请求时返回 409 idempotency_conflict。
 
@@ -91,14 +92,15 @@ X-Request-ID: product-generated-id
 
 - 创建知识库：create-kb:<业务知识库 ID>
 - 上传文件：ingest:<业务文件 ID>:<内容版本或哈希>
+- 批量上传：ingest-batch:<业务批次 ID>:<清单版本或哈希>
 
 不要为自动重试生成新 Key，否则服务会把它当成新的知识库或文件。
 
 ### 2.4 JSON 与 multipart
 
-除 Ingest 外，请求和响应均使用 application/json。
+除单文件和批量 Ingest 外，请求和响应均使用 application/json。
 
-Ingest 使用 multipart/form-data，因为一个请求同时包含文件二进制和结构化字段。调用方不需要先上传 File 再发第二次 Ingest 请求。
+Ingest 使用 multipart/form-data，因为一个请求同时包含文件二进制和结构化字段。调用方不需要先上传 File 再发第二次 Ingest 请求；批量接口通过重复的 `files` 字段传多个文件。
 
 ### 2.5 错误格式
 
@@ -373,7 +375,74 @@ attributes 限制：
 - 数组最多 64 项；字符串值最长 512 字符。
 - 不能写入 file_id、tenant_id、vector_store_id、filename、chunk_id、content_text、attributes 等服务保留字段。
 
-### 5.2 查询导入状态
+### 5.2 批量提交文件
+
+**POST /knowledge/v1/ingest/batch**
+
+权限：Runtime 或 Admin Token。要求批量请求级 `Idempotency-Key`。Content-Type 为 `multipart/form-data`。
+
+表单字段：
+
+| 字段 | 必填 | 约束 | 含义 |
+| --- | --- | --- | --- |
+| files | 是 | 重复字段；默认 1～20 个，每个最大 100 MiB | 同一批原始文件，顺序参与幂等指纹 |
+| knowledge_base_id | 是 | 已存在的技术 ID | 整批文件进入同一个 KnowledgeBase |
+| attributes | 否 | JSON 对象字符串 | 整批文件共用的可信过滤属性 |
+
+默认单批总大小为 `500 MiB`。单文件大小、文件数和总大小分别由 `KNOWLEDGE_MAX_UPLOAD_SIZE_BYTES`、`KNOWLEDGE_MAX_BATCH_FILES` 和 `KNOWLEDGE_MAX_BATCH_UPLOAD_SIZE_BYTES` 覆盖。静态超限会在创建第一个 File 前拒绝整个请求。
+
+企业版示例：
+
+~~~bash
+curl -X POST "http://localhost:8321/knowledge/v1/ingest/batch" \
+  -H "Authorization: Bearer <runtime-token>" \
+  -H "Idempotency-Key: enterprise-product-a-import-123" \
+  -F "knowledge_base_id=vs_product_a" \
+  -F 'attributes={"source":"product-docs"}' \
+  -F "files=@./refund-policy.pdf" \
+  -F "files=@./product-manual.docx"
+~~~
+
+Stella 也可以批量提交同一四级范围的文件；如果文件属于不同 scope、user_id 或 agent_id，必须拆成多个请求，不能让同一批文件共用错误的 attributes。
+
+~~~bash
+curl -X POST "http://localhost:8321/knowledge/v1/ingest/batch" \
+  -H "Authorization: Bearer <runtime-token>" \
+  -H "Idempotency-Key: stella-user-agent-import-123" \
+  -F "knowledge_base_id=vs_stella_hidden" \
+  -F 'attributes={"scope":"user_agent","user_id":"user-1","agent_id":"agent-1"}' \
+  -F "files=@./project-rules.md" \
+  -F "files=@./meeting-notes.pdf"
+~~~
+
+首次至少创建一个新 Operation 时返回 `202`；整批精确重放且所有子项都已存在时返回 `200`。相同 Key 必须保持文件顺序、文件名、内容、KnowledgeBase 和 attributes 完全一致，否则返回 `409 idempotency_conflict`。
+
+~~~json
+{
+  "items": [
+    {
+      "index": 0,
+      "filename": "refund-policy.pdf",
+      "operation_id": "batch_01",
+      "file_id": "file_01",
+      "knowledge_base_id": "vs_product_a",
+      "status": "processing"
+    },
+    {
+      "index": 1,
+      "filename": "product-manual.docx",
+      "operation_id": "batch_02",
+      "file_id": "file_02",
+      "knowledge_base_id": "vs_product_a",
+      "status": "processing"
+    }
+  ]
+}
+~~~
+
+批量端点只聚合提交，不创建 `batch_id` 或批次任务。每个文件仍有独立 File 和 Operation；调用方分别轮询、重试、下载或删除。外部系统调用在中途失败时，已接受的前缀不会回滚；使用完全相同的批量请求和 Idempotency-Key 重试，会复用已接受项并继续剩余项。
+
+### 5.3 查询导入状态
 
 **GET /knowledge/v1/operations/{operation_id}**
 
@@ -406,7 +475,7 @@ status 取值：
 
 建议轮询使用退避，例如 1 秒、2 秒、5 秒，之后每 5～10 秒一次；不要高频固定轮询。
 
-### 5.3 重试失败导入
+### 5.4 重试失败导入
 
 **POST /knowledge/v1/operations/{operation_id}/retry**
 
@@ -504,7 +573,25 @@ Stella 示例：只查询 User 范围中已完成或失败的文件。
 
 响应与文件列表项相同，并额外包含 knowledge_base_id。
 
-### 6.3 删除文件
+### 6.3 下载原文件
+
+**GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download**
+
+权限：Runtime 或 Admin Token。无请求正文。
+
+该接口适合在文件列表或详情页面的“下载原文件”动作中调用。调用方只需要路径中的 `knowledge_base_id` 和 `file_id`；不传文件名、Operation ID、attributes、用户信息或底层存储地址。服务先确认该 File 属于指定 KnowledgeBase，再返回上传时保存的原始字节，并带 `Content-Disposition: attachment`。使用错误 KnowledgeBase 路径访问其他库的 File 时统一返回 `404 file_not_found`。
+
+产品后端必须先按自己的权限模型检查当前用户能否访问该业务知识库/文件，再携带 Runtime Token 调用并流式转发响应。不要把 Runtime Token 或知识库服务地址直接交给浏览器，也不要把二进制内容塞进列表或详情 JSON。
+
+~~~bash
+curl -L "http://localhost:8321/knowledge/v1/knowledge-bases/vs_product_a/files/file_01/download" \
+  -H "Authorization: Bearer <runtime-token>" \
+  --output refund-policy.pdf
+~~~
+
+本地 FS 与 S3-compatible 原文件后端共用这一接口。响应是原文件，不是 DoclingDocument、Markdown、Chunk 或搜索结果。
+
+### 6.4 删除文件
 
 **DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}**
 
@@ -512,7 +599,7 @@ Stella 示例：只查询 User 范围中已完成或失败的文件。
 
 成功返回 204 No Content；重复删除视为成功。删除范围仅限指定技术 KnowledgeBase。
 
-文件仍在 processing 时返回 409 file_busy，并在 details.active_operation_id 中给出活动任务。V1 不提供替换文件、修改 attributes 或下载原文件接口。
+文件仍在 processing 时返回 409 file_busy，并在 details.active_operation_id 中给出活动任务。V1 不提供替换文件或修改 attributes 接口。
 
 ## 7. Search API
 
@@ -673,10 +760,12 @@ score 只用于本次响应内排序。产品不应跨不同请求、不同 mode
 | PUT | /knowledge-bases/{id}/rerank-config | Admin | 启用、修改或关闭 Rerank |
 | DELETE | /knowledge-bases/{id} | Runtime | 删除技术 KnowledgeBase |
 | POST | /ingest | Runtime | 异步上传并导入一个文件 |
+| POST | /ingest/batch | Runtime | 一次提交同一 KB、共用 attributes 的多个文件 |
 | GET | /operations/{operation_id} | Runtime | 查询导入状态 |
 | POST | /operations/{operation_id}/retry | Runtime | 重试最终失败的导入 |
 | POST | /knowledge-bases/{id}/files/query | Runtime | 分页查询文件 |
 | GET | /knowledge-bases/{id}/files/{file_id} | Runtime | 查询文件详情 |
+| GET | /knowledge-bases/{id}/files/{file_id}/download | Runtime | 下载上传时保存的原文件 |
 | DELETE | /knowledge-bases/{id}/files/{file_id} | Runtime | 删除文件 |
 | POST | /search | Runtime | 检索一个或多个同租户 KnowledgeBase |
 
@@ -766,8 +855,8 @@ scope、user_id、agent_id 必须由 Stella 后端生成，不能直接信任终
 | 场景 | 接口 |
 | --- | --- |
 | 部署初始化 | 创建/查询隐藏 KnowledgeBase；必要时查询或轮换模型配置 |
-| 文件上传 | Ingest、Operation 查询、按需 Retry |
-| 文件管理 | File Query、File Detail、File Delete |
+| 文件上传 | 单文件/批量 Ingest、Operation 查询、按需 Retry |
+| 文件管理 | File Query、File Detail、原文件 Download、File Delete |
 | Agent 检索 | Search |
 | Stella 数据彻底清理 | 删除隐藏技术 KnowledgeBase；不是普通用户操作 |
 
@@ -847,8 +936,8 @@ KnowledgeBase 凭证只保存在统一知识库的加密配置中。企业版数
 | 创建业务知识库 | 携带该库模型配置创建技术 KnowledgeBase，并保存 ID 映射 |
 | 模型配置维护 | 查询配置；空库可换 Embedding，非空库可轮换 URL/Key；Rerank 可随时修改 |
 | 对账和展示技术状态 | 查询技术 KnowledgeBase |
-| 上传与任务状态 | Ingest、Operation 查询、Retry |
-| 文件管理 | File Query、File Detail、File Delete |
+| 上传与任务状态 | 单文件/批量 Ingest、Operation 查询、Retry |
+| 文件管理 | File Query、File Detail、原文件 Download、File Delete |
 | 多库挂载检索 | Search，传同租户多个 knowledge_base_ids |
 | 删除业务知识库 | 删除技术 KnowledgeBase |
 
@@ -875,7 +964,6 @@ V1 明确不提供：
 - 用户、组织、角色或权限管理。
 - 挂载/取消挂载 KnowledgeBase。
 - 业务 KnowledgeBase 列表、名称或描述修改。
-- 原文件下载。
 - 替换文件或 Revision 管理。
 - 修改已上传文件 attributes。
 - 取消 Operation。

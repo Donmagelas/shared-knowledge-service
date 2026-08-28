@@ -364,7 +364,7 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 | `knowledge_base_id` | 是 | 逻辑知识库 ID；映射 OGX VectorStore 和 Qdrant `vector_store_id`，不是物理 Collection ID |
 | `attributes` | 否 | 产品写入的通用过滤元数据；Stella 在这里写四级范围字段 |
 
-返回固定包含：`operation_id`、`file_id`、`knowledge_base_id` 和统一后的 `status`。`operation_id` 当前映射 OGX `file_batch_id`。批量导入由 Stella 或企业版并发调用本接口，不新增另一套批量上传协议。
+返回固定包含：`operation_id`、`file_id`、`knowledge_base_id` 和统一后的 `status`。`operation_id` 当前映射 OGX `file_batch_id`。单文件接口继续作为所有导入行为的权威实现；批量接口只在其上提供一次请求提交多个文件的包装，不改变每个文件独立 File、FileBatch 和 Operation 的语义。
 
 #### `GET /knowledge/v1/operations/{operation_id}`
 
@@ -393,7 +393,7 @@ MVP 的首要目标是验证原生单 VectorStore 链路。原生链路通过后
 | 删除整个知识库 | 不需要 | 需要 |
 | 用户管理 | 不由知识库服务提供 | 不由知识库服务提供 |
 
-业务知识库的名称、展示字段、组织归属和挂载关系始终由 Stella 或 Cherry Studio 企业版维护。统一知识库只管理对应的技术对象，因此 V1 不提供知识库列表、重命名、用户挂载、权限分配或原文件下载接口。
+业务知识库的名称、展示字段、组织归属和挂载关系始终由 Stella 或 Cherry Studio 企业版维护。统一知识库只管理对应的技术对象，因此 V1 不提供知识库列表、重命名、用户挂载或权限分配接口。原文件下载作为文件管理辅助能力提供，但不绕过产品侧权限判断，也不暴露内部存储路径或 S3 Key。
 
 V1 同样不包装 OGX Cancel API，也不增加 `GET /capabilities`。产品不能主动取消正在处理的 Operation；明显超过大小限制的上传同步返回 `413`。V1 不根据不可靠的客户端 MIME 声明维护硬编码格式白名单，文件被接受后若 Docling 判定格式不受支持、内容损坏或解析失败，通过 `Operation.status=failed` 和 `last_error` 返回。两端可以在自身 UI 中维护格式提示，实际接受结果以服务处理状态为准。
 
@@ -404,8 +404,10 @@ V1 需要补充的辅助接口如下：
 | 创建技术知识库 | `POST /knowledge/v1/knowledge-bases` | Stella 部署初始化时调用一次；企业版创建业务知识库时提交该 KB 的 Embedding 与可选 Rerank 配置，并保存返回的 `knowledge_base_id` |
 | 查询技术知识库 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}` | 只用于检查对象是否存在及读取技术状态，不承担业务知识库展示 |
 | 删除技术知识库 | `DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}` | 供企业版删除业务知识库时清理索引和技术对象；Stella 不删除隐藏知识库 |
+| 批量上传文件 | `POST /knowledge/v1/ingest/batch` | 同一 KB、共用 attributes，一次提交最多 20 个文件；每个文件仍产生独立 Operation，不创建公开 Batch 对象 |
 | 查询文件列表 | `POST /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query` | 使用通用 Filter、状态和 Cursor 分页查询该知识库内的文件 |
 | 查看文件详情 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}` | 返回文件技术元数据、处理状态和可选失败原因，不返回原文件内容 |
+| 下载原文件 | `GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download` | 校验文件属于指定 KB 后返回上传时保存的原始字节；产品后端负责用户权限判断和文件流转发 |
 | 删除单个文件 | `DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}` | 删除挂载关系及索引数据，并在没有其他引用时清理原文件 |
 | 重试失败导入 | `POST /knowledge/v1/operations/{operation_id}/retry` | 服务从 OperationRecord 解析 KnowledgeBase，复用原 `file_id`，清理失败挂载并创建新的单文件 FileBatch；返回新的 `operation_id`，旧 Operation 保持不可变 |
 
@@ -480,7 +482,17 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 该接口不接收 Filter，也不新增文件级权限模型。Stella 或企业版必须先在产品层完成权限判断；统一知识库只接受服务端调用并验证文件属于指定 KnowledgeBase，不能把接口直接暴露给终端用户。
 
-### 7.10 删除单个 KnowledgeBase 文件
+### 7.10 下载 KnowledgeBase 原文件
+
+`GET /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download` 返回上传时保存的原文件，而不是 Docling 解析结果、Markdown、Chunk 或向量数据。调用方只传路径中的 `knowledge_base_id` 和 `file_id`，并使用 Runtime Token；不重复传入 `tenant_id`、文件名、Operation ID、attributes、产品用户或内部存储位置。
+
+下载对象按 `(knowledge_base_id, file_id)` 挂载关系解析。服务必须先确认 KnowledgeBase 存在且 File 确实属于该 KnowledgeBase，再调用 OGX Files Provider 读取内容；全局原 File 存在但不属于路径指定 KB 时仍返回 `404 file_not_found`，不能泄露它是否存在于其他知识库。文件处于 `processing / completed / failed / cancelled` 中的任意状态时，只要原文件仍在保留期内就允许下载；原文件已经清理时返回同一稳定错误。
+
+成功响应使用 HTTP `200`、`Content-Disposition: attachment` 和服务端保存的安全文件名，正文为二进制文件流。V1 不支持调用方覆盖下载文件名、切换 inline 展示或使用 HTTP Range。统一知识库不生成绝对下载 URL 或预签名 URL：Stella 或企业版先校验当前产品用户权限，再由产品后端携带 Runtime Token 调用本接口并把响应流转发给浏览器，不能把服务 Token 暴露给前端。
+
+下载实现继续复用当前 Files Provider，因此本地 FS 和 S3-compatible 后端使用同一公开接口。OGX S3 Provider 可以流式返回；当前 LocalFS Provider 会先把单个原文件读入内存，首期通过单文件 `100 MiB` 上限和部署侧下载并发控制约束峰值，不为此耦合 LocalFS 私有路径。若实际并发下载证明内存不可接受，再单独为 Files Provider 补统一流式能力。
+
+### 7.11 删除单个 KnowledgeBase 文件
 
 `DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}` 同步、幂等地删除指定 `(knowledge_base_id, file_id)` 挂载及对应 Qdrant Chunk，成功和重复删除均返回 HTTP `204`，不要求 `Idempotency-Key`。如果文件仍有 `processing` Operation，返回 `409 file_busy` 和 `active_operation_id`，不提供强制删除；`completed / failed / cancelled` 文件均允许删除。
 
@@ -488,7 +500,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 失败重试不能直接调用该公共 DELETE。公共删除会在最后一个挂载消失时清理原 File，而重试内部只删除失败 VectorStoreFile 和残留索引、保留原文件并创建新 FileBatch。
 
-### 7.11 重试失败 Operation
+### 7.12 重试失败 Operation
 
 `POST /knowledge/v1/operations/{operation_id}/retry` 只接受最终 `failed` Operation，不接收请求体，也不允许修改原文件、attributes、Chunking 参数、Embedding 模型或维度。服务先根据 OperationRecord 取得 `knowledge_base_id` 和 `file_id`，再锁定对应 KnowledgeBase 与文件，删除失败挂载和残留索引但保留原 File，复用原配置创建新的单文件 FileBatch，并返回 HTTP `202`、新 `operation_id`、`retried_from_operation_id`、`knowledge_base_id`、`file_id` 和 `processing`。
 
@@ -496,7 +508,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 `processing / completed / cancelled` 返回 `409 operation_not_retryable`，原 File 已不存在返回 `409 retry_source_missing`。OGX File Processor 在同一个 FileBatch 内的自动重试先执行；本接口只在自动重试耗尽并进入最终 failed 后由产品显式调用。旧 FileBatch 内容保持不可变，重试关系单独持久化。
 
-### 7.12 查询 Operation 状态
+### 7.13 查询 Operation 状态
 
 `GET /knowledge/v1/operations/{operation_id}` 返回 `operation_id / knowledge_base_id / file_id / status / created_at / last_error / retryable / retried_from_operation_id / retried_by_operation_id`。Operation ID 是全局任务标识；KnowledgeBase 是响应中的业务上下文和内部 OGX 路由信息，不是调用方查询 Operation 时必须重复提供的路径参数。未知 ID 返回 `404 operation_not_found`。
 
@@ -504,9 +516,9 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 当前 OGX 无法可靠表达解析页数、Chunk Embedding 进度和全链路预计完成时间，因此 V1 不返回 `progress_percent`、细分阶段或 ETA。统一接口已补充 File、创建时间、可重试判断、终态快照和重试链关系。
 
-### 7.13 异步 Ingest
+### 7.14 单文件异步 Ingest
 
-`POST /knowledge/v1/ingest` 使用 `multipart/form-data`，每次请求只接收一个文件。请求固定包含二进制 `file`、`knowledge_base_id`，并可选包含 JSON 编码的 `attributes`；Header 必须包含 `Idempotency-Key`。每次 Ingest 创建一个 File、一个单文件 OGX FileBatch 和一个 Operation；失败重试会为同一个 File 创建新的 Operation，并使用重试关系串联。产品需要批量上传时并发调用本接口，并自行汇总多个 `operation_id`。
+`POST /knowledge/v1/ingest` 使用 `multipart/form-data`，每次请求只接收一个文件。请求固定包含二进制 `file`、`knowledge_base_id`，并可选包含 JSON 编码的 `attributes`；Header 必须包含 `Idempotency-Key`。每次 Ingest 创建一个 File、一个单文件 OGX FileBatch 和一个 Operation；失败重试会为同一个 File 创建新的 Operation，并使用重试关系串联。该接口也是批量上传内部逐项调用的唯一导入实现。
 
 `attributes` 只允许最多 16 个产品过滤字段，字段名最长 64 个字符，值只允许字符串、数字、布尔值或上述标量的一维数组，不接收任意嵌套业务对象。`tenant_id / vector_store_id / file_id / chunk_id / embedding_model / embedding_dimension` 是服务保留字段，调用方不能写入或覆盖。Stella 在这里写四级范围属性；企业版可写来源、分类等不属于知识库业务对象本身的检索属性。
 
@@ -514,7 +526,19 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 每个 KnowledgeBase 的第一次 Ingest 需要在 KB 生命周期锁与租户 Collection Schema 锁内完成模型和维度锁定、Qdrant Collection 及对应 Dense Named Vector 的创建或确认，并建立可恢复的幂等记录，再创建原 File 与单文件 FileBatch。Qdrant 是外部系统，不能与 PostgreSQL 做单个物理事务，因此这里的“原子”指接口对外只产生一个可恢复结果：进程在任一步崩溃后，相同 Idempotency-Key 必须继续或返回原 Operation，不能再次创建任务，也不能遗留无法追踪的原 File。
 
-### 7.14 Search
+### 7.15 批量异步 Ingest
+
+`POST /knowledge/v1/ingest/batch` 使用 `multipart/form-data`，一次接收重复的 `files` 字段、一个 `knowledge_base_id` 和一份可选的 JSON `attributes`；同批所有文件必须进入同一个 KnowledgeBase 并共用 attributes，V1 不提供逐文件 attributes manifest。Header 使用一个批量请求级 `Idempotency-Key`。
+
+批量接口只是单文件 Ingest 的聚合入口。每个文件仍独立创建 File、单文件 OGX FileBatch 和 Operation，响应 `items` 按请求文件顺序返回，每项包含 `index / filename / operation_id / file_id / knowledge_base_id / status`。调用方继续分别使用现有 Operation 查询和重试接口；服务不创建公开 `batch_id`，也不增加批次状态、取消、整体重试或整体删除接口。
+
+首期默认限制为单文件最大 `100 MiB`、单批最多 20 个文件、单批原文件总计最大 `500 MiB`，三项均为部署配置。服务在创建任何 File 前校验文件数量、每个文件大小和总大小；超限分别使用稳定的 `413` 或 `422` 错误，不能先接受前缀文件再因静态限制拒绝后缀文件。提交阶段逐个调用单文件 Ingest，以限制应用内存峰值；后台 Docling、Embedding 和 Qdrant 处理仍由各自单文件 FileBatch 异步执行。
+
+批量幂等指纹覆盖有序文件清单中每个文件的字节、文件名、`knowledge_base_id` 和 canonical attributes。服务在提交第一个文件前保存内部批量请求指纹，并按“批量 Idempotency-Key + 文件索引”派生稳定的内部单文件幂等键；相同 Key 只允许以完全相同的文件顺序和内容重放，不同清单返回 `409 idempotency_conflict`。所有文件均为已有结果时返回 HTTP `200`；只要本次创建了任意新 Operation 就返回 HTTP `202`。
+
+批量提交不承诺跨多个原文件、PostgreSQL 记录和 OGX FileBatch 的物理事务，也不执行整体回滚。若外部存储或任务创建在中途暂时失败，接口返回对应稳定错误，已经可靠接受的前缀文件继续处理；调用方使用相同批量 Key 和完全相同的有序文件重试时，已接受项幂等复用，其余项继续提交。该可恢复语义替代成本更高且无法跨外部系统真正保证的“全部成功或全部回滚”。
+
+### 7.16 Search
 
 `POST /knowledge/v1/search` 是只读接口，不要求 `Idempotency-Key`。使用 POST 是因为请求包含多个 KnowledgeBase ID 和递归 Filter，不表示该接口会创建资源。
 
@@ -547,7 +571,7 @@ V1 使用同步、幂等删除，成功及重复删除均返回 HTTP `204`，不
 
 Dense 相似度、BM25、内层 RRF、神经 Rerank 和外层 RRF 的分数空间不同，因此 V1 不接收统一 `score_threshold`，也不承诺 `score` 可跨请求、跨模式或跨 Rerank 状态比较。单 KB 响应保留该 KB 最终阶段的分数；多 KB 响应使用外层 RRF 分数，等权且同名次的不同 KB 命中可以同分。
 
-### 7.15 服务间认证
+### 7.17 服务间认证
 
 Knowledge API 只面向 Stella 和 Cherry Studio 企业版后端，不直接接受终端用户请求。所有受保护接口使用 `Authorization: Bearer <token>`，并由每套部署注入两个静态服务 Token：
 
@@ -560,7 +584,7 @@ Admin Token 是 Runtime 权限的超集。两个 Token 通过环境变量或部�
 
 服务 Token 只证明请求来自可信产品后端，不代表终端用户，也不绑定租户。Stella 和企业版仍先在各自产品层完成用户认证、权限累计、KnowledgeBase 挂载和四级范围计算，再把允许的 `knowledge_base_ids + filters` 交给知识库。统一知识库继续强制校验 KnowledgeBase 存在、一次 Search 不跨租户 Collection、保留字段不能被覆盖，但不新增用户、部门、角色或租户授权模型。
 
-### 7.16 统一错误响应
+### 7.18 统一错误响应
 
 所有同步 API 使用同一个错误信封，替换 FastAPI 默认的 `{"detail": ...}`：
 
@@ -593,7 +617,7 @@ Admin Token 是 Runtime 权限的超集。两个 Token 通过环境变量或部�
 
 Ingest 已返回 `202` 后发生的解析、切块、Embedding 或索引失败属于 Operation 结果，不是状态查询接口的 HTTP 失败。此时查询 Operation 返回 HTTP `200`、`status=failed` 和稳定的 `last_error={code,message}`；只有状态接口本身无法执行时才返回错误信封。Search 中必需的 Embedding 或 Qdrant 分支失败会使整个请求失败；某个 KB 的可选 Rerank 失败继续按既定策略降级到该 KB 的内层 RRF，只记录可追踪日志。
 
-### 7.17 KnowledgeBase 模型配置更新
+### 7.19 KnowledgeBase 模型配置更新
 
 模型配置属于技术 KnowledgeBase，不再提供租户级 Embedding/Rerank 配置接口。创建后的管理接口为：
 
@@ -661,6 +685,8 @@ FILE_CLEANUP_INTERVAL_HOURS=24
 | KB 独立 Rerank | 同租户多个 KB 分别关闭或配置不同 URL、Key 和模型 | 只重排启用 KB 的本地候选；切换配置无需重建索引；失败仅降级该 KB 到内层 RRF |
 | 原文 | 上传后重启 OGX 仍可读取 | 文件字节与元数据一致 |
 | 原文后端 | 分别用本地持久卷与 S3-compatible 配置执行同一 Ingest/File 生命周期 | 两种部署返回相同公开对象与状态，不向产品暴露路径、Bucket 或后端差异 |
+| 原文下载 | 从文件列表、详情、SearchHit 和 Operation 分别取得 KB/File ID 后下载 | 只返回指定 KB 内的原始字节；跨 KB File ID 返回 404；LocalFS 与 S3-compatible 行为一致 |
+| 批量上传 | 覆盖首次提交、完整重放、清单冲突、静态超限和中途临时失败后续传 | 每个文件独立 Operation；无公开 Batch 对象；重试不重复创建已接受文件；顺序和响应映射稳定 |
 | 解析与切块 | Docling + HybridChunker 处理目标格式 | Chunk 有稳定内容、顺序和定位信息 |
 | Dense | 语义查询可召回相关 Chunk | 结果、分数和来源可解析 |
 | BM25 | 中文关键词和标识符可按相关性排序 | 不是固定分数或文本 Filter 冒充 BM25 |
@@ -695,6 +721,8 @@ FILE_CLEANUP_INTERVAL_HOURS=24
 | --- | --- | --- |
 | 自定义 Provider 承担核心检索语义 | 它不是薄适配层，错误会造成漏召回、串库或错误删除 | 单元测试过滤翻译；集成测试 Qdrant；以 OGX 官方 Provider 和 Qdrant 官方示例为参考，但独立维护契约测试 |
 | FileBatch 仍是单实例后台任务 | 多副本会重复恢复或缺少全局并发控制 | 当前固定单实例；Provider 修正优雅停机状态，真实重启测试覆盖恢复；多副本时重新设计租约领取 |
+| 批量上传在外部系统调用中途失败 | 同一 HTTP 请求可能只可靠接受前缀文件，无法提供跨 File、PostgreSQL 和 FileBatch 的物理事务 | 在提交前保存有序清单指纹；每项复用单文件幂等语义；相同批量 Key 精确重试并继续未完成项，不宣称整体原子回滚 |
+| LocalFS 下载会把单文件读入内存 | 并发下载大文件时增加 Knowledge Service 内存峰值 | 单文件默认限制 100 MiB 并限制部署侧下载并发；S3-compatible 使用流式响应；有实际压力证据后再补统一流式 Provider |
 | Qdrant 原生 BM25 与服务版本耦合 | tokenizer 选项或语言处理在升级后可能改变 | 固定 Qdrant 1.18.2；文档和查询共用同一配置；升级必须重跑原生 BM25 探针与真实语料评测 |
 | 产品生成错误 Filter | 可能漏数据或越权 | 产品只从可信身份生成；服务校验语法和保留字段；为 Stella 与企业版权限矩阵建立契约测试 |
 | 租户提交恶意或错误的模型 URL | 可能产生 SSRF、访问云元数据或把请求发往非预期内网服务 | Admin Token 保护配置接口；规范化 URL；默认 HTTPS；阻断 loopback/link-local/私网和重定向绕过；内部服务必须由部署 allowlist 显式放行 |
@@ -717,6 +745,8 @@ FILE_CLEANUP_INTERVAL_HOURS=24
 MVP 已完成真实 OpenAI-compatible Embedding 与第一轮两侧实际项目文档评测：0.6B、4B、8B 三种模型分别返回 1024、2560、4096 维向量，并都能完成完整导入和 Hybrid 检索。增量实现又使用同租户 3/5/7 维独立 KB、不同 Embedding/Rerank 凭证和可选 Rerank 完成接口、动态 Named Vector、单 KB 排名与跨 KB 外层 RRF 验收；真实多模型的跨库效果评测仍属于后续调优，不阻塞当前功能完整性。
 
 Qdrant Server 已固定为 `1.18.2`，qdrant-client 已固定为 `1.18.0`；真实探针已覆盖 IDF Sparse、Payload Filter、Query API 和原生 RRF，因此版本能力不再是未决项。
+
+文件管理增量方案已收敛：原文件下载使用 `(knowledge_base_id, file_id)` 校验挂载关系，由产品后端完成用户权限判断并代理文件流；批量上传只聚合多个现有单文件 Ingest，每项保留独立 Operation，不增加公开 Batch 对象。默认限制为单文件 `100 MiB`、单批 20 个文件和单批总计 `500 MiB`，三项均可通过部署配置调整。
 
 真实模型服务和可配置维度已经不再阻塞 MVP 完整导入。具体模型选型属于后续效果与性能调优，不阻塞当前 Provider 和统一 API 验证。
 

@@ -59,7 +59,8 @@ PostgreSQL 与 Qdrant 继续使用固定版本的官方镜像；Knowledge 镜像
 导入链路：
 
 ```text
-POST /knowledge/v1/ingest
+POST /knowledge/v1/ingest 或 POST /knowledge/v1/ingest/batch
+  → 批量请求按文件拆成独立单文件提交
   → OGX File 持久化
   → 单文件 FileBatch
   → Docling 解析
@@ -162,6 +163,7 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/knowledge-bases \
 
 ```http
 POST /knowledge/v1/ingest
+POST /knowledge/v1/ingest/batch
 GET  /knowledge/v1/operations/{operation_id}
 POST /knowledge/v1/operations/{operation_id}/retry
 ```
@@ -177,15 +179,28 @@ curl -X POST http://127.0.0.1:8321/knowledge/v1/ingest \
 
 首次可靠接受返回 HTTP `202`；相同幂等请求重放返回 HTTP `200` 和原 Operation。`operation_id` 在服务内全局唯一，查询和重试不要求调用方重复传入 KnowledgeBase；响应会回显对应的 `knowledge_base_id` 和 `file_id`。状态统一为 `processing / completed / failed / cancelled`。最终失败且原文件仍存在时，可调用 Retry 接口复用原文件创建唯一的子 Operation。
 
+批量接口使用重复的 `files` 字段、一个 `knowledge_base_id` 和一份共用 `attributes`。它不创建公开 Batch 对象，而是按请求顺序返回多个独立 File/Operation；调用方继续分别查询和重试每个 Operation。默认限制为单文件 `100 MiB`、单批 20 个文件、单批总计 `500 MiB`，均可通过 `.env` 配置：
+
+```bash
+curl -X POST http://127.0.0.1:8321/knowledge/v1/ingest/batch \
+  -H "Authorization: Bearer $KNOWLEDGE_RUNTIME_TOKEN" \
+  -H 'Idempotency-Key: ingest-product-a-batch-1' \
+  -F 'files=@./policy.pdf;type=application/pdf' \
+  -F 'files=@./manual.docx;type=application/vnd.openxmlformats-officedocument.wordprocessingml.document' \
+  -F 'knowledge_base_id=vs_example' \
+  -F 'attributes={"department_id":"product-a"}'
+```
+
 ### File
 
 ```http
 POST   /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/query
 GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}
+GET    /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}/download
 DELETE /knowledge/v1/knowledge-bases/{knowledge_base_id}/files/{file_id}
 ```
 
-V1 不提供原文件下载、替换、主动取消任务、用户管理或知识库挂载 API。超过保留期的未提交、最终失败和孤儿原文件由 Knowledge 进程内部自动清理，不增加公开清理接口。
+下载接口在服务端校验 `file_id` 属于路径中的 KnowledgeBase，随后返回上传时保存的原始字节；它不返回 Docling 解析结果或 Chunk。产品后端先完成用户权限检查，再代理该文件流。V1 仍不提供替换、主动取消任务、用户管理或知识库挂载 API。超过保留期的未提交、最终失败和孤儿原文件由 Knowledge 进程内部自动清理，不增加公开清理接口。
 
 ### Search
 

@@ -63,8 +63,10 @@ Stella 负责确保 `scope / user_id / agent_id` 来自可信身份。统一知�
 Stella 主要使用：
 
 - 部署时：携带部署级 Embedding/Rerank 配置创建并检查隐藏 KnowledgeBase。
-- 运行时：Ingest、Operation 查询/重试、File 查询/删除、Search。
+- 运行时：单文件或批量 Ingest、Operation 查询/重试、File 查询/下载/删除、Search。
 - 不需要：业务知识库列表、重命名、用户挂载或权限管理接口。
+
+Stella 使用批量 Ingest 时，同一请求中的所有文件必须属于相同四级范围并共用 attributes；不同用户、Agent 或 scope 的文件必须拆批。下载前由 Stella 先按四级范围判断当前用户能否访问对应文件，再代理统一知识库返回的原文件流。
 
 ## 3. Cherry Studio 企业版
 
@@ -81,6 +83,8 @@ Stella 主要使用：
 
 “挂载知识库”只存在于企业版产品数据库中，不调用统一知识库的 Mount API。创建、展示和修改业务对象也不等于修改 Qdrant Payload；只有删除业务知识库时，企业版才调用技术 KnowledgeBase DELETE 清理其文件和索引。
 
+企业版可以用批量 Ingest 一次向当前业务知识库提交多个文件；整批共用 attributes，每个文件仍有独立 Operation。文件列表或详情页需要下载时，企业版先验证用户对业务知识库的权限，再用映射后的 `knowledge_base_id` 和返回的 `file_id` 调用下载接口并代理响应。
+
 ## 4. 维护边界
 
 | Stella / 企业版维护 | 统一知识库维护 |
@@ -92,4 +96,4 @@ Stella 主要使用：
 | 产品 UI、配额、业务审计和错误提示 | 本地/S3 原文件、Docling、HybridChunker、Dense、BM25、内外层 RRF、可选 Rerank |
 | 决定何时创建、重试、删除 | 异步执行、崩溃恢复、技术删除和无效原文件自动清理 |
 
-统一知识库不提供用户创建、权限分配、业务 KnowledgeBase 列表/改名、挂载、原文件下载、任务取消或模型列表接口。
+统一知识库不提供用户创建、权限分配、业务 KnowledgeBase 列表/改名、挂载、任务取消或模型列表接口。原文件下载只负责技术 KB/File 归属校验和字节返回，不替代产品权限判断。

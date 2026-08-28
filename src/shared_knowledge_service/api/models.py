@@ -79,6 +79,25 @@ class IngestResponse(BaseModel):
     replayed: bool = Field(default=False, exclude=True)
 
 
+class BatchIngestItem(BaseModel):
+    """批量提交中的一个独立单文件 Ingest 结果。"""
+
+    index: int = Field(ge=0)
+    filename: str
+    operation_id: str
+    file_id: str
+    knowledge_base_id: str
+    status: OperationStatus
+
+
+class BatchIngestResponse(BaseModel):
+    """不引入公开 Batch 实体的有序单文件结果集合。"""
+
+    items: list[BatchIngestItem]
+    # 只供路由选择 200/202，不能进入公开 JSON。
+    replayed: bool = Field(default=False, exclude=True)
+
+
 class OperationResponse(BaseModel):
     """单文件导入任务的稳定状态，不暴露 OGX FileBatch 结构。"""
 

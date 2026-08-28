@@ -29,13 +29,16 @@ from ogx_api import (
     OpenAIFileObjectNotFoundError,
     OpenAIUpdateVectorStoreRequest,
     QueryChunksResponse,
+    RetrieveFileContentRequest,
     RetrieveFileRequest,
     UploadFileRequest,
     VectorIO,
     VectorStoreNotFoundError,
 )
+from ogx_api.common.upload_limits import DEFAULT_MAX_UPLOAD_SIZE_BYTES, PreReadUploadFile
 from ogx_api.files.models import OpenAIFileUploadPurpose
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import Response
 
 from shared_knowledge_service.provider.adapter import SharedQdrantVectorIOAdapter
 from shared_knowledge_service.provider.attributes import encode_attributes_for_ogx
@@ -45,6 +48,8 @@ from shared_knowledge_service.provider.filtering import FilterTranslationError, 
 from .errors import ApiSecurity, KnowledgeError
 from .models import (
     AttributeValue,
+    BatchIngestItem,
+    BatchIngestResponse,
     EmbeddingConfigPutRequest,
     EmbeddingConfigResponse,
     FileCounts,
@@ -68,6 +73,7 @@ from .models import (
     SearchResponse,
 )
 from .state import (
+    BatchIngestIdempotencyRecord,
     CreateIdempotencyRecord,
     CredentialCipher,
     EmbeddingProfileRecord,
@@ -115,6 +121,8 @@ _SEARCH_INTERNAL_METADATA = frozenset(
     }
 )
 
+_BATCH_SCAN_CHUNK_BYTES = 1024 * 1024
+
 
 def _normalize_identifier(value: str, *, field_name: str) -> str:
     normalized = value.strip()
@@ -133,6 +141,19 @@ def _request_fingerprint(parts: list[bytes]) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
+
+
+def _validate_ingest_attributes(attributes: dict[str, AttributeValue]) -> None:
+    """在写入任何原文件前拒绝调用方覆盖服务保留字段。"""
+
+    forbidden = RESERVED_INGEST_ATTRIBUTES.intersection(attributes)
+    if forbidden:
+        raise KnowledgeError(
+            422,
+            "reserved_attribute",
+            "attributes 不能覆盖保留字段",
+            {"fields": sorted(forbidden)},
+        )
 
 
 def _secret_digest(value: str) -> str:
@@ -259,6 +280,9 @@ class KnowledgeApiConfig(BaseModel):
     search_branch_concurrency: int = Field(default=8, ge=1, le=64)
     search_branch_candidate_limit: int = Field(default=50, ge=1, le=200)
     outer_rrf_k: int = Field(default=60, ge=1, le=10_000)
+    max_upload_size_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_SIZE_BYTES, ge=1)
+    max_batch_files: int = Field(default=20, ge=1, le=1000)
+    max_batch_upload_size_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
 
 
 class KnowledgeApiProvider:
@@ -280,6 +304,9 @@ class KnowledgeApiProvider:
         search_branch_concurrency: int = 8,
         search_branch_candidate_limit: int = 50,
         outer_rrf_k: int = 60,
+        max_upload_size_bytes: int = DEFAULT_MAX_UPLOAD_SIZE_BYTES,
+        max_batch_files: int = 20,
+        max_batch_upload_size_bytes: int = 500 * 1024 * 1024,
     ) -> None:
         self.files_api = files_api
         self.vector_io = vector_io
@@ -294,6 +321,9 @@ class KnowledgeApiProvider:
         self.search_branch_concurrency = search_branch_concurrency
         self.search_branch_candidate_limit = search_branch_candidate_limit
         self.outer_rrf_k = outer_rrf_k
+        self.max_upload_size_bytes = max_upload_size_bytes
+        self.max_batch_files = max_batch_files
+        self.max_batch_upload_size_bytes = max_batch_upload_size_bytes
         self._cleanup_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
@@ -838,14 +868,7 @@ class KnowledgeApiProvider:
     ) -> IngestResponse:
         knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
         idempotency_key = _normalize_identifier(idempotency_key, field_name="Idempotency-Key")
-        forbidden = RESERVED_INGEST_ATTRIBUTES.intersection(attributes)
-        if forbidden:
-            raise KnowledgeError(
-                422,
-                "reserved_attribute",
-                "attributes 不能覆盖保留字段",
-                {"fields": sorted(forbidden)},
-            )
+        _validate_ingest_attributes(attributes)
         content = await file.read()
         await file.seek(0)
         filename = file.filename or "upload.bin"
@@ -860,6 +883,140 @@ class KnowledgeApiProvider:
             idempotency_key=idempotency_key,
             fingerprint=fingerprint,
         )
+
+    async def _scan_batch_manifest(
+        self,
+        files: list[UploadFile],
+        knowledge_base_id: str,
+        attributes: dict[str, AttributeValue],
+    ) -> tuple[str, list[tuple[str, int, str]]]:
+        """流式计算有序批量清单，不把整批文件同时读入内存。"""
+
+        if not files:
+            raise KnowledgeError(422, "empty_batch", "批量上传至少需要一个文件")
+        if len(files) > self.max_batch_files:
+            raise KnowledgeError(
+                422,
+                "batch_file_count_exceeded",
+                "批量上传文件数量超过部署限制",
+                {"max_files": self.max_batch_files, "actual_files": len(files)},
+            )
+        canonical_attributes = json.dumps(attributes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint_parts = [
+            knowledge_base_id.encode("utf-8"),
+            canonical_attributes.encode("utf-8"),
+            str(len(files)).encode("ascii"),
+        ]
+        manifest: list[tuple[str, int, str]] = []
+        total_size = 0
+        for index, file in enumerate(files):
+            filename = file.filename or "upload.bin"
+            file_digest = hashlib.sha256()
+            file_size = 0
+            await file.seek(0)
+            try:
+                while chunk := await file.read(_BATCH_SCAN_CHUNK_BYTES):
+                    file_size += len(chunk)
+                    total_size += len(chunk)
+                    if file_size > self.max_upload_size_bytes:
+                        raise KnowledgeError(
+                            413,
+                            "payload_too_large",
+                            "上传文件超过部署限制",
+                            {
+                                "index": index,
+                                "filename": filename,
+                                "max_size_bytes": self.max_upload_size_bytes,
+                            },
+                        )
+                    if total_size > self.max_batch_upload_size_bytes:
+                        raise KnowledgeError(
+                            413,
+                            "batch_payload_too_large",
+                            "批量上传总大小超过部署限制",
+                            {
+                                "max_batch_size_bytes": self.max_batch_upload_size_bytes,
+                                "actual_size_bytes_at_least": total_size,
+                            },
+                        )
+                    file_digest.update(chunk)
+            finally:
+                await file.seek(0)
+            digest = file_digest.hexdigest()
+            manifest.append((filename, file_size, digest))
+            fingerprint_parts.extend(
+                [
+                    str(index).encode("ascii"),
+                    filename.encode("utf-8"),
+                    str(file_size).encode("ascii"),
+                    digest.encode("ascii"),
+                ]
+            )
+        return _request_fingerprint(fingerprint_parts), manifest
+
+    async def batch_ingest(
+        self,
+        files: list[UploadFile],
+        knowledge_base_id: str,
+        attributes: dict[str, AttributeValue],
+        idempotency_key: str,
+    ) -> BatchIngestResponse:
+        """幂等聚合多个权威单文件 Ingest，不创建公开 Batch 任务。"""
+
+        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
+        idempotency_key = _normalize_identifier(idempotency_key, field_name="Idempotency-Key")
+        _validate_ingest_attributes(attributes)
+        # 在扫描大文件前先验证技术 KB，避免无效路由消耗不必要的磁盘 I/O。
+        await self._shared_provider([knowledge_base_id])
+        fingerprint, manifest = await self._scan_batch_manifest(files, knowledge_base_id, attributes)
+        state = self._state()
+        lock_key = f"ingest-batch:{opaque_suffix(knowledge_base_id)}:{opaque_suffix(idempotency_key)}"
+        async with state.locked(lock_key):
+            record = await state.get_batch_ingest_idempotency(knowledge_base_id, idempotency_key)
+            if record is not None and record.fingerprint != fingerprint:
+                raise KnowledgeError(409, "idempotency_conflict", "Idempotency-Key 已用于不同批量文件或参数")
+            if record is None:
+                await state.save_batch_ingest_idempotency(
+                    idempotency_key,
+                    BatchIngestIdempotencyRecord(
+                        knowledge_base_id=knowledge_base_id,
+                        key_hash=opaque_suffix(idempotency_key, length=40),
+                        fingerprint=fingerprint,
+                        item_count=len(files),
+                    ),
+                )
+
+            items: list[BatchIngestItem] = []
+            all_replayed = True
+            batch_key_hash = opaque_suffix(idempotency_key, length=40)
+            for index, (file, (filename, expected_size, expected_digest)) in enumerate(
+                zip(files, manifest, strict=True)
+            ):
+                content = await file.read()
+                await file.seek(0)
+                if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_digest:
+                    raise KnowledgeError(409, "batch_request_changed", "批量上传文件在提交期间发生变化")
+                safe_file = PreReadUploadFile(content, filename=filename, content_type=file.content_type)
+                child_key = f"batch-{batch_key_hash}-{index}"
+                result = await self.ingest(
+                    safe_file,
+                    knowledge_base_id,
+                    attributes,
+                    child_key,
+                )
+                all_replayed = all_replayed and result.replayed
+                file_record = await state.get_file(knowledge_base_id, result.file_id)
+                items.append(
+                    BatchIngestItem(
+                        index=index,
+                        filename=file_record.filename if file_record is not None else filename,
+                        operation_id=result.operation_id,
+                        file_id=result.file_id,
+                        knowledge_base_id=result.knowledge_base_id,
+                        status=result.status,
+                    )
+                )
+            return BatchIngestResponse(items=items, replayed=all_replayed)
 
     async def _ingest_serialized(
         self,
@@ -1224,6 +1381,30 @@ class KnowledgeApiProvider:
         item = await self._file_item(record)
         return FileDetail(knowledge_base_id=knowledge_base_id, **item.model_dump())
 
+    async def download_file(self, knowledge_base_id: str, file_id: str) -> Response:
+        """校验 KB/File 挂载关系后原样返回 Files Provider 的二进制响应。"""
+
+        knowledge_base_id = _normalize_identifier(knowledge_base_id, field_name="knowledge_base_id")
+        file_id = _normalize_identifier(file_id, field_name="file_id")
+        await self._shared_provider([knowledge_base_id])
+        record = await self._state().get_file(knowledge_base_id, file_id)
+        if record is None:
+            # 全局 File 即使存在，也不能通过错误的 KnowledgeBase 路径被探测或下载。
+            raise KnowledgeError(404, "file_not_found", "文件不存在")
+        try:
+            response = cast(
+                Response,
+                await self.files_api.openai_retrieve_file_content(RetrieveFileContentRequest(file_id=file_id)),
+            )
+        except (OpenAIFileObjectNotFoundError, KeyError) as exc:
+            raise KnowledgeError(404, "file_not_found", "文件不存在") from exc
+        except Exception as exc:
+            raise KnowledgeError(503, "file_storage_unavailable", "原文件存储暂时不可用") from exc
+        # 下载经过产品后端代理；禁止中间层缓存租户文件，并阻止浏览器进行内容嗅探。
+        response.headers.setdefault("Cache-Control", "private, no-store")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
+
     async def delete_file(self, knowledge_base_id: str, file_id: str) -> None:
         state = self._state()
         async with state.locked(f"knowledge-base:{opaque_suffix(knowledge_base_id)}"):
@@ -1581,6 +1762,9 @@ async def get_provider_impl(config: KnowledgeApiConfig, deps: dict[Api, Any]) ->
         search_branch_concurrency=config.search_branch_concurrency,
         search_branch_candidate_limit=config.search_branch_candidate_limit,
         outer_rrf_k=config.outer_rrf_k,
+        max_upload_size_bytes=config.max_upload_size_bytes,
+        max_batch_files=config.max_batch_files,
+        max_batch_upload_size_bytes=config.max_batch_upload_size_bytes,
     )
     await impl.initialize()
     return impl
